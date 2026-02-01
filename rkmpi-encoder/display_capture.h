@@ -48,7 +48,6 @@ typedef struct {
     DisplayOrientation orientation; /* Detected orientation */
     int output_width;               /* Output width after rotation */
     int output_height;              /* Output height after rotation */
-    uint8_t *rotate_buf;            /* Temp buffer for rotation + NV12 conversion */
     int fps;                        /* Target capture FPS */
     volatile int running;           /* Thread control flag */
 } DisplayCapture;

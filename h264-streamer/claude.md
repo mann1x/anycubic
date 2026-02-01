@@ -37,8 +37,10 @@ USB camera streaming app for Rinkhals with hardware H.264 encoding using the RV1
 This app provides HTTP endpoints for streaming video from a USB camera:
 
 **Main server (port 8080, configurable via `port` property):**
-- `/stream` - MJPEG multipart stream
-- `/snapshot` - Single JPEG frame
+- `/stream` - MJPEG multipart stream (USB camera)
+- `/snapshot` - Single JPEG frame (USB camera)
+- `/display` - MJPEG stream of printer LCD framebuffer (5 fps)
+- `/display/snapshot` - Single JPEG of printer LCD
 - `/control` - Web UI with settings, FPS/CPU monitoring, and live stream preview
 - `/status` - JSON status
 - `/api/stats` - JSON stats (FPS, CPU, settings) with 1s refresh
@@ -328,20 +330,31 @@ All development is done in the **anycubic** repository. Rinkhals uses a symlink 
 ```bash
 PRINTER_IP=192.168.178.43
 
-# Copy files
-sshpass -p 'rockchip' scp -r /shared/dev/anycubic/h264-streamer/29-h264-streamer/* root@$PRINTER_IP:/useremain/home/rinkhals/apps/29-h264-streamer/
+# IMPORTANT: Stop app before deploying (or encoder binary won't update)
+sshpass -p 'rockchip' ssh root@$PRINTER_IP '/useremain/home/rinkhals/apps/29-h264-streamer/app.sh stop'
+
+# Copy encoder binary (from rkmpi-encoder)
+sshpass -p 'rockchip' scp /shared/dev/anycubic/rkmpi-encoder/rkmpi_enc root@$PRINTER_IP:/useremain/home/rinkhals/apps/29-h264-streamer/
+
+# Copy Python files (if changed)
+sshpass -p 'rockchip' scp /shared/dev/anycubic/h264-streamer/29-h264-streamer/h264_server.py root@$PRINTER_IP:/useremain/home/rinkhals/apps/29-h264-streamer/
 
 # Start app
 sshpass -p 'rockchip' ssh root@$PRINTER_IP '/useremain/home/rinkhals/apps/29-h264-streamer/app.sh start'
 
 # Test endpoints
-curl http://$PRINTER_IP:8554/status
-curl http://$PRINTER_IP:8554/snapshot -o snapshot.jpg
+curl http://$PRINTER_IP:8080/status
+curl http://$PRINTER_IP:8080/snapshot -o snapshot.jpg
+curl http://$PRINTER_IP:8080/display/snapshot -o display.jpg
 ```
 
 ### Check logs
 ```bash
-sshpass -p 'rockchip' ssh root@$PRINTER_IP 'cat /tmp/h264_server.log'
+# Main application log (h264_server.py + encoder output)
+sshpass -p 'rockchip' ssh root@$PRINTER_IP 'tail -50 /tmp/rinkhals/app-h264-streamer.log'
+
+# Encoder-only log (raw stderr from rkmpi_enc)
+sshpass -p 'rockchip' ssh root@$PRINTER_IP 'cat /tmp/rkmpi.log'
 ```
 
 ## Camera Compatibility

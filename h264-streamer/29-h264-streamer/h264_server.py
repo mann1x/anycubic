@@ -2583,6 +2583,9 @@ class StreamerApp:
         if not self.h264_enabled:
             cmd.append('-n')
 
+        # Enable display capture (printer LCD framebuffer)
+        cmd.append('--display')
+
         print(f"Starting encoder (server mode): {' '.join(cmd)}", flush=True)
 
         try:
@@ -3432,6 +3435,7 @@ class StreamerApp:
                 <button class="active" onclick="switchTab('snapshot')">Snapshot</button>
                 <button onclick="switchTab('mjpeg')">MJPEG Stream</button>
                 <button onclick="switchTab('flv')">H.264 Stream</button>
+                <button onclick="switchTab('display')">Display</button>
             </div>
             <div class="preview">
                 <div id="tab-snapshot" class="tab-content active">
@@ -3450,12 +3454,17 @@ class StreamerApp:
                         <span id="flv-status" style="margin-left:10px;color:#888;"></span>
                     </div>
                 </div>
+                <div id="tab-display" class="tab-content">
+                    <img id="display-stream" style="display:none">
+                    <p style="color:#888;font-size:12px">Printer LCD framebuffer (5 FPS)</p>
+                </div>
             </div>
             <div class="links" style="margin-top:10px;display:flex;justify-content:space-between;align-items:center;">
                 <div>
                     <a href="/stream" target="_blank">Open MJPEG</a>
                     <a href="/snapshot" target="_blank">Open Snapshot</a>
                     <a href="#" onclick="openFlvFullscreen();return false;">Open FLV</a>
+                    <a href="/display" target="_blank">Open Display</a>
                 </div>
                 <div style="display:flex;gap:5px;align-items:center;">
                     <span style="color:#888;font-size:12px;margin-right:5px;">LED:</span>
@@ -3710,6 +3719,9 @@ class StreamerApp:
             document.querySelectorAll('a[href="/snapshot"]').forEach(a => {{
                 a.href = streamBase + '/snapshot';
             }});
+            document.querySelectorAll('a[href="/display"]').forEach(a => {{
+                a.href = streamBase + '/display';
+            }});
         }}
         document.addEventListener('DOMContentLoaded', initStreamUrls);
 
@@ -3849,6 +3861,11 @@ class StreamerApp:
             }} else {{
                 stopMjpegStream();
             }}
+            if (tab === 'display') {{
+                startDisplayStream();
+            }} else {{
+                stopDisplayStream();
+            }}
             // Don't auto-start FLV player on tab switch - user clicks Play
             if (tab !== 'flv') {{
                 stopFlvPlayer();
@@ -3867,6 +3884,21 @@ class StreamerApp:
             img.src = '';
             img.style.display = 'none';
             mjpegActive = false;
+        }}
+
+        // Display stream (printer LCD framebuffer)
+        let displayActive = false;
+        function startDisplayStream() {{
+            const img = document.getElementById('display-stream');
+            img.src = streamBase + '/display';
+            img.style.display = 'block';
+            displayActive = true;
+        }}
+        function stopDisplayStream() {{
+            const img = document.getElementById('display-stream');
+            img.src = '';
+            img.style.display = 'none';
+            displayActive = false;
         }}
 
         // LED control

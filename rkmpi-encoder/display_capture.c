@@ -1,6 +1,6 @@
 /*
  * Display Framebuffer Capture Implementation
- * Uses RV1106 hardware VENC for JPEG encoding (not TurboJPEG)
+ * Uses RGA for hardware color conversion/rotation + VENC for JPEG encoding
  */
 
 #include "display_capture.h"
@@ -26,6 +26,10 @@
 #include "rk_comm_venc.h"
 #include "rk_comm_video.h"
 
+/* RGA headers for hardware color conversion/rotation */
+#include "librga/im2d.h"
+#include "librga/rga.h"
+
 /* Model IDs for orientation detection */
 #define MODEL_ID_K2P   "20021"
 #define MODEL_ID_K3    "20024"
@@ -47,9 +51,13 @@ static pthread_t g_display_thread;
 static DisplayCapture g_display_ctx;
 static volatile int g_display_running = 0;
 
-/* DMA buffer for NV12 data */
-static MB_BLK g_display_mb = MB_INVALID_HANDLE;
-static void *g_display_mb_vaddr = NULL;
+/* DMA buffers for RGA and VENC */
+static MB_BLK g_display_src_mb = MB_INVALID_HANDLE;  /* Source BGRX buffer */
+static MB_BLK g_display_rot_mb = MB_INVALID_HANDLE;  /* Rotated BGRX buffer */
+static MB_BLK g_display_dst_mb = MB_INVALID_HANDLE;  /* Destination NV12 buffer */
+static void *g_display_src_vaddr = NULL;
+static void *g_display_rot_vaddr = NULL;
+static void *g_display_dst_vaddr = NULL;
 
 static void log_info(const char *fmt, ...) {
     if (g_verbose) {
@@ -94,21 +102,26 @@ static DisplayOrientation detect_orientation(void) {
     char line[256];
     char model_id[32] = {0};
 
+    /* api.cfg is JSON format, look for "modelId": "20025" */
     while (fgets(line, sizeof(line), f)) {
-        /* Look for model_id line */
-        if (strncmp(line, "model_id", 8) == 0) {
-            char *eq = strchr(line, '=');
-            if (eq) {
-                eq++;
-                /* Skip whitespace */
-                while (*eq == ' ' || *eq == '\t') eq++;
-                /* Copy model ID, strip newline */
-                int i = 0;
-                while (*eq && *eq != '\n' && *eq != '\r' && i < (int)sizeof(model_id) - 1) {
-                    model_id[i++] = *eq++;
+        char *pos = strstr(line, "\"modelId\"");
+        if (pos) {
+            /* Find the colon and then the value */
+            pos = strchr(pos, ':');
+            if (pos) {
+                pos++;
+                /* Skip whitespace and find opening quote */
+                while (*pos == ' ' || *pos == '\t') pos++;
+                if (*pos == '"') {
+                    pos++;
+                    /* Copy model ID until closing quote */
+                    int i = 0;
+                    while (*pos && *pos != '"' && i < (int)sizeof(model_id) - 1) {
+                        model_id[i++] = *pos++;
+                    }
+                    model_id[i] = '\0';
+                    break;
                 }
-                model_id[i] = '\0';
-                break;
             }
         }
     }
@@ -121,7 +134,11 @@ static DisplayOrientation detect_orientation(void) {
 
     log_info("Detected model ID: %s\n", model_id);
 
-    /* Map model ID to orientation */
+    /* Map model ID to orientation
+     * KS1/KS1M: 180 degree flip needed
+     * K3M: 270 degree rotation needed
+     * K3/K2P/K3V2: 90 degree rotation needed
+     */
     if (strcmp(model_id, MODEL_ID_KS1) == 0 || strcmp(model_id, MODEL_ID_KS1M) == 0) {
         return DISPLAY_ORIENT_FLIP_180;
     }
@@ -137,106 +154,86 @@ static DisplayOrientation detect_orientation(void) {
 }
 
 /*
- * Convert BGRX (32-bit) to NV12 (YUV420SP)
- * BGRX: B G R X B G R X ... (4 bytes per pixel)
- * NV12: Y plane, then interleaved UV plane (half resolution)
- *
- * RGB to YUV conversion (BT.601):
- *   Y  =  0.299*R + 0.587*G + 0.114*B
- *   U  = -0.169*R - 0.331*G + 0.500*B + 128
- *   V  =  0.500*R - 0.419*G - 0.081*B + 128
+ * Rotate BGRX pixels 180 degrees using NEON SIMD
+ * Processes 4 pixels at a time for better performance
  */
-static void bgrx_to_nv12(const uint32_t *bgrx, uint8_t *nv12_y, uint8_t *nv12_uv,
-                         int width, int height) {
-    /* Process 2x2 blocks for UV subsampling */
-    for (int y = 0; y < height; y += 2) {
-        const uint32_t *row0 = bgrx + y * width;
-        const uint32_t *row1 = row0 + width;
-        uint8_t *y_row0 = nv12_y + y * width;
-        uint8_t *y_row1 = y_row0 + width;
-        uint8_t *uv_row = nv12_uv + (y / 2) * width;
+#include <arm_neon.h>
 
-        for (int x = 0; x < width; x += 2) {
-            /* Extract BGRX pixels (2x2 block) */
-            uint32_t p00 = row0[x];
-            uint32_t p01 = row0[x + 1];
-            uint32_t p10 = row1[x];
-            uint32_t p11 = row1[x + 1];
+static void rotate_bgrx_180(const uint32_t *src, uint32_t *dst, int width, int height) {
+    int total = width * height;
+    int i = 0;
+    int j = total - 4;
 
-            /* Extract RGB components (BGRX format: B=byte0, G=byte1, R=byte2, X=byte3) */
-            int b00 = (p00 >> 0) & 0xFF, g00 = (p00 >> 8) & 0xFF, r00 = (p00 >> 16) & 0xFF;
-            int b01 = (p01 >> 0) & 0xFF, g01 = (p01 >> 8) & 0xFF, r01 = (p01 >> 16) & 0xFF;
-            int b10 = (p10 >> 0) & 0xFF, g10 = (p10 >> 8) & 0xFF, r10 = (p10 >> 16) & 0xFF;
-            int b11 = (p11 >> 0) & 0xFF, g11 = (p11 >> 8) & 0xFF, r11 = (p11 >> 16) & 0xFF;
+    /* Process 4 pixels at a time with NEON */
+    while (i <= total - 4 && j >= 0) {
+        /* Load 4 pixels */
+        uint32x4_t pixels = vld1q_u32(&src[i]);
+        /* Reverse the 4 pixels */
+        uint32x4_t reversed = vrev64q_u32(pixels);
+        reversed = vcombine_u32(vget_high_u32(reversed), vget_low_u32(reversed));
+        /* Store at reversed position */
+        vst1q_u32(&dst[j], reversed);
+        i += 4;
+        j -= 4;
+    }
 
-            /* Calculate Y for each pixel (fixed-point: *256 then >>8) */
-            y_row0[x]     = (uint8_t)((66 * r00 + 129 * g00 + 25 * b00 + 128) >> 8) + 16;
-            y_row0[x + 1] = (uint8_t)((66 * r01 + 129 * g01 + 25 * b01 + 128) >> 8) + 16;
-            y_row1[x]     = (uint8_t)((66 * r10 + 129 * g10 + 25 * b10 + 128) >> 8) + 16;
-            y_row1[x + 1] = (uint8_t)((66 * r11 + 129 * g11 + 25 * b11 + 128) >> 8) + 16;
+    /* Handle remaining pixels */
+    while (i < total) {
+        dst[total - 1 - i] = src[i];
+        i++;
+    }
+}
 
-            /* Average RGB for UV calculation (2x2 block -> 1 UV pair) */
-            int r_avg = (r00 + r01 + r10 + r11) >> 2;
-            int g_avg = (g00 + g01 + g10 + g11) >> 2;
-            int b_avg = (b00 + b01 + b10 + b11) >> 2;
+static void rotate_bgrx_90(const uint32_t *src, uint32_t *dst, int width, int height) {
+    /* 90 CW: output is height x width */
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+            dst[x * height + (height - 1 - y)] = src[y * width + x];
+        }
+    }
+}
 
-            /* Calculate U and V */
-            int u = ((-38 * r_avg - 74 * g_avg + 112 * b_avg + 128) >> 8) + 128;
-            int v = ((112 * r_avg - 94 * g_avg - 18 * b_avg + 128) >> 8) + 128;
-
-            /* Clamp to [0, 255] */
-            uv_row[x]     = (uint8_t)(u < 0 ? 0 : (u > 255 ? 255 : u));  /* U */
-            uv_row[x + 1] = (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v));  /* V */
+static void rotate_bgrx_270(const uint32_t *src, uint32_t *dst, int width, int height) {
+    /* 270 CW: output is height x width */
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+            dst[(width - 1 - x) * height + y] = src[y * width + x];
         }
     }
 }
 
 /*
- * Rotate BGRX pixels according to orientation
- * Input: src (fb_width x fb_height)
- * Output: dst (output_width x output_height)
+ * Convert BGRX to NV12 using RGA hardware acceleration (color conversion only)
  */
-static void rotate_pixels(const uint32_t *src, uint32_t *dst,
-                         int fb_width, int fb_height,
-                         DisplayOrientation orient) {
-    int x, y;
+static int rga_convert_bgrx_to_nv12(void *src_bgrx, void *dst_nv12,
+                                     int width, int height) {
+    rga_buffer_t src_buf, dst_buf;
+    IM_STATUS status;
 
-    switch (orient) {
-        case DISPLAY_ORIENT_NORMAL:
-            /* No rotation needed, just copy */
-            memcpy(dst, src, fb_width * fb_height * sizeof(uint32_t));
-            break;
-
-        case DISPLAY_ORIENT_FLIP_180:
-            /* 180 degree rotation */
-            for (y = 0; y < fb_height; y++) {
-                for (x = 0; x < fb_width; x++) {
-                    dst[(fb_height - 1 - y) * fb_width + (fb_width - 1 - x)] =
-                        src[y * fb_width + x];
-                }
-            }
-            break;
-
-        case DISPLAY_ORIENT_ROTATE_90:
-            /* 90 degree clockwise: output is height x width */
-            for (y = 0; y < fb_height; y++) {
-                for (x = 0; x < fb_width; x++) {
-                    dst[x * fb_height + (fb_height - 1 - y)] =
-                        src[y * fb_width + x];
-                }
-            }
-            break;
-
-        case DISPLAY_ORIENT_ROTATE_270:
-            /* 270 degree clockwise (90 counter-clockwise): output is height x width */
-            for (y = 0; y < fb_height; y++) {
-                for (x = 0; x < fb_width; x++) {
-                    dst[(fb_width - 1 - x) * fb_height + y] =
-                        src[y * fb_width + x];
-                }
-            }
-            break;
+    /* Wrap source buffer (BGRX) */
+    src_buf = wrapbuffer_virtualaddr(src_bgrx, width, height, RK_FORMAT_BGRX_8888);
+    if (src_buf.width == 0) {
+        log_error("Failed to wrap source buffer\n");
+        return -1;
     }
+
+    /* Wrap destination buffer (NV12) */
+    dst_buf = wrapbuffer_virtualaddr(dst_nv12, width, height, RK_FORMAT_YCbCr_420_SP);
+    if (dst_buf.width == 0) {
+        log_error("Failed to wrap destination buffer\n");
+        return -1;
+    }
+
+    /* RGA color conversion only */
+    status = imcvtcolor(src_buf, dst_buf, RK_FORMAT_BGRX_8888, RK_FORMAT_YCbCr_420_SP,
+                       IM_RGB_TO_YUV_BT601_LIMIT, 1);
+
+    if (status != IM_STATUS_SUCCESS) {
+        log_error("RGA color conversion failed: %s\n", imStrError(status));
+        return -1;
+    }
+
+    return 0;
 }
 
 /*
@@ -348,61 +345,88 @@ int display_capture_init(DisplayCapture *ctx, int fps) {
 
     log_info("Output dimensions: %dx%d\n", ctx->output_width, ctx->output_height);
 
-    /* Allocate rotation buffer (always needed for BGRX storage before NV12 conversion) */
-    ctx->rotate_buf = malloc(ctx->fb_size);
-    if (!ctx->rotate_buf) {
-        log_error("Failed to allocate rotation buffer\n");
+    /* Allocate DMA buffer for source BGRX (copy from framebuffer) */
+    size_t src_size = ctx->fb_size;
+    RK_S32 ret = RK_MPI_MMZ_Alloc(&g_display_src_mb, src_size, RK_MMZ_ALLOC_CACHEABLE);
+    if (ret != RK_SUCCESS || g_display_src_mb == MB_INVALID_HANDLE) {
+        log_error("RK_MPI_MMZ_Alloc(src) failed: 0x%x\n", ret);
         munmap(ctx->fb_pixels, ctx->fb_size);
         close(ctx->fb_fd);
         return -1;
     }
+    g_display_src_vaddr = RK_MPI_MMZ_Handle2VirAddr(g_display_src_mb);
+    log_info("Allocated source DMA buffer: %zu bytes\n", src_size);
+
+    /* Allocate DMA buffer for rotation (CPU rotation output, RGA input) */
+    ret = RK_MPI_MMZ_Alloc(&g_display_rot_mb, src_size, RK_MMZ_ALLOC_CACHEABLE);
+    if (ret != RK_SUCCESS || g_display_rot_mb == MB_INVALID_HANDLE) {
+        log_error("RK_MPI_MMZ_Alloc(rot) failed: 0x%x\n", ret);
+        RK_MPI_MMZ_Free(g_display_src_mb);
+        g_display_src_mb = MB_INVALID_HANDLE;
+        munmap(ctx->fb_pixels, ctx->fb_size);
+        close(ctx->fb_fd);
+        return -1;
+    }
+    g_display_rot_vaddr = RK_MPI_MMZ_Handle2VirAddr(g_display_rot_mb);
+    log_info("Allocated rotation DMA buffer: %zu bytes\n", src_size);
+
+    /* Allocate DMA buffer for destination NV12 */
+    size_t nv12_size = ctx->output_width * ctx->output_height * 3 / 2;
+    ret = RK_MPI_MMZ_Alloc(&g_display_dst_mb, nv12_size, RK_MMZ_ALLOC_CACHEABLE);
+    if (ret != RK_SUCCESS || g_display_dst_mb == MB_INVALID_HANDLE) {
+        log_error("RK_MPI_MMZ_Alloc(dst) failed: 0x%x\n", ret);
+        RK_MPI_MMZ_Free(g_display_rot_mb);
+        g_display_rot_mb = MB_INVALID_HANDLE;
+        RK_MPI_MMZ_Free(g_display_src_mb);
+        g_display_src_mb = MB_INVALID_HANDLE;
+        munmap(ctx->fb_pixels, ctx->fb_size);
+        close(ctx->fb_fd);
+        return -1;
+    }
+    g_display_dst_vaddr = RK_MPI_MMZ_Handle2VirAddr(g_display_dst_mb);
+    log_info("Allocated destination DMA buffer: %zu bytes\n", nv12_size);
 
     /* Initialize VENC for display JPEG encoding */
     if (init_display_venc(ctx->output_width, ctx->output_height, ctx->fps, DISPLAY_JPEG_QUALITY) != 0) {
-        free(ctx->rotate_buf);
+        RK_MPI_MMZ_Free(g_display_dst_mb);
+        RK_MPI_MMZ_Free(g_display_rot_mb);
+        RK_MPI_MMZ_Free(g_display_src_mb);
+        g_display_dst_mb = MB_INVALID_HANDLE;
+        g_display_rot_mb = MB_INVALID_HANDLE;
+        g_display_src_mb = MB_INVALID_HANDLE;
         munmap(ctx->fb_pixels, ctx->fb_size);
         close(ctx->fb_fd);
         return -1;
     }
 
-    /* Allocate DMA buffer for NV12 data */
-    size_t nv12_size = ctx->output_width * ctx->output_height * 3 / 2;
-    RK_S32 ret = RK_MPI_MMZ_Alloc(&g_display_mb, nv12_size, RK_MMZ_ALLOC_CACHEABLE);
-    if (ret != RK_SUCCESS || g_display_mb == MB_INVALID_HANDLE) {
-        log_error("RK_MPI_MMZ_Alloc failed: 0x%x, trying uncacheable\n", ret);
-        ret = RK_MPI_MMZ_Alloc(&g_display_mb, nv12_size, RK_MMZ_ALLOC_UNCACHEABLE);
-        if (ret != RK_SUCCESS || g_display_mb == MB_INVALID_HANDLE) {
-            log_error("RK_MPI_MMZ_Alloc failed completely: 0x%x\n", ret);
-            cleanup_display_venc();
-            free(ctx->rotate_buf);
-            munmap(ctx->fb_pixels, ctx->fb_size);
-            close(ctx->fb_fd);
-            return -1;
-        }
-    }
-    g_display_mb_vaddr = RK_MPI_MMZ_Handle2VirAddr(g_display_mb);
-    log_info("Allocated DMA buffer: %zu bytes\n", nv12_size);
-
     ctx->running = 1;
+    log_info("Display capture initialized (CPU rotation + RGA color conversion)\n");
     return 0;
 }
 
 void display_capture_cleanup(DisplayCapture *ctx) {
     ctx->running = 0;
 
-    /* Free DMA buffer */
-    if (g_display_mb != MB_INVALID_HANDLE) {
-        RK_MPI_MMZ_Free(g_display_mb);
-        g_display_mb = MB_INVALID_HANDLE;
-        g_display_mb_vaddr = NULL;
-    }
-
     /* Cleanup VENC */
     cleanup_display_venc();
 
-    if (ctx->rotate_buf) {
-        free(ctx->rotate_buf);
-        ctx->rotate_buf = NULL;
+    /* Free DMA buffers */
+    if (g_display_dst_mb != MB_INVALID_HANDLE) {
+        RK_MPI_MMZ_Free(g_display_dst_mb);
+        g_display_dst_mb = MB_INVALID_HANDLE;
+        g_display_dst_vaddr = NULL;
+    }
+
+    if (g_display_rot_mb != MB_INVALID_HANDLE) {
+        RK_MPI_MMZ_Free(g_display_rot_mb);
+        g_display_rot_mb = MB_INVALID_HANDLE;
+        g_display_rot_vaddr = NULL;
+    }
+
+    if (g_display_src_mb != MB_INVALID_HANDLE) {
+        RK_MPI_MMZ_Free(g_display_src_mb);
+        g_display_src_mb = MB_INVALID_HANDLE;
+        g_display_src_vaddr = NULL;
     }
 
     if (ctx->fb_pixels && ctx->fb_pixels != MAP_FAILED) {
@@ -417,37 +441,66 @@ void display_capture_cleanup(DisplayCapture *ctx) {
 }
 
 size_t display_capture_frame(DisplayCapture *ctx, uint8_t *jpeg_buf, size_t jpeg_buf_size) {
-    if (!ctx->running || !ctx->fb_pixels || !g_display_mb_vaddr) {
+    if (!ctx->running || !ctx->fb_pixels || !g_display_src_vaddr || !g_display_rot_vaddr || !g_display_dst_vaddr) {
         return 0;
     }
 
-    const uint32_t *pixels;
+    void *rga_src;
+    int rga_width, rga_height;
 
-    /* Apply rotation if needed */
-    if (ctx->orientation != DISPLAY_ORIENT_NORMAL) {
-        rotate_pixels(ctx->fb_pixels, (uint32_t *)ctx->rotate_buf,
-                     ctx->fb_width, ctx->fb_height, ctx->orientation);
-        pixels = (const uint32_t *)ctx->rotate_buf;
+    /* Copy framebuffer to cached DMA buffer first (fb mmap is slow/uncached) */
+    memcpy(g_display_src_vaddr, ctx->fb_pixels, ctx->fb_size);
+
+    /* Apply CPU rotation if needed, reading from cached source buffer */
+    if (ctx->orientation == DISPLAY_ORIENT_FLIP_180) {
+        rotate_bgrx_180((uint32_t *)g_display_src_vaddr, (uint32_t *)g_display_rot_vaddr, ctx->fb_width, ctx->fb_height);
+        rga_src = g_display_rot_vaddr;
+        rga_width = ctx->fb_width;
+        rga_height = ctx->fb_height;
+        /* Flush rotation buffer cache so RGA can see it */
+        RK_MPI_MMZ_FlushCacheStart(g_display_rot_mb, 0, ctx->fb_size, RK_MMZ_SYNC_WRITEONLY);
+        RK_MPI_MMZ_FlushCacheEnd(g_display_rot_mb, 0, ctx->fb_size, RK_MMZ_SYNC_WRITEONLY);
+    } else if (ctx->orientation == DISPLAY_ORIENT_ROTATE_90) {
+        rotate_bgrx_90((uint32_t *)g_display_src_vaddr, (uint32_t *)g_display_rot_vaddr, ctx->fb_width, ctx->fb_height);
+        rga_src = g_display_rot_vaddr;
+        rga_width = ctx->fb_height;  /* Swapped */
+        rga_height = ctx->fb_width;
+        /* Flush rotation buffer cache so RGA can see it */
+        RK_MPI_MMZ_FlushCacheStart(g_display_rot_mb, 0, ctx->fb_size, RK_MMZ_SYNC_WRITEONLY);
+        RK_MPI_MMZ_FlushCacheEnd(g_display_rot_mb, 0, ctx->fb_size, RK_MMZ_SYNC_WRITEONLY);
+    } else if (ctx->orientation == DISPLAY_ORIENT_ROTATE_270) {
+        rotate_bgrx_270((uint32_t *)g_display_src_vaddr, (uint32_t *)g_display_rot_vaddr, ctx->fb_width, ctx->fb_height);
+        rga_src = g_display_rot_vaddr;
+        rga_width = ctx->fb_height;  /* Swapped */
+        rga_height = ctx->fb_width;
+        /* Flush rotation buffer cache so RGA can see it */
+        RK_MPI_MMZ_FlushCacheStart(g_display_rot_mb, 0, ctx->fb_size, RK_MMZ_SYNC_WRITEONLY);
+        RK_MPI_MMZ_FlushCacheEnd(g_display_rot_mb, 0, ctx->fb_size, RK_MMZ_SYNC_WRITEONLY);
     } else {
-        /* Copy to rotate_buf even if no rotation (needed for consistent pointer) */
-        memcpy(ctx->rotate_buf, ctx->fb_pixels, ctx->fb_size);
-        pixels = (const uint32_t *)ctx->rotate_buf;
+        /* No rotation needed, use source buffer directly */
+        rga_src = g_display_src_vaddr;
+        rga_width = ctx->fb_width;
+        rga_height = ctx->fb_height;
+        /* Flush source buffer cache so RGA can see it */
+        RK_MPI_MMZ_FlushCacheStart(g_display_src_mb, 0, ctx->fb_size, RK_MMZ_SYNC_WRITEONLY);
+        RK_MPI_MMZ_FlushCacheEnd(g_display_src_mb, 0, ctx->fb_size, RK_MMZ_SYNC_WRITEONLY);
     }
 
-    /* Convert BGRX to NV12 */
-    size_t y_size = ctx->output_width * ctx->output_height;
-    uint8_t *nv12_y = (uint8_t *)g_display_mb_vaddr;
-    uint8_t *nv12_uv = nv12_y + y_size;
-    bgrx_to_nv12(pixels, nv12_y, nv12_uv, ctx->output_width, ctx->output_height);
+    /* RGA color conversion (BGRX to NV12) */
+    if (rga_convert_bgrx_to_nv12(rga_src, g_display_dst_vaddr, rga_width, rga_height) != 0) {
+        log_error("RGA conversion failed\n");
+        return 0;
+    }
 
-    /* Flush cache for DMA */
-    RK_MPI_MMZ_FlushCacheStart(g_display_mb, 0, y_size * 3 / 2, RK_MMZ_SYNC_WRITEONLY);
-    RK_MPI_MMZ_FlushCacheEnd(g_display_mb, 0, y_size * 3 / 2, RK_MMZ_SYNC_WRITEONLY);
+    /* Flush destination cache for VENC */
+    size_t nv12_size = ctx->output_width * ctx->output_height * 3 / 2;
+    RK_MPI_MMZ_FlushCacheStart(g_display_dst_mb, 0, nv12_size, RK_MMZ_SYNC_WRITEONLY);
+    RK_MPI_MMZ_FlushCacheEnd(g_display_dst_mb, 0, nv12_size, RK_MMZ_SYNC_WRITEONLY);
 
     /* Setup frame info for VENC */
     VIDEO_FRAME_INFO_S stFrame;
     memset(&stFrame, 0, sizeof(stFrame));
-    stFrame.stVFrame.pMbBlk = g_display_mb;
+    stFrame.stVFrame.pMbBlk = g_display_dst_mb;
     stFrame.stVFrame.u32Width = ctx->output_width;
     stFrame.stVFrame.u32Height = ctx->output_height;
     stFrame.stVFrame.u32VirWidth = ctx->output_width;
@@ -566,7 +619,7 @@ int display_capture_start(int fps) {
         return -1;
     }
 
-    log_info("Display capture started at %d fps (hardware VENC)\n", fps);
+    log_info("Display capture started at %d fps (RGA + VENC hardware)\n", fps);
     return 0;
 }
 
