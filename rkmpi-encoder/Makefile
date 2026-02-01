@@ -50,6 +50,7 @@ SRCS = rkmpi_enc.c \
        mqtt_client.c \
        rpc_client.c \
        timelapse.c \
+       display_capture.c \
        cJSON.c
 
 OBJS = $(SRCS:.c=.o)
@@ -61,7 +62,8 @@ HDRS = frame_buffer.h \
        json_util.h \
        mqtt_client.h \
        rpc_client.h \
-       timelapse.h
+       timelapse.h \
+       display_capture.h
 
 .PHONY: all clean install static dynamic server-only
 
@@ -146,6 +148,8 @@ help:
 	@echo "  PRINTER_IP   Printer IP address (default: $(PRINTER_IP))"
 	@echo ""
 	@echo "Server mode endpoints:"
-	@echo "  MJPEG stream:  http://\$$(PRINTER_IP):8080/stream"
+	@echo "  MJPEG stream:   http://\$$(PRINTER_IP):8080/stream"
 	@echo "  MJPEG snapshot: http://\$$(PRINTER_IP):8080/snapshot"
-	@echo "  FLV stream:    http://\$$(PRINTER_IP):18088/flv"
+	@echo "  FLV stream:     http://\$$(PRINTER_IP):18088/flv"
+	@echo "  Display stream: http://\$$(PRINTER_IP):8080/display (with --display)"
+	@echo "  Display snap:   http://\$$(PRINTER_IP):8080/display/snapshot"

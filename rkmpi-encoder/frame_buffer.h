@@ -13,8 +13,9 @@
 #include <pthread.h>
 
 /* Maximum frame sizes */
-#define FRAME_BUFFER_MAX_JPEG  (512 * 1024)   /* 512KB for JPEG */
-#define FRAME_BUFFER_MAX_H264  (256 * 1024)   /* 256KB for H.264 */
+#define FRAME_BUFFER_MAX_JPEG    (512 * 1024)   /* 512KB for camera JPEG */
+#define FRAME_BUFFER_MAX_H264    (256 * 1024)   /* 256KB for H.264 */
+#define FRAME_BUFFER_MAX_DISPLAY (512 * 1024)   /* 512KB for display JPEG */
 
 /* Frame data structure */
 typedef struct {
@@ -39,6 +40,7 @@ typedef struct {
 /* Global frame buffers */
 extern FrameBuffer g_jpeg_buffer;
 extern FrameBuffer g_h264_buffer;
+extern FrameBuffer g_display_buffer;
 
 /* Initialization and cleanup */
 int frame_buffer_init(FrameBuffer *fb, size_t capacity);

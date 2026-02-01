@@ -11,6 +11,7 @@
 /* Global frame buffers */
 FrameBuffer g_jpeg_buffer;
 FrameBuffer g_h264_buffer;
+FrameBuffer g_display_buffer;
 
 static uint64_t get_timestamp_us(void) {
     struct timespec ts;
@@ -82,10 +83,16 @@ int frame_buffers_init(void) {
         frame_buffer_cleanup(&g_jpeg_buffer);
         return -1;
     }
+    if (frame_buffer_init(&g_display_buffer, FRAME_BUFFER_MAX_DISPLAY) != 0) {
+        frame_buffer_cleanup(&g_h264_buffer);
+        frame_buffer_cleanup(&g_jpeg_buffer);
+        return -1;
+    }
     return 0;
 }
 
 void frame_buffers_cleanup(void) {
+    frame_buffer_cleanup(&g_display_buffer);
     frame_buffer_cleanup(&g_jpeg_buffer);
     frame_buffer_cleanup(&g_h264_buffer);
 }

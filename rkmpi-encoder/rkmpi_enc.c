@@ -61,6 +61,7 @@
 #include "http_server.h"
 #include "mqtt_client.h"
 #include "rpc_client.h"
+#include "display_capture.h"
 
 /*
  * Stack Smashing Protection stubs for uClibc without SSP support
@@ -193,6 +194,9 @@ typedef struct {
     /* H.264 resolution (rkmpi mode only, 0=same as camera) */
     int h264_width;
     int h264_height;
+    /* Display capture */
+    int display_capture;  /* 1=enable display framebuffer capture */
+    int display_fps;      /* Display capture FPS (default: 5) */
 } EncoderConfig;
 
 static void log_info(const char *fmt, ...) {
@@ -1159,6 +1163,8 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "  --streaming-port <n> MJPEG HTTP server port (default: %d)\n", HTTP_MJPEG_PORT);
     fprintf(stderr, "  --h264-resolution <WxH> H.264 encode resolution (rkmpi mode only, default: camera res)\n");
     fprintf(stderr, "                       Lower resolution reduces TurboJPEG decode CPU usage\n");
+    fprintf(stderr, "  --display            Enable display framebuffer capture (server mode)\n");
+    fprintf(stderr, "  --display-fps <n>    Display capture FPS (default: %d)\n", DISPLAY_DEFAULT_FPS);
     fprintf(stderr, "  -v, --verbose        Verbose output to stderr\n");
     fprintf(stderr, "  -V, --version        Show version and exit\n");
     fprintf(stderr, "  --help               Show this help\n");
@@ -1196,7 +1202,9 @@ int main(int argc, char *argv[]) {
         .vanilla_klipper = 0,
         .streaming_port = 0,
         .h264_width = 0,
-        .h264_height = 0
+        .h264_height = 0,
+        .display_capture = 0,
+        .display_fps = DISPLAY_DEFAULT_FPS
     };
     strncpy(cfg.device, DEFAULT_DEVICE, sizeof(cfg.device) - 1);
     cfg.h264_output[0] = '\0';
@@ -1224,6 +1232,8 @@ int main(int argc, char *argv[]) {
         {"mode",         required_argument, 0, 'M'},
         {"streaming-port", required_argument, 0, 'P'},
         {"h264-resolution", required_argument, 0, 'R'},
+        {"display",      no_argument,       0, 'D'},
+        {"display-fps",  required_argument, 0, 'F'},
         {0, 0, 0, 0}
     };
 
@@ -1262,6 +1272,8 @@ int main(int argc, char *argv[]) {
                     return 1;
                 }
                 break;
+            case 'D': cfg.display_capture = 1; break;
+            case 'F': cfg.display_fps = atoi(optarg); break;
             case 'H':
             case '?':
                 print_usage(argv[0]);
@@ -1596,6 +1608,16 @@ int main(int argc, char *argv[]) {
             }
         } else {
             log_info("  MQTT/RPC: disabled (vanilla-klipper mode)\n");
+        }
+
+        /* Start display capture if enabled */
+        if (cfg.display_capture) {
+            if (display_capture_start(cfg.display_fps) == 0) {
+                log_info("  Display capture: http://0.0.0.0:%d/display (%d fps)\n",
+                         mjpeg_port, cfg.display_fps);
+            } else {
+                log_error("  Display capture: failed to start\n");
+            }
         }
     }
 
@@ -1984,6 +2006,10 @@ int main(int argc, char *argv[]) {
     if (mjpeg_server_initialized) {
         log_info("Stopping MJPEG server...\n");
         mjpeg_server_stop();
+    }
+    if (display_capture_is_running()) {
+        log_info("Stopping display capture...\n");
+        display_capture_stop();
     }
 
     /* Cleanup */

@@ -186,6 +186,13 @@ static RequestType parse_http_request(const char *buf, size_t len, int port) {
         if (path_len >= 9 && strncmp(path, "/snapshot", 9) == 0) {
             return REQUEST_MJPEG_SNAPSHOT;
         }
+        /* Display capture endpoints */
+        if (path_len >= 17 && strncmp(path, "/display/snapshot", 17) == 0) {
+            return REQUEST_DISPLAY_SNAPSHOT;
+        }
+        if (path_len >= 8 && strncmp(path, "/display", 8) == 0) {
+            return REQUEST_DISPLAY_STREAM;
+        }
     } else if (port == HTTP_FLV_PORT) {
         if (path_len >= 4 && strncmp(path, "/flv", 4) == 0) {
             return REQUEST_FLV_STREAM;
@@ -235,17 +242,16 @@ static void http_send_mjpeg_headers(int fd) {
     http_send(fd, headers, len);
 }
 
-/* Send single JPEG snapshot */
-static void http_send_snapshot(int fd) {
-    uint8_t *jpeg_buf = malloc(FRAME_BUFFER_MAX_JPEG);
+/* Send single JPEG snapshot from a buffer */
+static void http_send_snapshot_from_buffer(int fd, FrameBuffer *buffer, size_t max_size) {
+    uint8_t *jpeg_buf = malloc(max_size);
     if (!jpeg_buf) {
         http_send_404(fd);
         return;
     }
 
     uint64_t seq;
-    size_t jpeg_size = frame_buffer_copy(&g_jpeg_buffer, jpeg_buf,
-                                         FRAME_BUFFER_MAX_JPEG, &seq, NULL);
+    size_t jpeg_size = frame_buffer_copy(buffer, jpeg_buf, max_size, &seq, NULL);
 
     if (jpeg_size > 0) {
         char headers[256];
@@ -263,6 +269,16 @@ static void http_send_snapshot(int fd) {
     }
 
     free(jpeg_buf);
+}
+
+/* Send single JPEG snapshot (camera) */
+static void http_send_snapshot(int fd) {
+    http_send_snapshot_from_buffer(fd, &g_jpeg_buffer, FRAME_BUFFER_MAX_JPEG);
+}
+
+/* Send single JPEG snapshot (display) */
+static void http_send_display_snapshot(int fd) {
+    http_send_snapshot_from_buffer(fd, &g_display_buffer, FRAME_BUFFER_MAX_DISPLAY);
 }
 
 /* Send FLV stream headers (gkcam-compatible) */
@@ -313,6 +329,18 @@ static void http_handle_client_read(HttpServer *srv, HttpClient *client) {
                 client->state = CLIENT_STATE_CLOSING;
                 break;
 
+            case REQUEST_DISPLAY_STREAM:
+                http_send_mjpeg_headers(client->fd);
+                client->state = CLIENT_STATE_STREAMING;
+                client->header_sent = 1;
+                log_info("HTTP[%d]: Display stream started\n", srv->port);
+                break;
+
+            case REQUEST_DISPLAY_SNAPSHOT:
+                http_send_display_snapshot(client->fd);
+                client->state = CLIENT_STATE_CLOSING;
+                break;
+
             case REQUEST_FLV_STREAM:
                 http_send_flv_headers(client->fd);
                 client->state = CLIENT_STATE_STREAMING;
@@ -359,6 +387,7 @@ static void *mjpeg_server_thread(void *arg) {
     HttpServer *srv = &st->server;
 
     uint8_t *jpeg_buf = malloc(FRAME_BUFFER_MAX_JPEG);
+    uint8_t *display_buf = malloc(FRAME_BUFFER_MAX_DISPLAY);
     char header_buf[256];
 
     while (st->running && srv->running) {
@@ -395,7 +424,8 @@ static void *mjpeg_server_thread(void *arg) {
         }
 
         /* Stream frames to connected clients */
-        uint64_t current_seq = frame_buffer_get_sequence(&g_jpeg_buffer);
+        uint64_t camera_seq = frame_buffer_get_sequence(&g_jpeg_buffer);
+        uint64_t display_seq = frame_buffer_get_sequence(&g_display_buffer);
 
         for (int i = 0; i < HTTP_MAX_CLIENTS; i++) {
             HttpClient *client = &srv->clients[i];
@@ -405,14 +435,28 @@ static void *mjpeg_server_thread(void *arg) {
                 continue;
             }
 
-            if (client->fd > 0 && client->state == CLIENT_STATE_STREAMING &&
-                client->request == REQUEST_MJPEG_STREAM) {
+            if (client->fd > 0 && client->state == CLIENT_STATE_STREAMING) {
+                FrameBuffer *buffer = NULL;
+                uint8_t *buf = NULL;
+                size_t buf_size = 0;
+                uint64_t current_seq = 0;
 
-                /* Check if we have a new frame */
-                if (current_seq > client->last_frame_seq) {
+                /* Select source buffer based on request type */
+                if (client->request == REQUEST_MJPEG_STREAM) {
+                    buffer = &g_jpeg_buffer;
+                    buf = jpeg_buf;
+                    buf_size = FRAME_BUFFER_MAX_JPEG;
+                    current_seq = camera_seq;
+                } else if (client->request == REQUEST_DISPLAY_STREAM) {
+                    buffer = &g_display_buffer;
+                    buf = display_buf;
+                    buf_size = FRAME_BUFFER_MAX_DISPLAY;
+                    current_seq = display_seq;
+                }
+
+                if (buffer && buf && current_seq > client->last_frame_seq) {
                     uint64_t seq;
-                    size_t jpeg_size = frame_buffer_copy(&g_jpeg_buffer, jpeg_buf,
-                                                         FRAME_BUFFER_MAX_JPEG, &seq, NULL);
+                    size_t jpeg_size = frame_buffer_copy(buffer, buf, buf_size, &seq, NULL);
 
                     if (jpeg_size > 0) {
                         /* Send multipart frame */
@@ -421,7 +465,7 @@ static void *mjpeg_server_thread(void *arg) {
                             MJPEG_BOUNDARY, jpeg_size);
 
                         if (http_send(client->fd, header_buf, hlen) < 0 ||
-                            http_send(client->fd, jpeg_buf, jpeg_size) < 0 ||
+                            http_send(client->fd, buf, jpeg_size) < 0 ||
                             http_send(client->fd, "\r\n", 2) < 0) {
                             client->state = CLIENT_STATE_CLOSING;
                         } else {
@@ -433,6 +477,7 @@ static void *mjpeg_server_thread(void *arg) {
         }
     }
 
+    free(display_buf);
     free(jpeg_buf);
     return NULL;
 }

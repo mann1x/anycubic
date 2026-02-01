@@ -39,7 +39,9 @@ typedef enum {
     REQUEST_NONE,
     REQUEST_MJPEG_STREAM,       /* /stream */
     REQUEST_MJPEG_SNAPSHOT,     /* /snapshot */
-    REQUEST_FLV_STREAM          /* /flv */
+    REQUEST_FLV_STREAM,         /* /flv */
+    REQUEST_DISPLAY_STREAM,     /* /display */
+    REQUEST_DISPLAY_SNAPSHOT    /* /display/snapshot */
 } RequestType;
 
 /* Client connection */
