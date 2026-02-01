@@ -151,9 +151,10 @@ anycubic/anycubicCloud/v1/web/printer/{modelId}/{deviceId}/video
 
 ## Control Page Features
 
-The `/control` endpoint provides a web UI with:
-- **Tab-based preview**: Snapshot, MJPEG Stream, H.264 Stream
+The `/control` endpoint (on port 8081) provides a web UI with:
+- **Tab-based preview**: Snapshot, MJPEG Stream, H.264 Stream, Display Stream
 - **H.264 player**: Uses flv.js from CDN for live FLV playback in browser
+- **Display preview**: Shows printer LCD framebuffer (5 fps MJPEG)
 - **Performance stats**: Real-time MJPEG FPS, H.264 FPS, Total CPU, Encoder CPU
 - **Settings**:
   - Auto LAN mode toggle
@@ -161,6 +162,11 @@ The `/control` endpoint provides a web UI with:
   - **Frame Rate slider**: 0-100% with text input (100%=all frames, 0%=~1fps)
   - **Auto Skip toggle**: CPU-based dynamic frame rate adjustment
   - **Target CPU %**: Maximum CPU target when auto-skip enabled (30-90%)
+
+### Port Layout
+- **Port 8080**: Streaming endpoints (`/stream`, `/snapshot`, `/display`, `/display/snapshot`)
+- **Port 8081**: Control page (`/control`, `/api/*`)
+- **Port 18088**: FLV H.264 stream (`/flv`)
 
 ### API Stats Response (`/api/stats`)
 ```json
@@ -469,6 +475,38 @@ This ensures the printer maintains at least 40% CPU headroom for other tasks.
 | 80% | 2 | 62.8% | 38.2% | 10.0 | OK |
 
 *30% target is below encoder baseline (~35% CPU minimum)
+
+## Display Capture
+
+**Status:** ✅ **Fully supported** in rkmpi/rkmpi-yuyv modes with `--display` flag.
+
+Captures the printer's LCD framebuffer (/dev/fb0) and streams it as MJPEG for remote viewing of the printer's touchscreen.
+
+### Endpoints
+- `/display` - MJPEG multipart stream (5 fps)
+- `/display/snapshot` - Single JPEG frame
+
+### Features
+- **Auto-orientation**: Detects printer model and applies correct rotation (90°, 180°, or 270°)
+- **Hardware encoding**: Uses RV1106 VENC for efficient JPEG compression
+- **Low CPU**: ~15% CPU usage at 5 fps
+
+### How It Works
+1. Framebuffer is memory-mapped from /dev/fb0 (800×480 BGRX, 32bpp)
+2. Copied to DMA buffer (framebuffer mmap is slow/uncached)
+3. CPU rotation applied based on printer model (NEON SIMD for 180°)
+4. RGA converts BGRX → NV12
+5. VENC encodes to JPEG
+6. Served via HTTP on `/display` endpoint
+
+### Printer Model Orientation
+| Model | Orientation |
+|-------|-------------|
+| KS1, KS1M | 180° flip |
+| K3M | 270° rotation |
+| K3, K2P, K3V2 | 90° rotation |
+
+---
 
 ## Timelapse Recording
 

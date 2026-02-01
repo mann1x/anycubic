@@ -94,7 +94,7 @@ For higher resolutions/framerates, a full hardware pipeline (VDEC→RGA→VENC) 
 
 ## Overview
 
-This encoder captures MJPEG frames from a USB camera, decodes them using TurboJPEG, and re-encodes to H.264 using the RV1106's hardware VENC. Output is written to named pipes (FIFOs) for consumption by the h264_server.py streaming server.
+This encoder captures MJPEG frames from a USB camera, decodes them using TurboJPEG, and re-encodes to H.264 using the RV1106's hardware VENC. It also supports capturing the printer's LCD framebuffer for remote display viewing. Output is served via built-in HTTP servers.
 
 ## Architecture
 
@@ -105,9 +105,13 @@ TurboJPEG decode (software)
     ↓
 NV12 frame buffer
     ↓
-RKMPI VENC (hardware H.264)
-    ↓
-Named pipes: /tmp/mjpeg.pipe, /tmp/h264.pipe
+RKMPI VENC Ch0 (hardware H.264) → FLV HTTP server (:18088)
+RKMPI VENC Ch1 (hardware MJPEG) → MJPEG HTTP server (:8080)
+
+Display Capture (optional, --display flag):
+    Framebuffer (/dev/fb0) → memcpy → CPU rotation → RGA (BGRX→NV12) → VENC Ch2 (MJPEG)
+                                                                            ↓
+                                                              /display endpoint (:8080)
 ```
 
 ## Build System
@@ -183,6 +187,10 @@ make install-h264
 | `-t` | Target CPU % for auto-skip (default: 60) |
 | `-n` | Disable H.264 encoding (MJPEG only) |
 | `-v` | Verbose output |
+| `-S` | Server mode (built-in HTTP servers) |
+| `-N` | No camera (server mode without camera capture) |
+| `--display` | Enable display capture (LCD framebuffer) |
+| `--streaming-port` | HTTP server port (default: 8080) |
 
 ## CPU Optimizations
 
@@ -190,8 +198,51 @@ The encoder includes several CPU optimizations:
 
 1. **Pre-allocated YUV buffer**: Avoids per-frame malloc/free overhead
 2. **NEON SIMD UV interleaving**: Uses ARM NEON intrinsics for U/V plane interleaving
-3. **TurboJPEG fast flags**: Uses `TJFLAG_FASTDCT | TJFLAG_FASTUPSAMPLE` for faster decoding
-4. **Auto-skip**: Dynamically adjusts skip ratio based on CPU usage
+3. **NEON SIMD rotation**: Uses NEON intrinsics for 180° display rotation
+4. **TurboJPEG fast flags**: Uses `TJFLAG_FASTDCT | TJFLAG_FASTUPSAMPLE` for faster decoding
+5. **Auto-skip**: Dynamically adjusts skip ratio based on CPU usage
+6. **DMA buffers**: Uses RK_MPI_MMZ for hardware-accessible memory
+
+## Display Capture
+
+The `--display` flag enables capturing the printer's LCD framebuffer (/dev/fb0) for remote viewing.
+
+### Pipeline
+```
+Framebuffer (800x480 BGRX)
+    ↓ memcpy to DMA buffer (fb mmap is slow/uncached)
+    ↓ CPU rotation (NEON SIMD for 180°)
+    ↓ RGA color conversion (BGRX → NV12)
+    ↓ VENC Ch2 (MJPEG encoding)
+    ↓
+/display endpoint (5 fps)
+```
+
+### Screen Orientation
+Auto-detected from `/userdata/app/gk/config/api.cfg` (JSON format with `modelId`):
+
+| Model | Model ID | Orientation |
+|-------|----------|-------------|
+| KS1, KS1M | 20025, 20029 | 180° flip |
+| K3M | 20026 | 270° rotation |
+| K3, K2P, K3V2 | 20024, 20021, 20027 | 90° rotation |
+
+### Endpoints
+- `/display` - MJPEG multipart stream (5 fps)
+- `/display/snapshot` - Single JPEG frame
+
+### Performance
+- **CPU usage**: ~15% at 5 fps (800x480)
+- **Memory**: 3 DMA buffers (~4.5MB total)
+  - Source BGRX: 800×480×4 = 1.5MB
+  - Rotation BGRX: 800×480×4 = 1.5MB
+  - NV12 output: 800×480×1.5 = 0.6MB
+
+### Implementation Details
+- Rotation done in CPU (RGA combined rotation+color conversion unreliable)
+- DMA buffers allocated via `RK_MPI_MMZ_Alloc` for RGA/VENC access
+- Cache flush required after CPU writes, before hardware reads
+- Uses VENC channel 2 (separate from camera channels 0, 1)
 
 ## Output Pipes
 
