@@ -2171,6 +2171,7 @@ class StreamerApp:
         self.control_port = getattr(args, 'control_port', self.CONTROL_PORT)
         self.gkcam_all_frames = getattr(args, 'gkcam_all_frames', False)
         self.jpeg_quality = getattr(args, 'jpeg_quality', 85)  # HW JPEG quality (1-99)
+        self.h264_resolution = getattr(args, 'h264_resolution', '1280x720')  # H.264 encode resolution (rkmpi only)
 
         # Gkcam mode: FLV reader for keyframe extraction, transcoder for all-frames
         self.gkcam_reader = None  # Reads H.264 NALs from FLV (keyframe-only mode)
@@ -2570,6 +2571,10 @@ class StreamerApp:
         # YUYV mode: use hardware JPEG encoding
         if self.encoder_type == 'rkmpi-yuyv':
             cmd.extend(['-y', '-j', str(self.jpeg_quality)])
+        else:
+            # rkmpi mode: allow custom H.264 resolution (for lower CPU during decode)
+            if self.h264_resolution and self.h264_resolution != '1280x720':
+                cmd.extend(['--h264-resolution', self.h264_resolution])
 
         if effective_auto_skip:
             cmd.append('-a')
@@ -5014,6 +5019,8 @@ def main():
                         help='MJPEG camera framerate (default: 10)')
     parser.add_argument('--jpeg-quality', type=int, default=85,
                         help='JPEG quality for HW encode in rkmpi-yuyv mode (1-99, default: 85)')
+    parser.add_argument('--h264-resolution', type=str, default='1280x720',
+                        help='H.264 encoding resolution for rkmpi mode (default: 1280x720)')
 
     args = parser.parse_args()
 

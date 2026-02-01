@@ -117,6 +117,14 @@ else
     export APP_MJPEG_FPS=""
 fi
 
+# Check h264_resolution property (default 1280x720, only for rkmpi mode)
+H264_RESOLUTION=$(get_app_property $APP_NAME h264_resolution)
+if [ -n "$H264_RESOLUTION" ] && [ "$H264_RESOLUTION" != "null" ] && [ "$H264_RESOLUTION" != "1280x720" ]; then
+    export APP_H264_RESOLUTION="--h264-resolution $H264_RESOLUTION"
+else
+    export APP_H264_RESOLUTION=""
+fi
+
 status() {
     PIDS=$(get_by_name h264_monitor)
 

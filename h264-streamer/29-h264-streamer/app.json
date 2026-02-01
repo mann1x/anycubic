@@ -53,6 +53,13 @@
             "description": "JPEG quality for hardware encoding in rkmpi-yuyv mode (1-99).",
             "type": "int",
             "default": "85"
+        },
+        "h264_resolution": {
+            "display": "H.264 Resolution",
+            "description": "H.264 encoding resolution for rkmpi mode only. Lower resolution reduces CPU usage. MJPEG stream stays at camera resolution.",
+            "type": "select",
+            "options": ["1280x720", "640x480"],
+            "default": "1280x720"
         }
     }
 }

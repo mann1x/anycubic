@@ -190,6 +190,9 @@ typedef struct {
     int vanilla_klipper;  /* 1=vanilla-klipper mode (skip MQTT/RPC) */
     /* Configurable ports */
     int streaming_port;   /* MJPEG HTTP port (default 8080) */
+    /* H.264 resolution (rkmpi mode only, 0=same as camera) */
+    int h264_width;
+    int h264_height;
 } EncoderConfig;
 
 static void log_info(const char *fmt, ...) {
@@ -826,17 +829,23 @@ static void interleave_uv(const uint8_t *u_plane, const uint8_t *v_plane,
 }
 
 /*
- * Decode JPEG to NV12 using TurboJPEG
+ * Decode JPEG to NV12 using TurboJPEG with optional scaling
  * Decodes to YUV420P first (I420), then converts to NV12 (YUV420SP)
+ *
+ * Parameters:
+ * - src_width/src_height: Expected JPEG source dimensions
+ * - dst_width/dst_height: Desired output dimensions (for scaling)
  *
  * Optimizations:
  * - Pre-allocated buffer (no malloc per frame)
  * - TJFLAG_FASTDCT | TJFLAG_FASTUPSAMPLE for faster decode
  * - NEON SIMD for UV interleaving
+ * - TurboJPEG DCT scaling (decodes fewer pixels when scaling down)
  */
 static int decode_jpeg_to_nv12(const uint8_t *jpeg_data, size_t jpeg_len,
                                 uint8_t *nv12_y, uint8_t *nv12_uv,
-                                int width, int height) {
+                                int src_width, int src_height,
+                                int dst_width, int dst_height) {
     int jpeg_width, jpeg_height, jpeg_subsamp, jpeg_colorspace;
 
     /* Get JPEG parameters */
@@ -846,11 +855,48 @@ static int decode_jpeg_to_nv12(const uint8_t *jpeg_data, size_t jpeg_len,
         return -1;
     }
 
-    if (jpeg_width != width || jpeg_height != height) {
+    if (jpeg_width != src_width || jpeg_height != src_height) {
         log_error("JPEG size mismatch: %dx%d vs expected %dx%d\n",
-                  jpeg_width, jpeg_height, width, height);
+                  jpeg_width, jpeg_height, src_width, src_height);
         return -1;
     }
+
+    /* Determine if scaling is needed */
+    int scale_num = 1, scale_denom = 1;
+    int decode_width = src_width;
+    int decode_height = src_height;
+
+    if (dst_width < src_width || dst_height < src_height) {
+        /* Find best TurboJPEG scaling factor
+         * Available: 1/1, 7/8, 3/4, 5/8, 1/2, 3/8, 1/4, 1/8 */
+        int num_factors;
+        tjscalingfactor *factors = tjGetScalingFactors(&num_factors);
+        if (factors) {
+            /* Find smallest factor that produces >= dst dimensions */
+            for (int i = num_factors - 1; i >= 0; i--) {
+                int sw = TJSCALED(src_width, factors[i]);
+                int sh = TJSCALED(src_height, factors[i]);
+                if (sw >= dst_width && sh >= dst_height) {
+                    scale_num = factors[i].num;
+                    scale_denom = factors[i].denom;
+                    decode_width = sw;
+                    decode_height = sh;
+                    break;
+                }
+            }
+        }
+        static int logged_scale = 0;
+        if (!logged_scale) {
+            log_info("JPEG scaling: %dx%d -> %dx%d (factor %d/%d, target %dx%d)\n",
+                     src_width, src_height, decode_width, decode_height,
+                     scale_num, scale_denom, dst_width, dst_height);
+            logged_scale = 1;
+        }
+    }
+
+    /* Use decode dimensions for the rest of the function */
+    int width = decode_width;
+    int height = decode_height;
 
     /* Debug: log JPEG format (once) */
     static int logged_format = 0;
@@ -863,67 +909,68 @@ static int decode_jpeg_to_nv12(const uint8_t *jpeg_data, size_t jpeg_len,
         logged_format = 1;
     }
 
-    /* Calculate plane sizes based on actual JPEG subsampling */
+    /* Calculate buffer size using TurboJPEG helper (handles all subsamplings correctly) */
     size_t y_size = width * height;
-    size_t src_uv_width = width / 2;  /* U/V always half width */
-    size_t src_uv_height;
-    int src_uv_stride;
-
-    /* Determine source UV height based on subsampling:
-     * TJSAMP_422 (1) = full height, TJSAMP_420 (2) = half height */
-    if (jpeg_subsamp == TJSAMP_422 || jpeg_subsamp == TJSAMP_444) {
-        src_uv_height = height;        /* 4:2:2 or 4:4:4 - full height */
-        src_uv_stride = (jpeg_subsamp == TJSAMP_444) ? width : width / 2;
-    } else {
-        src_uv_height = height / 2;    /* 4:2:0 or other - half height */
-        src_uv_stride = width / 2;
+    unsigned long needed = tjBufSizeYUV2(width, 1, height, jpeg_subsamp);
+    if (needed == (unsigned long)-1) {
+        log_error("tjBufSizeYUV2 failed\n");
+        return -1;
     }
-    size_t src_uv_size = src_uv_stride * src_uv_height;
 
-    /* Ensure buffer is large enough for the actual format */
-    size_t needed = y_size + src_uv_size * 2;  /* Y + U + V */
+    /* Ensure buffer is large enough */
     if (g_yuv_buffer_size < needed) {
         free(g_yuv_buffer);
         g_yuv_buffer = malloc(needed);
         if (!g_yuv_buffer) {
-            log_error("Failed to allocate YUV buffer (%zu bytes)\n", needed);
+            log_error("Failed to allocate YUV buffer (%lu bytes)\n", needed);
             g_yuv_buffer_size = 0;
             return -1;
         }
         g_yuv_buffer_size = needed;
-        log_info("Allocated YUV buffer: %zu bytes (for %s)\n", needed,
+        log_info("Allocated YUV buffer: %lu bytes (for %dx%d %s)\n", needed, width, height,
                  jpeg_subsamp == TJSAMP_422 ? "4:2:2" : "4:2:0");
     }
+
+    /* Decode JPEG to YUV with fast flags
+     * tjDecompressToYUV2 supports scaling - width/height can be smaller than source */
+    int flags = TJFLAG_FASTDCT | TJFLAG_FASTUPSAMPLE;
+    if (tjDecompressToYUV2(g_tjhandle, jpeg_data, jpeg_len,
+                           g_yuv_buffer, width, 1, height, flags) != 0) {
+        log_error("tjDecompressToYUV2 failed: %s\n", tjGetErrorStr());
+        return -1;
+    }
+
+    /* tjDecompressToYUV2 outputs in planar format with proper plane sizes
+     * Calculate UV plane dimensions based on subsampling */
+    size_t uv_width = (jpeg_subsamp == TJSAMP_444) ? width : width / 2;
+    size_t uv_height;
+    if (jpeg_subsamp == TJSAMP_422 || jpeg_subsamp == TJSAMP_444) {
+        uv_height = height;  /* 4:2:2 or 4:4:4: full height */
+    } else {
+        uv_height = height / 2;  /* 4:2:0: half height */
+    }
+    size_t uv_plane_size = uv_width * uv_height;
 
     uint8_t *planes[3] = {
         g_yuv_buffer,
         g_yuv_buffer + y_size,
-        g_yuv_buffer + y_size + src_uv_size
+        g_yuv_buffer + y_size + uv_plane_size
     };
-    int strides[3] = { width, src_uv_stride, src_uv_stride };
-
-    /* Decode JPEG to YUV planes with fast flags */
-    int flags = TJFLAG_FASTDCT | TJFLAG_FASTUPSAMPLE;
-    if (tjDecompressToYUVPlanes(g_tjhandle, jpeg_data, jpeg_len,
-                                planes, width, strides, height, flags) != 0) {
-        log_error("tjDecompressToYUVPlanes failed: %s\n", tjGetErrorStr());
-        return -1;
-    }
 
     /* Copy Y plane directly to output */
     memcpy(nv12_y, planes[0], y_size);
 
-    /* Convert U/V to NV12 (interleaved, half height) */
+    /* Convert U/V to NV12 (interleaved, always half width/height for NV12) */
     size_t dst_uv_width = width / 2;
     size_t dst_uv_height = height / 2;
 
     if (jpeg_subsamp == TJSAMP_422) {
         /* 4:2:2 to NV12: need to vertically subsample U/V (average pairs of rows) */
         for (size_t y = 0; y < dst_uv_height; y++) {
-            const uint8_t *u_row0 = planes[1] + (y * 2) * src_uv_stride;
-            const uint8_t *u_row1 = planes[1] + (y * 2 + 1) * src_uv_stride;
-            const uint8_t *v_row0 = planes[2] + (y * 2) * src_uv_stride;
-            const uint8_t *v_row1 = planes[2] + (y * 2 + 1) * src_uv_stride;
+            const uint8_t *u_row0 = planes[1] + (y * 2) * uv_width;
+            const uint8_t *u_row1 = planes[1] + (y * 2 + 1) * uv_width;
+            const uint8_t *v_row0 = planes[2] + (y * 2) * uv_width;
+            const uint8_t *v_row1 = planes[2] + (y * 2 + 1) * uv_width;
             uint8_t *dst = nv12_uv + y * dst_uv_width * 2;
 
             for (size_t x = 0; x < dst_uv_width; x++) {
@@ -951,16 +998,19 @@ static int init_venc(EncoderConfig *cfg) {
     memset(&stAttr, 0, sizeof(stAttr));
     memset(&stRecvParam, 0, sizeof(stRecvParam));
 
-    /* Encoder type */
+    /* Encoder type - use h264_width/h264_height for encoding dimensions */
+    int enc_width = cfg->h264_width ? cfg->h264_width : cfg->width;
+    int enc_height = cfg->h264_height ? cfg->h264_height : cfg->height;
+
     stAttr.stVencAttr.enType = RK_VIDEO_ID_AVC;  /* H.264 */
     stAttr.stVencAttr.enPixelFormat = RK_FMT_YUV420SP;  /* NV12 input */
     stAttr.stVencAttr.u32Profile = cfg->profile;
-    stAttr.stVencAttr.u32PicWidth = cfg->width;
-    stAttr.stVencAttr.u32PicHeight = cfg->height;
-    stAttr.stVencAttr.u32VirWidth = cfg->width;
-    stAttr.stVencAttr.u32VirHeight = cfg->height;
+    stAttr.stVencAttr.u32PicWidth = enc_width;
+    stAttr.stVencAttr.u32PicHeight = enc_height;
+    stAttr.stVencAttr.u32VirWidth = enc_width;
+    stAttr.stVencAttr.u32VirHeight = enc_height;
     stAttr.stVencAttr.u32StreamBufCnt = 4;
-    stAttr.stVencAttr.u32BufSize = cfg->width * cfg->height * 3 / 2;
+    stAttr.stVencAttr.u32BufSize = enc_width * enc_height * 3 / 2;
     stAttr.stVencAttr.enMirror = MIRROR_NONE;
 
     /* Rate control */
@@ -1107,6 +1157,8 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "  --mode <mode>        Operating mode: go-klipper (default) or vanilla-klipper\n");
     fprintf(stderr, "                       vanilla-klipper: skip MQTT/RPC (for external Klipper)\n");
     fprintf(stderr, "  --streaming-port <n> MJPEG HTTP server port (default: %d)\n", HTTP_MJPEG_PORT);
+    fprintf(stderr, "  --h264-resolution <WxH> H.264 encode resolution (rkmpi mode only, default: camera res)\n");
+    fprintf(stderr, "                       Lower resolution reduces TurboJPEG decode CPU usage\n");
     fprintf(stderr, "  -v, --verbose        Verbose output to stderr\n");
     fprintf(stderr, "  -V, --version        Show version and exit\n");
     fprintf(stderr, "  --help               Show this help\n");
@@ -1142,7 +1194,9 @@ int main(int argc, char *argv[]) {
         .server_mode = 0,
         .no_stdout = 0,
         .vanilla_klipper = 0,
-        .streaming_port = 0
+        .streaming_port = 0,
+        .h264_width = 0,
+        .h264_height = 0
     };
     strncpy(cfg.device, DEFAULT_DEVICE, sizeof(cfg.device) - 1);
     cfg.h264_output[0] = '\0';
@@ -1169,6 +1223,7 @@ int main(int argc, char *argv[]) {
         {"help",         no_argument,       0, 'H'},
         {"mode",         required_argument, 0, 'M'},
         {"streaming-port", required_argument, 0, 'P'},
+        {"h264-resolution", required_argument, 0, 'R'},
         {0, 0, 0, 0}
     };
 
@@ -1200,6 +1255,13 @@ int main(int argc, char *argv[]) {
                 }
                 break;
             case 'P': cfg.streaming_port = atoi(optarg); break;
+            case 'R':
+                /* --h264-resolution: WxH format (e.g., 640x480) */
+                if (sscanf(optarg, "%dx%d", &cfg.h264_width, &cfg.h264_height) != 2) {
+                    fprintf(stderr, "Invalid resolution format: %s (expected WxH)\n", optarg);
+                    return 1;
+                }
+                break;
             case 'H':
             case '?':
                 print_usage(argv[0]);
@@ -1235,6 +1297,18 @@ int main(int argc, char *argv[]) {
     }
     if (cfg.jpeg_quality < 1 || cfg.jpeg_quality > 99) {
         log_error("Invalid JPEG quality: %d (must be 1-99)\n", cfg.jpeg_quality);
+        return 1;
+    }
+
+    /* Default H.264 resolution to camera resolution if not specified */
+    if (cfg.h264_width == 0 || cfg.h264_height == 0) {
+        cfg.h264_width = cfg.width;
+        cfg.h264_height = cfg.height;
+    }
+    /* Validate H.264 resolution */
+    if (cfg.h264_width < 160 || cfg.h264_width > 1920 ||
+        cfg.h264_height < 120 || cfg.h264_height > 1080) {
+        log_error("Invalid H.264 resolution: %dx%d\n", cfg.h264_width, cfg.h264_height);
         return 1;
     }
 
@@ -1288,9 +1362,18 @@ int main(int argc, char *argv[]) {
         log_info("MJPEG output: stdout (pass-through, target %d fps)\n", g_mjpeg_ctrl.target_fps);
     }
     if (h264_available) {
-        log_info("H.264 output: %s (%s, skip=%d)\n",
-                 cfg.h264_output, g_ctrl.h264_enabled ? "enabled" : "disabled",
-                 g_ctrl.skip_ratio);
+        if (cfg.h264_width != cfg.width || cfg.h264_height != cfg.height) {
+            log_info("H.264 output: %s (%s, %dx%d scaled from %dx%d, skip=%d)\n",
+                     cfg.h264_output[0] ? cfg.h264_output : "server",
+                     g_ctrl.h264_enabled ? "enabled" : "disabled",
+                     cfg.h264_width, cfg.h264_height, cfg.width, cfg.height,
+                     g_ctrl.skip_ratio);
+        } else {
+            log_info("H.264 output: %s (%s, skip=%d)\n",
+                     cfg.h264_output[0] ? cfg.h264_output : "server",
+                     g_ctrl.h264_enabled ? "enabled" : "disabled",
+                     g_ctrl.skip_ratio);
+        }
     } else {
         log_info("H.264 output: disabled (no output path)\n");
     }
@@ -1395,8 +1478,10 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    /* Calculate NV12 buffer size for H.264 encoding */
-    size_t nv12_size = cfg.width * cfg.height * 3 / 2;
+    /* Calculate NV12 buffer size for H.264 encoding (use h264 dimensions) */
+    int h264_w = cfg.h264_width ? cfg.h264_width : cfg.width;
+    int h264_h = cfg.h264_height ? cfg.h264_height : cfg.height;
+    size_t nv12_size = h264_w * h264_h * 3 / 2;
 
     /* Allocate DMA buffer for H.264 encoding (JPEG decode output) */
     MB_BLK mb_blk = MB_INVALID_HANDLE;
@@ -1484,8 +1569,8 @@ int main(int argc, char *argv[]) {
             log_error("  MJPEG server: failed to start\n");
         }
 
-        /* Start FLV HTTP server */
-        if (flv_server_start(cfg.width, cfg.height, g_mjpeg_ctrl.target_fps) == 0) {
+        /* Start FLV HTTP server (use h264 dimensions for the stream) */
+        if (flv_server_start(h264_w, h264_h, g_mjpeg_ctrl.target_fps) == 0) {
             flv_server_initialized = 1;
             log_info("  FLV server: http://0.0.0.0:%d/flv\n", HTTP_FLV_PORT);
         } else {
@@ -1753,24 +1838,25 @@ int main(int argc, char *argv[]) {
 
             if (do_h264) {
                 uint8_t *nv12_y = (uint8_t *)mb_vaddr;
-                uint8_t *nv12_uv = nv12_y + cfg.width * cfg.height;
+                uint8_t *nv12_uv = nv12_y + h264_w * h264_h;
 
-                /* Decode JPEG to NV12 using TurboJPEG */
+                /* Decode JPEG to NV12 using TurboJPEG (with optional scaling) */
                 if (decode_jpeg_to_nv12(jpeg_data, jpeg_len, nv12_y, nv12_uv,
-                                         cfg.width, cfg.height) == 0) {
+                                         cfg.width, cfg.height,
+                                         h264_w, h264_h) == 0) {
 
                     /* Flush cache for DMA (if cacheable) */
                     if (mb_cacheable) {
                         RK_MPI_MMZ_FlushCacheEnd(mb_blk, 0, nv12_size, RK_MMZ_SYNC_WRITEONLY);
                     }
 
-                    /* Prepare frame for encoder */
+                    /* Prepare frame for encoder (use h264 dimensions) */
                     VIDEO_FRAME_INFO_S stEncFrame;
                     memset(&stEncFrame, 0, sizeof(stEncFrame));
-                    stEncFrame.stVFrame.u32Width = cfg.width;
-                    stEncFrame.stVFrame.u32Height = cfg.height;
-                    stEncFrame.stVFrame.u32VirWidth = cfg.width;
-                    stEncFrame.stVFrame.u32VirHeight = cfg.height;
+                    stEncFrame.stVFrame.u32Width = h264_w;
+                    stEncFrame.stVFrame.u32Height = h264_h;
+                    stEncFrame.stVFrame.u32VirWidth = h264_w;
+                    stEncFrame.stVFrame.u32VirHeight = h264_h;
                     stEncFrame.stVFrame.enPixelFormat = RK_FMT_YUV420SP;
                     stEncFrame.stVFrame.pMbBlk = mb_blk;
                     stEncFrame.stVFrame.u64PTS = get_timestamp_us();
