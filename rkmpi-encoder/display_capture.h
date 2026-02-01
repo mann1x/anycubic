@@ -2,12 +2,15 @@
  * Display Framebuffer Capture for RV1106
  *
  * Captures the LCD framebuffer (/dev/fb0) and encodes to JPEG for streaming.
+ * Uses RV1106 hardware VENC for efficient JPEG encoding.
  * Auto-detects printer model and applies correct screen orientation.
  *
  * Display specs (Anycubic printers):
  * - Resolution: 800x480
  * - Format: 32bpp BGRX
  * - Orientation varies by model
+ *
+ * Pipeline: Framebuffer -> Rotate -> BGRX to NV12 -> VENC MJPEG -> JPEG
  */
 
 #ifndef DISPLAY_CAPTURE_H
@@ -45,8 +48,7 @@ typedef struct {
     DisplayOrientation orientation; /* Detected orientation */
     int output_width;               /* Output width after rotation */
     int output_height;              /* Output height after rotation */
-    void *tj_handle;                /* TurboJPEG compressor handle */
-    uint8_t *rotate_buf;            /* Temp buffer for rotation */
+    uint8_t *rotate_buf;            /* Temp buffer for rotation + NV12 conversion */
     int fps;                        /* Target capture FPS */
     volatile int running;           /* Thread control flag */
 } DisplayCapture;

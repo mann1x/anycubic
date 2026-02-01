@@ -1,5 +1,6 @@
 /*
  * Display Framebuffer Capture Implementation
+ * Uses RV1106 hardware VENC for JPEG encoding (not TurboJPEG)
  */
 
 #include "display_capture.h"
@@ -17,7 +18,13 @@
 #include <sys/ioctl.h>
 #include <linux/fb.h>
 
-#include "turbojpeg.h"
+/* RKMPI headers for hardware JPEG encoding */
+#include "rk_mpi_sys.h"
+#include "rk_mpi_venc.h"
+#include "rk_mpi_mb.h"
+#include "rk_mpi_mmz.h"
+#include "rk_comm_venc.h"
+#include "rk_comm_video.h"
 
 /* Model IDs for orientation detection */
 #define MODEL_ID_K2P   "20021"
@@ -29,6 +36,9 @@
 
 #define API_CFG_PATH "/userdata/app/gk/config/api.cfg"
 
+/* VENC channel for display JPEG encoding (separate from camera channels 0,1) */
+#define VENC_CHN_DISPLAY  2
+
 /* External verbose flag */
 extern int g_verbose;
 
@@ -36,6 +46,10 @@ extern int g_verbose;
 static pthread_t g_display_thread;
 static DisplayCapture g_display_ctx;
 static volatile int g_display_running = 0;
+
+/* DMA buffer for NV12 data */
+static MB_BLK g_display_mb = MB_INVALID_HANDLE;
+static void *g_display_mb_vaddr = NULL;
 
 static void log_info(const char *fmt, ...) {
     if (g_verbose) {
@@ -123,6 +137,61 @@ static DisplayOrientation detect_orientation(void) {
 }
 
 /*
+ * Convert BGRX (32-bit) to NV12 (YUV420SP)
+ * BGRX: B G R X B G R X ... (4 bytes per pixel)
+ * NV12: Y plane, then interleaved UV plane (half resolution)
+ *
+ * RGB to YUV conversion (BT.601):
+ *   Y  =  0.299*R + 0.587*G + 0.114*B
+ *   U  = -0.169*R - 0.331*G + 0.500*B + 128
+ *   V  =  0.500*R - 0.419*G - 0.081*B + 128
+ */
+static void bgrx_to_nv12(const uint32_t *bgrx, uint8_t *nv12_y, uint8_t *nv12_uv,
+                         int width, int height) {
+    /* Process 2x2 blocks for UV subsampling */
+    for (int y = 0; y < height; y += 2) {
+        const uint32_t *row0 = bgrx + y * width;
+        const uint32_t *row1 = row0 + width;
+        uint8_t *y_row0 = nv12_y + y * width;
+        uint8_t *y_row1 = y_row0 + width;
+        uint8_t *uv_row = nv12_uv + (y / 2) * width;
+
+        for (int x = 0; x < width; x += 2) {
+            /* Extract BGRX pixels (2x2 block) */
+            uint32_t p00 = row0[x];
+            uint32_t p01 = row0[x + 1];
+            uint32_t p10 = row1[x];
+            uint32_t p11 = row1[x + 1];
+
+            /* Extract RGB components (BGRX format: B=byte0, G=byte1, R=byte2, X=byte3) */
+            int b00 = (p00 >> 0) & 0xFF, g00 = (p00 >> 8) & 0xFF, r00 = (p00 >> 16) & 0xFF;
+            int b01 = (p01 >> 0) & 0xFF, g01 = (p01 >> 8) & 0xFF, r01 = (p01 >> 16) & 0xFF;
+            int b10 = (p10 >> 0) & 0xFF, g10 = (p10 >> 8) & 0xFF, r10 = (p10 >> 16) & 0xFF;
+            int b11 = (p11 >> 0) & 0xFF, g11 = (p11 >> 8) & 0xFF, r11 = (p11 >> 16) & 0xFF;
+
+            /* Calculate Y for each pixel (fixed-point: *256 then >>8) */
+            y_row0[x]     = (uint8_t)((66 * r00 + 129 * g00 + 25 * b00 + 128) >> 8) + 16;
+            y_row0[x + 1] = (uint8_t)((66 * r01 + 129 * g01 + 25 * b01 + 128) >> 8) + 16;
+            y_row1[x]     = (uint8_t)((66 * r10 + 129 * g10 + 25 * b10 + 128) >> 8) + 16;
+            y_row1[x + 1] = (uint8_t)((66 * r11 + 129 * g11 + 25 * b11 + 128) >> 8) + 16;
+
+            /* Average RGB for UV calculation (2x2 block -> 1 UV pair) */
+            int r_avg = (r00 + r01 + r10 + r11) >> 2;
+            int g_avg = (g00 + g01 + g10 + g11) >> 2;
+            int b_avg = (b00 + b01 + b10 + b11) >> 2;
+
+            /* Calculate U and V */
+            int u = ((-38 * r_avg - 74 * g_avg + 112 * b_avg + 128) >> 8) + 128;
+            int v = ((112 * r_avg - 94 * g_avg - 18 * b_avg + 128) >> 8) + 128;
+
+            /* Clamp to [0, 255] */
+            uv_row[x]     = (uint8_t)(u < 0 ? 0 : (u > 255 ? 255 : u));  /* U */
+            uv_row[x + 1] = (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v));  /* V */
+        }
+    }
+}
+
+/*
  * Rotate BGRX pixels according to orientation
  * Input: src (fb_width x fb_height)
  * Output: dst (output_width x output_height)
@@ -168,6 +237,60 @@ static void rotate_pixels(const uint32_t *src, uint32_t *dst,
             }
             break;
     }
+}
+
+/*
+ * Initialize VENC for display JPEG encoding
+ */
+static int init_display_venc(int width, int height, int fps, int quality) {
+    RK_S32 ret;
+    VENC_CHN_ATTR_S stAttr;
+    VENC_RECV_PIC_PARAM_S stRecvParam;
+
+    memset(&stAttr, 0, sizeof(stAttr));
+    memset(&stRecvParam, 0, sizeof(stRecvParam));
+
+    /* MJPEG encoder for display frames */
+    stAttr.stVencAttr.enType = RK_VIDEO_ID_MJPEG;
+    stAttr.stVencAttr.enPixelFormat = RK_FMT_YUV420SP;  /* NV12 input */
+    stAttr.stVencAttr.u32PicWidth = width;
+    stAttr.stVencAttr.u32PicHeight = height;
+    stAttr.stVencAttr.u32VirWidth = width;
+    stAttr.stVencAttr.u32VirHeight = height;
+    stAttr.stVencAttr.u32StreamBufCnt = 2;
+    stAttr.stVencAttr.u32BufSize = width * height * 3 / 2;
+    stAttr.stVencAttr.enMirror = MIRROR_NONE;
+
+    /* Fixed quality for JPEG */
+    stAttr.stRcAttr.enRcMode = VENC_RC_MODE_MJPEGFIXQP;
+    stAttr.stRcAttr.stMjpegFixQp.u32Qfactor = quality;
+    stAttr.stRcAttr.stMjpegFixQp.u32SrcFrameRateNum = fps;
+    stAttr.stRcAttr.stMjpegFixQp.u32SrcFrameRateDen = 1;
+    stAttr.stRcAttr.stMjpegFixQp.fr32DstFrameRateNum = fps;
+    stAttr.stRcAttr.stMjpegFixQp.fr32DstFrameRateDen = 1;
+
+    ret = RK_MPI_VENC_CreateChn(VENC_CHN_DISPLAY, &stAttr);
+    if (ret != RK_SUCCESS) {
+        log_error("RK_MPI_VENC_CreateChn(DISPLAY) failed: 0x%x\n", ret);
+        return -1;
+    }
+
+    stRecvParam.s32RecvPicNum = -1;  /* Continuous */
+    ret = RK_MPI_VENC_StartRecvFrame(VENC_CHN_DISPLAY, &stRecvParam);
+    if (ret != RK_SUCCESS) {
+        log_error("RK_MPI_VENC_StartRecvFrame(DISPLAY) failed: 0x%x\n", ret);
+        RK_MPI_VENC_DestroyChn(VENC_CHN_DISPLAY);
+        return -1;
+    }
+
+    log_info("VENC DISPLAY initialized: %dx%d, quality=%d, fps=%d\n",
+             width, height, quality, fps);
+    return 0;
+}
+
+static void cleanup_display_venc(void) {
+    RK_MPI_VENC_StopRecvFrame(VENC_CHN_DISPLAY);
+    RK_MPI_VENC_DestroyChn(VENC_CHN_DISPLAY);
 }
 
 int display_capture_init(DisplayCapture *ctx, int fps) {
@@ -225,26 +348,40 @@ int display_capture_init(DisplayCapture *ctx, int fps) {
 
     log_info("Output dimensions: %dx%d\n", ctx->output_width, ctx->output_height);
 
-    /* Allocate rotation buffer if needed */
-    if (ctx->orientation != DISPLAY_ORIENT_NORMAL) {
-        ctx->rotate_buf = malloc(ctx->fb_size);
-        if (!ctx->rotate_buf) {
-            log_error("Failed to allocate rotation buffer\n");
+    /* Allocate rotation buffer (always needed for BGRX storage before NV12 conversion) */
+    ctx->rotate_buf = malloc(ctx->fb_size);
+    if (!ctx->rotate_buf) {
+        log_error("Failed to allocate rotation buffer\n");
+        munmap(ctx->fb_pixels, ctx->fb_size);
+        close(ctx->fb_fd);
+        return -1;
+    }
+
+    /* Initialize VENC for display JPEG encoding */
+    if (init_display_venc(ctx->output_width, ctx->output_height, ctx->fps, DISPLAY_JPEG_QUALITY) != 0) {
+        free(ctx->rotate_buf);
+        munmap(ctx->fb_pixels, ctx->fb_size);
+        close(ctx->fb_fd);
+        return -1;
+    }
+
+    /* Allocate DMA buffer for NV12 data */
+    size_t nv12_size = ctx->output_width * ctx->output_height * 3 / 2;
+    RK_S32 ret = RK_MPI_MMZ_Alloc(&g_display_mb, nv12_size, RK_MMZ_ALLOC_CACHEABLE);
+    if (ret != RK_SUCCESS || g_display_mb == MB_INVALID_HANDLE) {
+        log_error("RK_MPI_MMZ_Alloc failed: 0x%x, trying uncacheable\n", ret);
+        ret = RK_MPI_MMZ_Alloc(&g_display_mb, nv12_size, RK_MMZ_ALLOC_UNCACHEABLE);
+        if (ret != RK_SUCCESS || g_display_mb == MB_INVALID_HANDLE) {
+            log_error("RK_MPI_MMZ_Alloc failed completely: 0x%x\n", ret);
+            cleanup_display_venc();
+            free(ctx->rotate_buf);
             munmap(ctx->fb_pixels, ctx->fb_size);
             close(ctx->fb_fd);
             return -1;
         }
     }
-
-    /* Initialize TurboJPEG compressor */
-    ctx->tj_handle = tjInitCompress();
-    if (!ctx->tj_handle) {
-        log_error("tjInitCompress failed\n");
-        if (ctx->rotate_buf) free(ctx->rotate_buf);
-        munmap(ctx->fb_pixels, ctx->fb_size);
-        close(ctx->fb_fd);
-        return -1;
-    }
+    g_display_mb_vaddr = RK_MPI_MMZ_Handle2VirAddr(g_display_mb);
+    log_info("Allocated DMA buffer: %zu bytes\n", nv12_size);
 
     ctx->running = 1;
     return 0;
@@ -253,10 +390,15 @@ int display_capture_init(DisplayCapture *ctx, int fps) {
 void display_capture_cleanup(DisplayCapture *ctx) {
     ctx->running = 0;
 
-    if (ctx->tj_handle) {
-        tjDestroy(ctx->tj_handle);
-        ctx->tj_handle = NULL;
+    /* Free DMA buffer */
+    if (g_display_mb != MB_INVALID_HANDLE) {
+        RK_MPI_MMZ_Free(g_display_mb);
+        g_display_mb = MB_INVALID_HANDLE;
+        g_display_mb_vaddr = NULL;
     }
+
+    /* Cleanup VENC */
+    cleanup_display_venc();
 
     if (ctx->rotate_buf) {
         free(ctx->rotate_buf);
@@ -275,44 +417,85 @@ void display_capture_cleanup(DisplayCapture *ctx) {
 }
 
 size_t display_capture_frame(DisplayCapture *ctx, uint8_t *jpeg_buf, size_t jpeg_buf_size) {
-    if (!ctx->running || !ctx->fb_pixels || !ctx->tj_handle) {
+    if (!ctx->running || !ctx->fb_pixels || !g_display_mb_vaddr) {
         return 0;
     }
 
     const uint32_t *pixels;
 
     /* Apply rotation if needed */
-    if (ctx->orientation != DISPLAY_ORIENT_NORMAL && ctx->rotate_buf) {
+    if (ctx->orientation != DISPLAY_ORIENT_NORMAL) {
         rotate_pixels(ctx->fb_pixels, (uint32_t *)ctx->rotate_buf,
                      ctx->fb_width, ctx->fb_height, ctx->orientation);
         pixels = (const uint32_t *)ctx->rotate_buf;
     } else {
-        pixels = ctx->fb_pixels;
+        /* Copy to rotate_buf even if no rotation (needed for consistent pointer) */
+        memcpy(ctx->rotate_buf, ctx->fb_pixels, ctx->fb_size);
+        pixels = (const uint32_t *)ctx->rotate_buf;
     }
 
-    /* Compress to JPEG using TurboJPEG
-     * TJPF_BGRX matches the framebuffer format (B G R X) */
-    unsigned char *jpeg_out = jpeg_buf;
-    unsigned long jpeg_size = 0;
+    /* Convert BGRX to NV12 */
+    size_t y_size = ctx->output_width * ctx->output_height;
+    uint8_t *nv12_y = (uint8_t *)g_display_mb_vaddr;
+    uint8_t *nv12_uv = nv12_y + y_size;
+    bgrx_to_nv12(pixels, nv12_y, nv12_uv, ctx->output_width, ctx->output_height);
 
-    int ret = tjCompress2(ctx->tj_handle,
-                         (const unsigned char *)pixels,
-                         ctx->output_width,
-                         0,  /* pitch (0 = default) */
-                         ctx->output_height,
-                         TJPF_BGRX,
-                         &jpeg_out,
-                         &jpeg_size,
-                         TJSAMP_420,
-                         DISPLAY_JPEG_QUALITY,
-                         TJFLAG_FASTDCT | TJFLAG_NOREALLOC);
+    /* Flush cache for DMA */
+    RK_MPI_MMZ_FlushCacheStart(g_display_mb, 0, y_size * 3 / 2, RK_MMZ_SYNC_WRITEONLY);
+    RK_MPI_MMZ_FlushCacheEnd(g_display_mb, 0, y_size * 3 / 2, RK_MMZ_SYNC_WRITEONLY);
 
-    if (ret != 0) {
-        log_error("tjCompress2 failed: %s\n", tjGetErrorStr());
+    /* Setup frame info for VENC */
+    VIDEO_FRAME_INFO_S stFrame;
+    memset(&stFrame, 0, sizeof(stFrame));
+    stFrame.stVFrame.pMbBlk = g_display_mb;
+    stFrame.stVFrame.u32Width = ctx->output_width;
+    stFrame.stVFrame.u32Height = ctx->output_height;
+    stFrame.stVFrame.u32VirWidth = ctx->output_width;
+    stFrame.stVFrame.u32VirHeight = ctx->output_height;
+    stFrame.stVFrame.enPixelFormat = RK_FMT_YUV420SP;
+    stFrame.stVFrame.enCompressMode = COMPRESS_MODE_NONE;
+
+    /* Send frame to VENC */
+    RK_S32 ret = RK_MPI_VENC_SendFrame(VENC_CHN_DISPLAY, &stFrame, 1000);
+    if (ret != RK_SUCCESS) {
+        log_error("RK_MPI_VENC_SendFrame failed: 0x%x\n", ret);
         return 0;
     }
 
-    return (size_t)jpeg_size;
+    /* Get encoded JPEG stream */
+    VENC_STREAM_S stStream;
+    memset(&stStream, 0, sizeof(stStream));
+    stStream.pstPack = malloc(sizeof(VENC_PACK_S));
+    if (!stStream.pstPack) {
+        log_error("Failed to allocate stream pack\n");
+        return 0;
+    }
+
+    ret = RK_MPI_VENC_GetStream(VENC_CHN_DISPLAY, &stStream, 1000);
+    if (ret != RK_SUCCESS) {
+        log_error("RK_MPI_VENC_GetStream failed: 0x%x\n", ret);
+        free(stStream.pstPack);
+        return 0;
+    }
+
+    /* Copy JPEG data to output buffer */
+    size_t jpeg_size = 0;
+    if (stStream.u32PackCount > 0 && stStream.pstPack) {
+        void *pData = RK_MPI_MB_Handle2VirAddr(stStream.pstPack->pMbBlk);
+        jpeg_size = stStream.pstPack->u32Len;
+        if (pData && jpeg_size > 0) {
+            if (jpeg_size > jpeg_buf_size) {
+                jpeg_size = jpeg_buf_size;
+            }
+            memcpy(jpeg_buf, pData, jpeg_size);
+        }
+    }
+
+    /* Release stream */
+    RK_MPI_VENC_ReleaseStream(VENC_CHN_DISPLAY, &stStream);
+    free(stStream.pstPack);
+
+    return jpeg_size;
 }
 
 /*
@@ -383,7 +566,7 @@ int display_capture_start(int fps) {
         return -1;
     }
 
-    log_info("Display capture started at %d fps\n", fps);
+    log_info("Display capture started at %d fps (hardware VENC)\n", fps);
     return 0;
 }
 
