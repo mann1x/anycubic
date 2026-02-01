@@ -1053,7 +1053,7 @@ static int init_venc(EncoderConfig *cfg) {
     }
 
     log_info("VENC initialized: %dx%d @ %dfps, %dkbps, GOP=%d, profile=%d, %s\n",
-             cfg->width, cfg->height, cfg->fps, cfg->bitrate, cfg->gop,
+             enc_width, enc_height, cfg->fps, cfg->bitrate, cfg->gop,
              cfg->profile, cfg->use_vbr ? "VBR" : "CBR");
     return 0;
 }

@@ -2343,6 +2343,7 @@ class StreamerApp:
             config['mjpeg_fps'] = str(self.mjpeg_fps_target)
             config['streaming_port'] = str(self.streaming_port)
             config['control_port'] = str(self.control_port)
+            config['h264_resolution'] = self.h264_resolution
 
             # Write back
             with open(config_path, 'w') as f:
@@ -3628,6 +3629,18 @@ class StreamerApp:
                     </div>
                     <div class="setting-note">Requires restart</div>
                 </div>
+                <div class="setting rkmpi-mjpeg-only" style="{'display:none' if self.encoder_type != 'rkmpi' else ''}">
+                    <div class="setting-row">
+                        <span class="label">H.264 Resolution:</span>
+                        <div class="control">
+                            <select name="h264_resolution" style="padding:8px;border-radius:4px;border:1px solid #555;background:#333;color:#fff;">
+                                <option value="1280x720" {'selected' if self.h264_resolution == '1280x720' else ''}>1280x720 (full)</option>
+                                <option value="640x360" {'selected' if self.h264_resolution == '640x360' else ''}>640x360 (scaled, lower CPU)</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="setting-note">Lower resolution = less TurboJPEG decode CPU. Requires restart.</div>
+                </div>
                 <div class="setting" style="margin-top: 15px;">
                     <div class="setting-row">
                         <button type="submit">Apply Settings</button>
@@ -3672,6 +3685,7 @@ class StreamerApp:
         let currentGkcamAllFrames = {'true' if self.gkcam_all_frames else 'false'};  // Track for restart detection
         let currentLogging = {'true' if self.logging else 'false'};  // Track for restart detection
         let currentBitrate = {self.bitrate};  // Track for restart detection
+        let currentH264Resolution = '{self.h264_resolution}';  // Track for restart detection
         let currentSessionId = {self.session_id};  // For restart detection
 
         // Streaming server base URL (for rkmpi modes, streaming is on a different port)
@@ -3750,6 +3764,7 @@ class StreamerApp:
             data.append('target_cpu', document.querySelector('[name=target_cpu]').value);
             data.append('bitrate', document.querySelector('[name=bitrate]').value);
             data.append('mjpeg_fps', document.querySelector('[name=mjpeg_fps]').value);
+            data.append('h264_resolution', document.querySelector('[name=h264_resolution]')?.value || '1280x720');
 
             // Save settings, then restart
             // Stop stats polling during restart to avoid connection errors
@@ -4085,6 +4100,7 @@ if(flvjs.isSupported()){{
             data.append('auto_skip', formData.has('auto_skip') ? '1' : '0');
             data.append('target_cpu', document.querySelector('[name=target_cpu]').value);
             data.append('bitrate', document.querySelector('[name=bitrate]').value);
+            data.append('h264_resolution', document.querySelector('[name=h264_resolution]')?.value || '1280x720');
             // Get mjpeg_fps from the correct slider based on encoder type
             const selectedEncoderType = document.querySelector('[name=encoder_type]').value;
             const mjpegFpsValue = selectedEncoderType === 'rkmpi-yuyv'
@@ -4097,11 +4113,13 @@ if(flvjs.isSupported()){{
             const newGkcamAllFrames = formData.has('gkcam_all_frames');
             const newLogging = formData.has('logging');
             const newBitrate = parseInt(document.querySelector('[name=bitrate]').value) || 512;
+            const newH264Resolution = document.querySelector('[name=h264_resolution]')?.value || '1280x720';
             const needsRkmpiRestart = (newMjpegFps !== currentMjpegFpsTarget) && currentEncoderType === 'rkmpi';
             const needsGkcamRestart = (newGkcamAllFrames !== currentGkcamAllFrames) && currentEncoderType === 'gkcam';
             const needsLoggingRestart = (newLogging !== currentLogging);
             const needsBitrateRestart = (newBitrate !== currentBitrate) && (currentEncoderType === 'rkmpi' || currentEncoderType === 'rkmpi-yuyv');
-            const needsRestart = needsRkmpiRestart || needsGkcamRestart || needsLoggingRestart || needsBitrateRestart;
+            const needsResolutionRestart = (newH264Resolution !== currentH264Resolution) && currentEncoderType === 'rkmpi';
+            const needsRestart = needsRkmpiRestart || needsGkcamRestart || needsLoggingRestart || needsBitrateRestart || needsResolutionRestart;
 
             if (needsRestart) {{
                 // Show loading overlay and trigger restart
@@ -4215,6 +4233,11 @@ if(flvjs.isSupported()){{
                 self.mjpeg_fps_target = max(2, min(max_fps, int(params['mjpeg_fps'])))
             except ValueError:
                 pass
+        if 'h264_resolution' in params:
+            # Validate resolution format
+            res = params['h264_resolution']
+            if res in ('1280x720', '640x360'):
+                self.h264_resolution = res
 
         # Update control file (for rkmpi encoder)
         if self.is_rkmpi_mode():
@@ -5070,6 +5093,7 @@ def main():
     args.mjpeg_fps = max(2, min(30, int(saved_config.get('mjpeg_fps', getattr(args, 'mjpeg_fps', 10)))))
     args.streaming_port = int(saved_config.get('streaming_port', getattr(args, 'streaming_port', 8080)))
     args.control_port = int(saved_config.get('control_port', getattr(args, 'control_port', 8081)))
+    args.h264_resolution = saved_config.get('h264_resolution', getattr(args, 'h264_resolution', '1280x720'))
 
     app = StreamerApp(args)
 

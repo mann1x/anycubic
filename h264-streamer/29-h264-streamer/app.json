@@ -58,7 +58,7 @@
             "display": "H.264 Resolution",
             "description": "H.264 encoding resolution for rkmpi mode only. Lower resolution reduces CPU usage. MJPEG stream stays at camera resolution.",
             "type": "select",
-            "options": ["1280x720", "640x480"],
+            "options": ["1280x720", "640x360"],
             "default": "1280x720"
         }
     }
