@@ -186,6 +186,10 @@ typedef struct {
     /* Server mode options */
     int server_mode;  /* 1=enable built-in HTTP/MQTT/RPC servers */
     int no_stdout;    /* 1=disable stdout output (use with server_mode) */
+    /* Operating mode */
+    int vanilla_klipper;  /* 1=vanilla-klipper mode (skip MQTT/RPC) */
+    /* Configurable ports */
+    int streaming_port;   /* MJPEG HTTP port (default 8080) */
 } EncoderConfig;
 
 static void log_info(const char *fmt, ...) {
@@ -1100,6 +1104,9 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "  -n, --no-h264        Start with H.264 encoding disabled\n");
     fprintf(stderr, "  -S, --server         Enable built-in HTTP/MQTT/RPC servers\n");
     fprintf(stderr, "  -N, --no-stdout      Disable stdout output (use with -S)\n");
+    fprintf(stderr, "  --mode <mode>        Operating mode: go-klipper (default) or vanilla-klipper\n");
+    fprintf(stderr, "                       vanilla-klipper: skip MQTT/RPC (for external Klipper)\n");
+    fprintf(stderr, "  --streaming-port <n> MJPEG HTTP server port (default: %d)\n", HTTP_MJPEG_PORT);
     fprintf(stderr, "  -v, --verbose        Verbose output to stderr\n");
     fprintf(stderr, "  -V, --version        Show version and exit\n");
     fprintf(stderr, "  --help               Show this help\n");
@@ -1133,7 +1140,9 @@ int main(int argc, char *argv[]) {
         .yuyv_mode = 0,
         .jpeg_quality = DEFAULT_JPEG_QUALITY,
         .server_mode = 0,
-        .no_stdout = 0
+        .no_stdout = 0,
+        .vanilla_klipper = 0,
+        .streaming_port = 0
     };
     strncpy(cfg.device, DEFAULT_DEVICE, sizeof(cfg.device) - 1);
     cfg.h264_output[0] = '\0';
@@ -1158,6 +1167,8 @@ int main(int argc, char *argv[]) {
         {"verbose",      no_argument,       0, 'v'},
         {"version",      no_argument,       0, 'V'},
         {"help",         no_argument,       0, 'H'},
+        {"mode",         required_argument, 0, 'M'},
+        {"streaming-port", required_argument, 0, 'P'},
         {0, 0, 0, 0}
     };
 
@@ -1182,6 +1193,13 @@ int main(int argc, char *argv[]) {
             case 'q': cfg.use_vbr = 1; break;
             case 'v': g_verbose = 1; break;
             case 'V': print_version(); return 0;
+            case 'M':
+                /* --mode: go-klipper (default) or vanilla-klipper */
+                if (strcmp(optarg, "vanilla-klipper") == 0) {
+                    cfg.vanilla_klipper = 1;
+                }
+                break;
+            case 'P': cfg.streaming_port = atoi(optarg); break;
             case 'H':
             case '?':
                 print_usage(argv[0]);
@@ -1229,11 +1247,12 @@ int main(int argc, char *argv[]) {
         cfg.fps = g_mjpeg_ctrl.target_fps;
     }
 
-    /* Check if we have H.264 output configured */
+    /* Check if we have H.264 output configured (or server mode which needs H.264 for FLV) */
     int h264_fd = -1;
-    int h264_available = (cfg.h264_output[0] != '\0');
+    int h264_available = (cfg.h264_output[0] != '\0') || cfg.server_mode;
 
-    if (h264_available) {
+    /* Only open file if we have a path - server mode sends H.264 via HTTP */
+    if (cfg.h264_output[0] != '\0') {
         h264_fd = open(cfg.h264_output, O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (h264_fd < 0) {
             /* Try opening as FIFO (non-blocking first to avoid hang) */
@@ -1453,12 +1472,14 @@ int main(int argc, char *argv[]) {
 
     /* Start servers if in server mode */
     if (cfg.server_mode) {
+        log_info("Operating mode: %s\n", cfg.vanilla_klipper ? "vanilla-klipper" : "go-klipper");
         log_info("Starting built-in servers...\n");
 
         /* Start MJPEG HTTP server */
-        if (mjpeg_server_start() == 0) {
+        int mjpeg_port = cfg.streaming_port > 0 ? cfg.streaming_port : HTTP_MJPEG_PORT;
+        if (mjpeg_server_start(cfg.streaming_port) == 0) {
             mjpeg_server_initialized = 1;
-            log_info("  MJPEG server: http://0.0.0.0:%d/stream\n", HTTP_MJPEG_PORT);
+            log_info("  MJPEG server: http://0.0.0.0:%d/stream\n", mjpeg_port);
         } else {
             log_error("  MJPEG server: failed to start\n");
         }
@@ -1471,20 +1492,25 @@ int main(int argc, char *argv[]) {
             log_error("  FLV server: failed to start\n");
         }
 
-        /* Start MQTT video responder */
-        if (mqtt_client_start() == 0) {
-            mqtt_initialized = 1;
-            log_info("  MQTT responder: localhost:9883 (TLS)\n");
-        } else {
-            log_error("  MQTT responder: failed to start\n");
-        }
+        /* Start MQTT/RPC responders (go-klipper mode only) */
+        if (!cfg.vanilla_klipper) {
+            /* Start MQTT video responder */
+            if (mqtt_client_start() == 0) {
+                mqtt_initialized = 1;
+                log_info("  MQTT responder: localhost:9883 (TLS)\n");
+            } else {
+                log_error("  MQTT responder: failed to start\n");
+            }
 
-        /* Start RPC video responder */
-        if (rpc_client_start() == 0) {
-            rpc_initialized = 1;
-            log_info("  RPC responder: localhost:18086\n");
+            /* Start RPC video responder */
+            if (rpc_client_start() == 0) {
+                rpc_initialized = 1;
+                log_info("  RPC responder: localhost:18086\n");
+            } else {
+                log_error("  RPC responder: failed to start\n");
+            }
         } else {
-            log_error("  RPC responder: failed to start\n");
+            log_info("  MQTT/RPC: disabled (vanilla-klipper mode)\n");
         }
     }
 

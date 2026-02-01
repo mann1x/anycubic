@@ -3,6 +3,30 @@
 export APP_ROOT=$(dirname $(realpath $0))
 export APP_NAME=$(basename $APP_ROOT)
 
+# Check mode property (default go-klipper)
+MODE=$(get_app_property $APP_NAME mode)
+if [ "$MODE" = "vanilla-klipper" ]; then
+    export APP_MODE="--mode vanilla-klipper"
+else
+    export APP_MODE="--mode go-klipper"
+fi
+
+# Check streaming_port property (default 8080)
+STREAMING_PORT=$(get_app_property $APP_NAME streaming_port)
+if [ -n "$STREAMING_PORT" ] && [ "$STREAMING_PORT" != "null" ]; then
+    export APP_STREAMING_PORT="--streaming-port $STREAMING_PORT"
+else
+    export APP_STREAMING_PORT=""
+fi
+
+# Check control_port property (default 8081)
+CONTROL_PORT=$(get_app_property $APP_NAME control_port)
+if [ -n "$CONTROL_PORT" ] && [ "$CONTROL_PORT" != "null" ]; then
+    export APP_CONTROL_PORT="--control-port $CONTROL_PORT"
+else
+    export APP_CONTROL_PORT=""
+fi
+
 # Check logging property (default false = no logging)
 LOGGING=$(get_app_property $APP_NAME logging)
 if [ "$LOGGING" = "true" ]; then
@@ -128,8 +152,10 @@ debug() {
     ./h264_monitor.sh
 }
 stop() {
-    # Kill gkcam first (like mjpg-streamer does) to ensure clean state
-    kill_by_name gkcam
+    # In go-klipper mode, kill gkcam first (like mjpg-streamer does) to ensure clean state
+    if [ "$MODE" != "vanilla-klipper" ]; then
+        kill_by_name gkcam
+    fi
 
     # Stop our processes
     # Use SIGTERM first to allow cleanup, then SIGKILL
@@ -147,11 +173,15 @@ stop() {
     rm -f /tmp/mjpeg.pipe
     rm -f /tmp/h264.pipe
 
-    # Restart gkcam fresh (ensures clean state after any mode)
-    echo "Restarting gkcam..." >> $APP_LOG
-    cd /userdata/app/gk
-    LD_LIBRARY_PATH=/userdata/app/gk:$LD_LIBRARY_PATH \
-        ./gkcam >> $RINKHALS_LOGS/gkcam.log 2>&1 &
+    # Restart gkcam fresh (go-klipper mode only)
+    if [ "$MODE" != "vanilla-klipper" ]; then
+        echo "Restarting gkcam..." >> $APP_LOG
+        cd /userdata/app/gk
+        LD_LIBRARY_PATH=/userdata/app/gk:$LD_LIBRARY_PATH \
+            ./gkcam >> $RINKHALS_LOGS/gkcam.log 2>&1 &
+    else
+        echo "Vanilla-klipper mode: skipping gkcam restart" >> $APP_LOG
+    fi
 }
 
 case "$1" in

@@ -86,8 +86,8 @@ typedef struct {
 extern MjpegServerThread g_mjpeg_server;
 extern FlvServerThread g_flv_server;
 
-/* Initialize and start MJPEG server */
-int mjpeg_server_start(void);
+/* Initialize and start MJPEG server (port 0 = use default HTTP_MJPEG_PORT) */
+int mjpeg_server_start(int port);
 void mjpeg_server_stop(void);
 
 /* Initialize and start FLV server */

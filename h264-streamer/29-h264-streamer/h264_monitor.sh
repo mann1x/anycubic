@@ -33,6 +33,9 @@ else
     echo "Using encoder: gkcam (via ffmpeg)" >> $APP_LOG
 fi
 
+echo "Mode: $APP_MODE" >> $APP_LOG
+echo "Streaming port: $APP_STREAMING_PORT" >> $APP_LOG
+echo "Control port: $APP_CONTROL_PORT" >> $APP_LOG
 echo "Encoder type: $APP_ENCODER_TYPE" >> $APP_LOG
 echo "Gkcam all frames: $APP_GKCAM_ALL_FRAMES" >> $APP_LOG
 echo "Autolanmode: $APP_AUTOLANMODE" >> $APP_LOG
@@ -46,7 +49,7 @@ echo "JPEG Quality: $APP_JPEG_QUALITY" >> $APP_LOG
 # Start Python H.264 server
 echo "Starting h264_server.py" >> $APP_LOG
 chmod +x $APP_ROOT/h264_server.py
-python $APP_ROOT/h264_server.py $APP_ENCODER_TYPE $APP_GKCAM_ALL_FRAMES $APP_AUTOLANMODE $APP_AUTO_SKIP $APP_TARGET_CPU $APP_SKIP_RATIO $APP_PORT $APP_BITRATE $APP_MJPEG_FPS $APP_JPEG_QUALITY >> $APP_LOG 2>&1 &
+python $APP_ROOT/h264_server.py $APP_MODE $APP_STREAMING_PORT $APP_CONTROL_PORT $APP_ENCODER_TYPE $APP_GKCAM_ALL_FRAMES $APP_AUTOLANMODE $APP_AUTO_SKIP $APP_TARGET_CPU $APP_SKIP_RATIO $APP_PORT $APP_BITRATE $APP_MJPEG_FPS $APP_JPEG_QUALITY >> $APP_LOG 2>&1 &
 CHILD_PID=$!
 echo $CHILD_PID > $PID_FILE
 

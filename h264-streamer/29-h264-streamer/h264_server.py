@@ -2158,17 +2158,17 @@ class StreamerApp:
         self.encoder_pid = None
         self.gkcam_pid = None  # Tracked for CPU monitoring in gkcam mode
 
+        # Operating mode: 'go-klipper' or 'vanilla-klipper'
+        self.mode = getattr(args, 'mode', 'go-klipper')
+
         # Encoder mode: 'gkcam', 'rkmpi', or 'rkmpi-yuyv'
         self.encoder_type = getattr(args, 'encoder_type', 'rkmpi-yuyv')
 
-        # Server ports - for rkmpi modes, rkmpi_enc serves streams on 8080,
-        # h264_server.py serves control page on 8081
-        if self.encoder_type in ('rkmpi', 'rkmpi-yuyv'):
-            self.main_port = self.CONTROL_PORT
-            self.streaming_port = self.STREAMING_PORT
-        else:
-            self.main_port = getattr(args, 'port', 8080)
-            self.streaming_port = self.main_port
+        # Server ports - consistent layout for all modes:
+        # - streaming_port (8080): /stream, /snapshot (rkmpi_enc in rkmpi mode, Python in gkcam mode)
+        # - control_port (8081): /control, /api/* (always Python)
+        self.streaming_port = getattr(args, 'streaming_port', self.STREAMING_PORT)
+        self.control_port = getattr(args, 'control_port', self.CONTROL_PORT)
         self.gkcam_all_frames = getattr(args, 'gkcam_all_frames', False)
         self.jpeg_quality = getattr(args, 'jpeg_quality', 85)  # HW JPEG quality (1-99)
 
@@ -2330,6 +2330,7 @@ class StreamerApp:
                 pass
 
             # Update with current settings (using string values for bools)
+            config['mode'] = self.mode
             config['encoder_type'] = self.encoder_type
             config['gkcam_all_frames'] = 'true' if self.gkcam_all_frames else 'false'
             config['autolanmode'] = 'true' if self.autolanmode else 'false'
@@ -2339,6 +2340,8 @@ class StreamerApp:
             config['skip_ratio'] = str(self.saved_skip_ratio)  # Save manual setting
             config['bitrate'] = str(self.bitrate)
             config['mjpeg_fps'] = str(self.mjpeg_fps_target)
+            config['streaming_port'] = str(self.streaming_port)
+            config['control_port'] = str(self.control_port)
 
             # Write back
             with open(config_path, 'w') as f:
@@ -2351,20 +2354,25 @@ class StreamerApp:
         """Start the streamer"""
         self.running = True
 
+        print(f"Operating mode: {self.mode}", flush=True)
         print(f"Encoder mode: {self.encoder_type}", flush=True)
 
-        # Check LAN mode
-        print("Checking printer status...", flush=True)
-        lan_enabled = is_lan_mode_enabled()
-        print(f"LAN mode detected: {'enabled' if lan_enabled else 'disabled/unknown'}", flush=True)
-
-        # Try to enable LAN mode if autolanmode is on
-        if self.autolanmode and not lan_enabled:
-            print("Auto-enabling LAN mode...", flush=True)
-            enable_lan_mode()
-            time.sleep(3)
+        # In vanilla-klipper mode, skip Anycubic-specific initialization
+        if self.mode == 'vanilla-klipper':
+            print("Vanilla-klipper mode: skipping LAN mode check and Anycubic services", flush=True)
+        else:
+            # Check LAN mode (go-klipper mode only)
+            print("Checking printer status...", flush=True)
             lan_enabled = is_lan_mode_enabled()
-            print(f"LAN mode after enable: {'enabled' if lan_enabled else 'disabled/unknown'}", flush=True)
+            print(f"LAN mode detected: {'enabled' if lan_enabled else 'disabled/unknown'}", flush=True)
+
+            # Try to enable LAN mode if autolanmode is on
+            if self.autolanmode and not lan_enabled:
+                print("Auto-enabling LAN mode...", flush=True)
+                enable_lan_mode()
+                time.sleep(3)
+                lan_enabled = is_lan_mode_enabled()
+                print(f"LAN mode after enable: {'enabled' if lan_enabled else 'disabled/unknown'}", flush=True)
 
         if self.encoder_type == 'gkcam':
             # GKCAM MODE: Use gkcam's FLV stream, don't kill gkcam
@@ -2381,12 +2389,12 @@ class StreamerApp:
             print(f"Printer IP: {self.current_ip}", flush=True)
             update_moonraker_webcam_config(self.current_ip, self.streaming_port, self.mjpeg_fps_target)
 
-        # Start HTTP server (main port for MJPEG, snapshots, control)
-        threading.Thread(target=self._run_server, daemon=True).start()
+        # Start control server (both modes)
+        threading.Thread(target=self._run_control_server, daemon=True).start()
 
-        # In rkmpi server mode, rkmpi_enc handles FLV on port 18088 and MQTT/RPC internally
-        # No need to start FLV server or responders from Python
-        # (Only gkcam mode would need this, but gkcam handles its own FLV natively)
+        # In gkcam mode, also start streaming server (rkmpi mode uses rkmpi_enc for streaming)
+        if not self.is_rkmpi_mode():
+            threading.Thread(target=self._run_streaming_server, daemon=True).start()
 
         # Start CPU monitor thread
         threading.Thread(target=self._cpu_monitor_loop, daemon=True).start()
@@ -2395,21 +2403,18 @@ class StreamerApp:
         threading.Thread(target=self._ip_monitor_loop, daemon=True).start()
 
         print(f"Streamer started:", flush=True)
+        print(f"  Streaming:", flush=True)
+        print(f"    Port {self.streaming_port}: /stream, /snapshot", flush=True)
+        print(f"    Port {self.FLV_PORT}: /flv (H.264 FLV)", flush=True)
         if self.is_rkmpi_mode():
-            # RKMPI mode: encoder handles streaming on dedicated ports
-            print(f"  Streaming (rkmpi_enc server mode):", flush=True)
-            print(f"    Port {self.streaming_port}: /stream, /snapshot (MJPEG)", flush=True)
-            print(f"    Port {self.FLV_PORT}: /flv (H.264 FLV)", flush=True)
-            print(f"    MQTT/RPC responders: built-in", flush=True)
-            print(f"  Control panel:", flush=True)
-            print(f"    Port {self.main_port}: /control", flush=True)
+            if self.mode == 'vanilla-klipper':
+                print(f"    MQTT/RPC: disabled (vanilla-klipper)", flush=True)
+            else:
+                print(f"    MQTT/RPC: built-in (rkmpi_enc)", flush=True)
         else:
-            # GKCAM mode: h264_server.py handles everything
-            print(f"  Port {self.main_port}:", flush=True)
-            print(f"    /stream   - MJPEG stream", flush=True)
-            print(f"    /snapshot - JPEG snapshot", flush=True)
-            print(f"    /control  - Web control panel", flush=True)
-            print(f"  FLV stream: gkcam native at :18088/flv", flush=True)
+            print(f"    (gkcam native FLV)", flush=True)
+        print(f"  Control:", flush=True)
+        print(f"    Port {self.control_port}: /control, /api/*", flush=True)
 
         return True
 
@@ -2458,21 +2463,26 @@ class StreamerApp:
         """Start in rkmpi mode - use our encoder"""
         print("Starting in RKMPI mode...", flush=True)
 
-        # Kill gkcam to free port 18088 and the camera
-        # We'll restart it later (without camera/port) so gkapi can still talk to it via RPC
-        print("Stopping gkcam (if running)...", flush=True)
-        kill_gkcam()
-        time.sleep(1)
+        if self.mode == 'vanilla-klipper':
+            # Vanilla-klipper mode: no Anycubic services running
+            print("Vanilla-klipper mode: skipping gkcam/API interactions", flush=True)
+        else:
+            # Go-klipper mode: need to manage gkcam and use Anycubic APIs
+            # Kill gkcam to free port 18088 and the camera
+            # We'll restart it later (without camera/port) so gkapi can still talk to it via RPC
+            print("Stopping gkcam (if running)...", flush=True)
+            kill_gkcam()
+            time.sleep(1)
 
-        # Stop any existing camera stream
-        print("Stopping existing camera stream...", flush=True)
-        stop_camera_stream()
-        time.sleep(1)
+            # Stop any existing camera stream
+            print("Stopping existing camera stream...", flush=True)
+            stop_camera_stream()
+            time.sleep(1)
 
-        # Start camera stream via API (needed to activate camera on some printers)
-        print("Starting camera stream via API...", flush=True)
-        start_camera_stream()
-        time.sleep(2)
+            # Start camera stream via API (needed to activate camera on some printers)
+            print("Starting camera stream via API...", flush=True)
+            start_camera_stream()
+            time.sleep(2)
 
         # Find camera
         self.camera_device = find_camera_device()
@@ -2552,7 +2562,9 @@ class StreamerApp:
             '-b', str(self.bitrate),
             '-t', str(self.target_cpu),
             '-q',  # VBR mode
-            '-v'   # Verbose logging
+            '-v',  # Verbose logging
+            '--mode', self.mode,  # Operating mode (go-klipper or vanilla-klipper)
+            '--streaming-port', str(self.streaming_port)  # MJPEG HTTP port
         ]
 
         # YUYV mode: use hardware JPEG encoding
@@ -2580,7 +2592,10 @@ class StreamerApp:
             print(f"Encoder started in server mode (PID {self.encoder_pid})", flush=True)
             print(f"  Streaming on port {self.STREAMING_PORT} (/stream, /snapshot)", flush=True)
             print(f"  FLV on port {self.FLV_PORT} (/flv)", flush=True)
-            print(f"  MQTT/RPC responders active", flush=True)
+            if self.mode == 'vanilla-klipper':
+                print(f"  MQTT/RPC responders: disabled (vanilla-klipper mode)", flush=True)
+            else:
+                print(f"  MQTT/RPC responders active", flush=True)
 
             # Start stderr reader for logging only (not for frame data)
             threading.Thread(target=self._encoder_stderr_reader, daemon=True).start()
@@ -2764,11 +2779,11 @@ class StreamerApp:
             except Exception as e:
                 print(f"IP monitor error: {e}", flush=True)
 
-    def _run_server(self):
-        """Run main HTTP server (MJPEG, snapshots, control)"""
+    def _run_control_server(self):
+        """Run control HTTP server on control_port for /control and /api endpoints"""
         server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server_socket.bind(('0.0.0.0', self.main_port))
+        server_socket.bind(('0.0.0.0', self.control_port))
         server_socket.listen(10)
         server_socket.settimeout(1.0)
 
@@ -2780,9 +2795,60 @@ class StreamerApp:
                 continue
             except Exception as e:
                 if self.running:
-                    print(f"Server error: {e}", flush=True)
+                    print(f"Control server error: {e}", flush=True)
 
         server_socket.close()
+
+    def _run_streaming_server(self):
+        """Run streaming HTTP server on streaming_port for /stream and /snapshot (gkcam mode only)"""
+        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server_socket.bind(('0.0.0.0', self.streaming_port))
+        server_socket.listen(10)
+        server_socket.settimeout(1.0)
+
+        while self.running:
+            try:
+                client, addr = server_socket.accept()
+                threading.Thread(target=self._handle_streaming_client, args=(client,), daemon=True).start()
+            except socket.timeout:
+                continue
+            except Exception as e:
+                if self.running:
+                    print(f"Streaming server error: {e}", flush=True)
+
+        server_socket.close()
+
+    def _handle_streaming_client(self, client):
+        """Handle streaming client - serves /stream and /snapshot on streaming_port (gkcam mode)"""
+        try:
+            client.settimeout(30.0)
+            request = client.recv(4096).decode('utf-8', errors='ignore')
+
+            lines = request.split('\r\n')
+            if not lines:
+                return
+
+            parts = lines[0].split(' ')
+            if len(parts) < 2:
+                return
+
+            path = parts[1].split('?')[0]
+
+            if path == '/stream':
+                client.settimeout(None)
+                self._serve_mjpeg_stream(client)
+            elif path in ('/snapshot', '/snap', '/image'):
+                self._serve_snapshot(client)
+            else:
+                self._serve_404(client)
+        except Exception:
+            pass
+        finally:
+            try:
+                client.close()
+            except Exception:
+                pass
 
     def _run_flv_server(self):
         """Run FLV HTTP server on port 18088 (for Anycubic slicer)"""
@@ -2867,24 +2933,15 @@ class StreamerApp:
                         query[k] = v
 
             # Route
-            # For rkmpi modes, streaming is handled by rkmpi_enc on streaming_port
-            # Redirect stream requests to the streaming server
+            # Streaming endpoints redirect to streaming_port (rkmpi_enc or gkcam streaming server)
+            # Control server only handles /control and /api/*
             if path == '/stream':
-                if self.is_rkmpi_mode() and self.streaming_port != self.main_port:
-                    self._redirect_to_streaming(client, '/stream')
-                else:
-                    self._serve_mjpeg_stream(client)
+                self._redirect_to_streaming(client, '/stream')
             elif path in ('/snapshot', '/snap', '/image'):
-                if self.is_rkmpi_mode() and self.streaming_port != self.main_port:
-                    self._redirect_to_streaming(client, '/snapshot')
-                else:
-                    self._serve_snapshot(client)
+                self._redirect_to_streaming(client, '/snapshot')
             elif path == '/flv':
-                if self.is_rkmpi_mode() and self.streaming_port != self.main_port:
-                    # FLV is on FLV_PORT (18088), redirect there
-                    self._redirect_to_streaming(client, '/flv', port=self.FLV_PORT)
-                else:
-                    self._serve_flv_stream(client)
+                # FLV is always on FLV_PORT (18088)
+                self._redirect_to_streaming(client, '/flv', port=self.FLV_PORT)
             elif path == '/control':
                 if method == 'POST':
                     # Read POST body
@@ -4381,8 +4438,9 @@ if(flvjs.isSupported()){{
                     pass
             self.mqtt_subprocess = None
 
-        # Stop camera stream
-        stop_camera_stream()
+        # Stop camera stream (go-klipper mode only)
+        if self.mode != 'vanilla-klipper':
+            stop_camera_stream()
 
         # Cleanup
         try:
@@ -4926,6 +4984,12 @@ def main():
                         help='Camera width (for --flv-server)')
     parser.add_argument('--height', type=int, default=720,
                         help='Camera height (for --flv-server)')
+    parser.add_argument('--mode', choices=['go-klipper', 'vanilla-klipper'], default='go-klipper',
+                        help='Operating mode: go-klipper (Anycubic firmware) or vanilla-klipper (external Klipper)')
+    parser.add_argument('--streaming-port', type=int, default=8080,
+                        help='MJPEG/snapshot streaming port for rkmpi_enc (default: 8080)')
+    parser.add_argument('--control-port', type=int, default=8081,
+                        help='Control panel and API port (default: 8081)')
     parser.add_argument('--encoder-type', choices=['gkcam', 'rkmpi', 'rkmpi-yuyv'], default='rkmpi-yuyv',
                         help='Encoder type: gkcam, rkmpi (MJPEG capture), or rkmpi-yuyv (default, YUYV capture with HW JPEG)')
     parser.add_argument('--gkcam-all-frames', action='store_true',
@@ -4980,6 +5044,7 @@ def main():
 
     # Map hyphenated args to underscored attrs
     # Use saved config values if available, otherwise use defaults
+    args.mode = saved_config.get('mode', getattr(args, 'mode', 'go-klipper'))
     args.encoder_type = saved_config.get('encoder_type', getattr(args, 'encoder_type', 'gkcam'))
     args.gkcam_all_frames = saved_config.get('gkcam_all_frames', 'false') == 'true' if 'gkcam_all_frames' in saved_config else getattr(args, 'gkcam_all_frames', False)
     # Default: autolanmode enabled (from config or command line)
@@ -4996,6 +5061,8 @@ def main():
     args.skip_ratio = max(1, min(20, int(saved_config.get('skip_ratio', getattr(args, 'skip_ratio', 4)))))
     args.bitrate = max(100, min(4000, int(saved_config.get('bitrate', getattr(args, 'bitrate', 512)))))
     args.mjpeg_fps = max(2, min(30, int(saved_config.get('mjpeg_fps', getattr(args, 'mjpeg_fps', 10)))))
+    args.streaming_port = int(saved_config.get('streaming_port', getattr(args, 'streaming_port', 8080)))
+    args.control_port = int(saved_config.get('control_port', getattr(args, 'control_port', 8081)))
 
     app = StreamerApp(args)
 

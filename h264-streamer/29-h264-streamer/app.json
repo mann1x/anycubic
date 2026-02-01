@@ -6,6 +6,25 @@
     "version": "0.2",
 
     "properties": {
+        "mode": {
+            "display": "Mode",
+            "description": "Operating mode: go-klipper (Anycubic firmware with Rinkhals) or vanilla-klipper (external Klipper on Raspberry Pi).",
+            "type": "select",
+            "options": ["go-klipper", "vanilla-klipper"],
+            "default": "go-klipper"
+        },
+        "streaming_port": {
+            "display": "Streaming Port",
+            "description": "HTTP port for MJPEG stream and snapshots (default: 8080).",
+            "type": "int",
+            "default": "8080"
+        },
+        "control_port": {
+            "display": "Control Port",
+            "description": "HTTP port for control panel and API (default: 8081).",
+            "type": "int",
+            "default": "8081"
+        },
         "autolanmode": {
             "display": "Auto-enable LAN mode",
             "description": "Automatically enable LAN mode on startup if not already enabled. Required for camera access.",

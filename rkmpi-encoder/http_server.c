@@ -437,10 +437,15 @@ static void *mjpeg_server_thread(void *arg) {
     return NULL;
 }
 
-int mjpeg_server_start(void) {
+int mjpeg_server_start(int port) {
     memset(&g_mjpeg_server, 0, sizeof(g_mjpeg_server));
 
-    if (http_server_init(&g_mjpeg_server.server, HTTP_MJPEG_PORT) != 0) {
+    /* Use default port if not specified */
+    if (port <= 0) {
+        port = HTTP_MJPEG_PORT;
+    }
+
+    if (http_server_init(&g_mjpeg_server.server, port) != 0) {
         return -1;
     }
 
