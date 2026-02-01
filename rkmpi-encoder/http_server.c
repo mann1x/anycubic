@@ -1,0 +1,624 @@
+/*
+ * HTTP Server Implementation
+ *
+ * Minimal socket-based HTTP server for MJPEG and FLV streaming.
+ */
+
+#include "http_server.h"
+#include "frame_buffer.h"
+#include "flv_mux.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdarg.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/socket.h>
+#include <sys/select.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <arpa/inet.h>
+#include <time.h>
+
+/* Global server instances */
+MjpegServerThread g_mjpeg_server;
+FlvServerThread g_flv_server;
+
+/* Logging (use external if available) */
+extern int g_verbose;
+static void log_info(const char *fmt, ...) {
+    if (g_verbose) {
+        va_list args;
+        va_start(args, fmt);
+        vfprintf(stderr, fmt, args);
+        va_end(args);
+        fflush(stderr);
+    }
+}
+
+static uint64_t get_time_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000 + (uint64_t)ts.tv_nsec / 1000;
+}
+
+/* Set socket non-blocking */
+static int set_nonblocking(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0) return -1;
+    return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+/* Initialize HTTP server */
+static int http_server_init(HttpServer *srv, int port) {
+    memset(srv, 0, sizeof(*srv));
+    srv->port = port;
+    pthread_mutex_init(&srv->mutex, NULL);
+
+    /* Create listen socket */
+    srv->listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (srv->listen_fd < 0) {
+        fprintf(stderr, "HTTP: socket() failed: %s\n", strerror(errno));
+        return -1;
+    }
+
+    /* Allow address reuse */
+    int opt = 1;
+    setsockopt(srv->listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    /* Bind */
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons(port);
+
+    if (bind(srv->listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        fprintf(stderr, "HTTP: bind(%d) failed: %s\n", port, strerror(errno));
+        close(srv->listen_fd);
+        return -1;
+    }
+
+    /* Listen */
+    if (listen(srv->listen_fd, 8) < 0) {
+        fprintf(stderr, "HTTP: listen() failed: %s\n", strerror(errno));
+        close(srv->listen_fd);
+        return -1;
+    }
+
+    set_nonblocking(srv->listen_fd);
+    srv->running = 1;
+
+    log_info("HTTP: Server listening on port %d\n", port);
+    return 0;
+}
+
+/* Cleanup HTTP server */
+static void http_server_cleanup(HttpServer *srv) {
+    srv->running = 0;
+
+    /* Close all clients */
+    for (int i = 0; i < HTTP_MAX_CLIENTS; i++) {
+        if (srv->clients[i].fd > 0) {
+            close(srv->clients[i].fd);
+            srv->clients[i].fd = 0;
+            if (srv->clients[i].send_buf) {
+                free(srv->clients[i].send_buf);
+                srv->clients[i].send_buf = NULL;
+            }
+        }
+    }
+
+    if (srv->listen_fd > 0) {
+        close(srv->listen_fd);
+        srv->listen_fd = 0;
+    }
+
+    pthread_mutex_destroy(&srv->mutex);
+}
+
+/* Accept new client */
+static void http_server_accept(HttpServer *srv) {
+    struct sockaddr_in client_addr;
+    socklen_t addr_len = sizeof(client_addr);
+
+    int client_fd = accept(srv->listen_fd, (struct sockaddr *)&client_addr, &addr_len);
+    if (client_fd < 0) {
+        return;
+    }
+
+    /* Find free slot */
+    int slot = -1;
+    for (int i = 0; i < HTTP_MAX_CLIENTS; i++) {
+        if (srv->clients[i].fd == 0) {
+            slot = i;
+            break;
+        }
+    }
+
+    if (slot < 0) {
+        /* No free slots */
+        close(client_fd);
+        log_info("HTTP: Rejected client (max connections)\n");
+        return;
+    }
+
+    /* Setup client */
+    set_nonblocking(client_fd);
+
+    /* Disable Nagle's algorithm for lower latency */
+    int opt = 1;
+    setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+
+    HttpClient *client = &srv->clients[slot];
+    memset(client, 0, sizeof(*client));
+    client->fd = client_fd;
+    client->state = CLIENT_STATE_IDLE;
+    client->request = REQUEST_NONE;
+    client->connect_time = get_time_us();
+
+    srv->client_count++;
+    log_info("HTTP[%d]: Client connected from %s (slot %d)\n",
+             srv->port, inet_ntoa(client_addr.sin_addr), slot);
+}
+
+/* Parse HTTP request */
+static RequestType parse_http_request(const char *buf, size_t len, int port) {
+    if (len < 10) return REQUEST_NONE;
+
+    /* Check for GET request */
+    if (strncmp(buf, "GET ", 4) != 0) {
+        return REQUEST_NONE;
+    }
+
+    /* Find path */
+    const char *path = buf + 4;
+    const char *path_end = strchr(path, ' ');
+    if (!path_end) return REQUEST_NONE;
+
+    size_t path_len = path_end - path;
+
+    if (port == HTTP_MJPEG_PORT) {
+        if (path_len >= 7 && strncmp(path, "/stream", 7) == 0) {
+            return REQUEST_MJPEG_STREAM;
+        }
+        if (path_len >= 9 && strncmp(path, "/snapshot", 9) == 0) {
+            return REQUEST_MJPEG_SNAPSHOT;
+        }
+    } else if (port == HTTP_FLV_PORT) {
+        if (path_len >= 4 && strncmp(path, "/flv", 4) == 0) {
+            return REQUEST_FLV_STREAM;
+        }
+    }
+
+    return REQUEST_NONE;
+}
+
+/* Send HTTP response */
+static int http_send(int fd, const void *data, size_t len) {
+    size_t sent = 0;
+    while (sent < len) {
+        ssize_t n = send(fd, (const char *)data + sent, len - sent, MSG_NOSIGNAL);
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                usleep(1000);
+                continue;
+            }
+            return -1;
+        }
+        sent += n;
+    }
+    return 0;
+}
+
+/* Send 404 response */
+static void http_send_404(int fd) {
+    const char *response =
+        "HTTP/1.1 404 Not Found\r\n"
+        "Content-Type: text/plain\r\n"
+        "Content-Length: 9\r\n"
+        "\r\n"
+        "Not Found";
+    http_send(fd, response, strlen(response));
+}
+
+/* Send MJPEG stream headers */
+static void http_send_mjpeg_headers(int fd) {
+    char headers[256];
+    int len = snprintf(headers, sizeof(headers),
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: multipart/x-mixed-replace; boundary=" MJPEG_BOUNDARY "\r\n"
+        "Cache-Control: no-cache\r\n"
+        "Connection: close\r\n"
+        "\r\n");
+    http_send(fd, headers, len);
+}
+
+/* Send single JPEG snapshot */
+static void http_send_snapshot(int fd) {
+    uint8_t *jpeg_buf = malloc(FRAME_BUFFER_MAX_JPEG);
+    if (!jpeg_buf) {
+        http_send_404(fd);
+        return;
+    }
+
+    uint64_t seq;
+    size_t jpeg_size = frame_buffer_copy(&g_jpeg_buffer, jpeg_buf,
+                                         FRAME_BUFFER_MAX_JPEG, &seq, NULL);
+
+    if (jpeg_size > 0) {
+        char headers[256];
+        int hlen = snprintf(headers, sizeof(headers),
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: image/jpeg\r\n"
+            "Content-Length: %zu\r\n"
+            "Cache-Control: no-cache\r\n"
+            "Connection: close\r\n"
+            "\r\n", jpeg_size);
+        http_send(fd, headers, hlen);
+        http_send(fd, jpeg_buf, jpeg_size);
+    } else {
+        http_send_404(fd);
+    }
+
+    free(jpeg_buf);
+}
+
+/* Send FLV stream headers (gkcam-compatible) */
+static void http_send_flv_headers(int fd) {
+    /* Must match gkcam exactly for slicer compatibility */
+    const char *headers =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/plain\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "Content-Length: 99999999999\r\n"
+        "\r\n";
+    http_send(fd, headers, strlen(headers));
+}
+
+/* Handle client read (for request parsing) */
+static void http_handle_client_read(HttpServer *srv, HttpClient *client) {
+    char buf[HTTP_RECV_BUF_SIZE];
+    ssize_t n = recv(client->fd, buf, sizeof(buf) - 1, 0);
+
+    if (n <= 0) {
+        client->state = CLIENT_STATE_CLOSING;
+        return;
+    }
+
+    buf[n] = '\0';
+
+    if (client->state == CLIENT_STATE_IDLE) {
+        RequestType req = parse_http_request(buf, n, srv->port);
+
+        if (req == REQUEST_NONE) {
+            http_send_404(client->fd);
+            client->state = CLIENT_STATE_CLOSING;
+            return;
+        }
+
+        client->request = req;
+
+        switch (req) {
+            case REQUEST_MJPEG_STREAM:
+                http_send_mjpeg_headers(client->fd);
+                client->state = CLIENT_STATE_STREAMING;
+                client->header_sent = 1;
+                log_info("HTTP[%d]: MJPEG stream started\n", srv->port);
+                break;
+
+            case REQUEST_MJPEG_SNAPSHOT:
+                http_send_snapshot(client->fd);
+                client->state = CLIENT_STATE_CLOSING;
+                break;
+
+            case REQUEST_FLV_STREAM:
+                http_send_flv_headers(client->fd);
+                client->state = CLIENT_STATE_STREAMING;
+                client->header_sent = 1;
+
+                /* Allocate send buffer for FLV */
+                client->send_buf = malloc(HTTP_SEND_BUF_SIZE);
+                client->send_buf_size = HTTP_SEND_BUF_SIZE;
+                client->send_buf_pos = 0;
+                log_info("HTTP[%d]: FLV stream started\n", srv->port);
+                break;
+
+            default:
+                http_send_404(client->fd);
+                client->state = CLIENT_STATE_CLOSING;
+                break;
+        }
+    }
+}
+
+/* Close client and cleanup */
+static void http_close_client(HttpServer *srv, int slot) {
+    HttpClient *client = &srv->clients[slot];
+
+    if (client->fd > 0) {
+        close(client->fd);
+        log_info("HTTP[%d]: Client disconnected (slot %d)\n", srv->port, slot);
+    }
+
+    if (client->send_buf) {
+        free(client->send_buf);
+    }
+
+    memset(client, 0, sizeof(*client));
+    srv->client_count--;
+}
+
+/* ============================================================================
+ * MJPEG Server Thread
+ * ============================================================================ */
+
+static void *mjpeg_server_thread(void *arg) {
+    MjpegServerThread *st = (MjpegServerThread *)arg;
+    HttpServer *srv = &st->server;
+
+    uint8_t *jpeg_buf = malloc(FRAME_BUFFER_MAX_JPEG);
+    char header_buf[256];
+
+    while (st->running && srv->running) {
+        fd_set read_fds;
+        FD_ZERO(&read_fds);
+        FD_SET(srv->listen_fd, &read_fds);
+
+        int max_fd = srv->listen_fd;
+
+        for (int i = 0; i < HTTP_MAX_CLIENTS; i++) {
+            if (srv->clients[i].fd > 0 && srv->clients[i].state == CLIENT_STATE_IDLE) {
+                FD_SET(srv->clients[i].fd, &read_fds);
+                if (srv->clients[i].fd > max_fd) {
+                    max_fd = srv->clients[i].fd;
+                }
+            }
+        }
+
+        struct timeval tv = { .tv_sec = 0, .tv_usec = 50000 };  /* 50ms timeout */
+        int ret = select(max_fd + 1, &read_fds, NULL, NULL, &tv);
+
+        if (ret > 0) {
+            /* Check for new connections */
+            if (FD_ISSET(srv->listen_fd, &read_fds)) {
+                http_server_accept(srv);
+            }
+
+            /* Check for client requests */
+            for (int i = 0; i < HTTP_MAX_CLIENTS; i++) {
+                if (srv->clients[i].fd > 0 && FD_ISSET(srv->clients[i].fd, &read_fds)) {
+                    http_handle_client_read(srv, &srv->clients[i]);
+                }
+            }
+        }
+
+        /* Stream frames to connected clients */
+        uint64_t current_seq = frame_buffer_get_sequence(&g_jpeg_buffer);
+
+        for (int i = 0; i < HTTP_MAX_CLIENTS; i++) {
+            HttpClient *client = &srv->clients[i];
+
+            if (client->fd > 0 && client->state == CLIENT_STATE_CLOSING) {
+                http_close_client(srv, i);
+                continue;
+            }
+
+            if (client->fd > 0 && client->state == CLIENT_STATE_STREAMING &&
+                client->request == REQUEST_MJPEG_STREAM) {
+
+                /* Check if we have a new frame */
+                if (current_seq > client->last_frame_seq) {
+                    uint64_t seq;
+                    size_t jpeg_size = frame_buffer_copy(&g_jpeg_buffer, jpeg_buf,
+                                                         FRAME_BUFFER_MAX_JPEG, &seq, NULL);
+
+                    if (jpeg_size > 0) {
+                        /* Send multipart frame */
+                        int hlen = snprintf(header_buf, sizeof(header_buf),
+                            "--%s\r\nContent-Type: image/jpeg\r\nContent-Length: %zu\r\n\r\n",
+                            MJPEG_BOUNDARY, jpeg_size);
+
+                        if (http_send(client->fd, header_buf, hlen) < 0 ||
+                            http_send(client->fd, jpeg_buf, jpeg_size) < 0 ||
+                            http_send(client->fd, "\r\n", 2) < 0) {
+                            client->state = CLIENT_STATE_CLOSING;
+                        } else {
+                            client->last_frame_seq = seq;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    free(jpeg_buf);
+    return NULL;
+}
+
+int mjpeg_server_start(void) {
+    memset(&g_mjpeg_server, 0, sizeof(g_mjpeg_server));
+
+    if (http_server_init(&g_mjpeg_server.server, HTTP_MJPEG_PORT) != 0) {
+        return -1;
+    }
+
+    g_mjpeg_server.running = 1;
+
+    if (pthread_create(&g_mjpeg_server.thread, NULL, mjpeg_server_thread, &g_mjpeg_server) != 0) {
+        fprintf(stderr, "HTTP: Failed to create MJPEG server thread\n");
+        http_server_cleanup(&g_mjpeg_server.server);
+        return -1;
+    }
+
+    return 0;
+}
+
+void mjpeg_server_stop(void) {
+    g_mjpeg_server.running = 0;
+    g_mjpeg_server.server.running = 0;
+
+    /* Wake up any waiting threads */
+    frame_buffer_broadcast(&g_jpeg_buffer);
+
+    pthread_join(g_mjpeg_server.thread, NULL);
+    http_server_cleanup(&g_mjpeg_server.server);
+}
+
+int mjpeg_server_client_count(void) {
+    return g_mjpeg_server.server.client_count;
+}
+
+/* ============================================================================
+ * FLV Server Thread
+ * ============================================================================ */
+
+static void *flv_server_thread(void *arg) {
+    FlvServerThread *st = (FlvServerThread *)arg;
+    HttpServer *srv = &st->server;
+
+    uint8_t *h264_buf = malloc(FRAME_BUFFER_MAX_H264);
+    uint8_t *flv_buf = malloc(FLV_MAX_TAG_SIZE);
+
+    /* Per-client muxers */
+    FLVMuxer muxers[HTTP_MAX_CLIENTS];
+    for (int i = 0; i < HTTP_MAX_CLIENTS; i++) {
+        flv_muxer_init(&muxers[i], st->width, st->height, st->fps);
+    }
+
+    while (st->running && srv->running) {
+        fd_set read_fds;
+        FD_ZERO(&read_fds);
+        FD_SET(srv->listen_fd, &read_fds);
+
+        int max_fd = srv->listen_fd;
+
+        for (int i = 0; i < HTTP_MAX_CLIENTS; i++) {
+            if (srv->clients[i].fd > 0 && srv->clients[i].state == CLIENT_STATE_IDLE) {
+                FD_SET(srv->clients[i].fd, &read_fds);
+                if (srv->clients[i].fd > max_fd) {
+                    max_fd = srv->clients[i].fd;
+                }
+            }
+        }
+
+        struct timeval tv = { .tv_sec = 0, .tv_usec = 50000 };
+        int ret = select(max_fd + 1, &read_fds, NULL, NULL, &tv);
+
+        if (ret > 0) {
+            if (FD_ISSET(srv->listen_fd, &read_fds)) {
+                http_server_accept(srv);
+            }
+
+            for (int i = 0; i < HTTP_MAX_CLIENTS; i++) {
+                if (srv->clients[i].fd > 0 && FD_ISSET(srv->clients[i].fd, &read_fds)) {
+                    http_handle_client_read(srv, &srv->clients[i]);
+
+                    /* New FLV client - send header and metadata */
+                    if (srv->clients[i].state == CLIENT_STATE_STREAMING &&
+                        srv->clients[i].request == REQUEST_FLV_STREAM &&
+                        srv->clients[i].last_frame_seq == 0) {
+
+                        /* Reset muxer for new connection */
+                        flv_muxer_reset(&muxers[i]);
+
+                        /* Send FLV header */
+                        size_t hdr_size = flv_create_header(flv_buf, FLV_MAX_TAG_SIZE);
+                        if (hdr_size > 0) {
+                            http_send(srv->clients[i].fd, flv_buf, hdr_size);
+                        }
+
+                        /* Send metadata */
+                        size_t meta_size = flv_create_metadata(&muxers[i], flv_buf, FLV_MAX_TAG_SIZE);
+                        if (meta_size > 0) {
+                            http_send(srv->clients[i].fd, flv_buf, meta_size);
+                        }
+                    }
+                }
+            }
+        }
+
+        /* Stream H.264 to connected FLV clients */
+        uint64_t current_seq = frame_buffer_get_sequence(&g_h264_buffer);
+
+        for (int i = 0; i < HTTP_MAX_CLIENTS; i++) {
+            HttpClient *client = &srv->clients[i];
+
+            if (client->fd > 0 && client->state == CLIENT_STATE_CLOSING) {
+                http_close_client(srv, i);
+                flv_muxer_reset(&muxers[i]);
+                continue;
+            }
+
+            if (client->fd > 0 && client->state == CLIENT_STATE_STREAMING &&
+                client->request == REQUEST_FLV_STREAM) {
+
+                if (current_seq > client->last_frame_seq) {
+                    uint64_t seq;
+                    int is_keyframe;
+                    size_t h264_size = frame_buffer_copy(&g_h264_buffer, h264_buf,
+                                                         FRAME_BUFFER_MAX_H264, &seq, &is_keyframe);
+
+                    if (h264_size > 0) {
+                        /* Mux to FLV */
+                        size_t flv_size = flv_mux_h264(&muxers[i], h264_buf, h264_size,
+                                                       flv_buf, FLV_MAX_TAG_SIZE);
+
+                        if (flv_size > 0) {
+                            if (http_send(client->fd, flv_buf, flv_size) < 0) {
+                                client->state = CLIENT_STATE_CLOSING;
+                            } else {
+                                client->last_frame_seq = seq;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /* Cleanup */
+    for (int i = 0; i < HTTP_MAX_CLIENTS; i++) {
+        flv_muxer_cleanup(&muxers[i]);
+    }
+    free(h264_buf);
+    free(flv_buf);
+
+    return NULL;
+}
+
+int flv_server_start(int width, int height, int fps) {
+    memset(&g_flv_server, 0, sizeof(g_flv_server));
+    g_flv_server.width = width;
+    g_flv_server.height = height;
+    g_flv_server.fps = fps;
+
+    if (http_server_init(&g_flv_server.server, HTTP_FLV_PORT) != 0) {
+        return -1;
+    }
+
+    g_flv_server.running = 1;
+
+    if (pthread_create(&g_flv_server.thread, NULL, flv_server_thread, &g_flv_server) != 0) {
+        fprintf(stderr, "HTTP: Failed to create FLV server thread\n");
+        http_server_cleanup(&g_flv_server.server);
+        return -1;
+    }
+
+    return 0;
+}
+
+void flv_server_stop(void) {
+    g_flv_server.running = 0;
+    g_flv_server.server.running = 0;
+
+    frame_buffer_broadcast(&g_h264_buffer);
+
+    pthread_join(g_flv_server.thread, NULL);
+    http_server_cleanup(&g_flv_server.server);
+}
+
+int flv_server_client_count(void) {
+    return g_flv_server.server.client_count;
+}

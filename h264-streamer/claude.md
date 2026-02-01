@@ -1,0 +1,503 @@
+# h264-streamer App
+
+USB camera streaming app for Rinkhals with hardware H.264 encoding using the RV1106 VENC.
+
+---
+
+## ⛔ CRITICAL: NEVER KILL PYTHON PROCESSES ⛔
+
+```
+██████████████████████████████████████████████████████████████████████████████
+██                                                                          ██
+██   NEVER USE: killall python                                              ██
+██   NEVER USE: pkill python                                                ██
+██   NEVER USE: pkill -f python                                             ██
+██                                                                          ██
+██   This DESTROYS the printer! Moonraker, Klipper, and other critical      ██
+██   services run as Python processes. Killing all Python = BRICK.          ██
+██                                                                          ██
+██   ALWAYS USE app.sh FOR PROCESS MANAGEMENT:                              ██
+██                                                                          ██
+██   # Stop h264-streamer:                                                  ██
+██   /useremain/home/rinkhals/apps/29-h264-streamer/app.sh stop             ██
+██                                                                          ██
+██   # Start h264-streamer:                                                 ██
+██   /useremain/home/rinkhals/apps/29-h264-streamer/app.sh start            ██
+██                                                                          ██
+██   If you need to kill h264_server.py specifically:                       ██
+██   pkill -f h264_server.py   (NOT just "python"!)                         ██
+██                                                                          ██
+██████████████████████████████████████████████████████████████████████████████
+```
+
+---
+
+## Overview
+
+This app provides HTTP endpoints for streaming video from a USB camera:
+
+**Main server (port 8080, configurable via `port` property):**
+- `/stream` - MJPEG multipart stream
+- `/snapshot` - Single JPEG frame
+- `/control` - Web UI with settings, FPS/CPU monitoring, and live stream preview
+- `/status` - JSON status
+- `/api/stats` - JSON stats (FPS, CPU, settings) with 1s refresh
+
+**FLV server (port 18088, fixed for Anycubic slicer):**
+- `/flv` - H.264 in FLV container
+
+## Architecture
+
+**rkmpi mode (MJPEG capture):**
+```
+USB Camera (MJPEG) → rkmpi_enc → stdout (MJPEG multipart) → h264_server.py → HTTP
+                         ↓
+                    TurboJPEG decode → NV12 → VENC → H.264 FIFO
+```
+
+**rkmpi-yuyv mode (YUYV capture with HW JPEG):**
+```
+USB Camera (YUYV) → rkmpi_enc → YUYV→NV12 (CPU) → VENC Ch0 → H.264 FIFO
+                                       ↓
+                                   VENC Ch1 → JPEG → stdout → h264_server.py → HTTP
+```
+
+## Components
+
+### h264_server.py
+Python HTTP server that:
+- Manages LAN mode via local binary API (port 18086)
+- Kills gkcam when LAN mode is enabled (to free the camera)
+- Spawns rkmpi_enc subprocess
+- Reads MJPEG from encoder stdout and H.264 from FIFO
+- Provides FLV muxing for H.264 streams
+- Monitors CPU usage
+
+### rkmpi_enc
+Native binary encoder built with RV1106 SDK:
+- V4L2 capture from USB camera (MJPEG or YUYV)
+- In MJPEG mode: TurboJPEG software JPEG decoding
+- In YUYV mode: CPU YUYV→NV12 conversion + hardware JPEG encoding (VENC Ch1)
+- RKMPI VENC hardware H.264 encoding (VENC Ch0)
+- Outputs MJPEG to stdout and H.264 to FIFO
+
+Source: `/shared/dev/anycubic/rkmpi-encoder/`
+
+### app.sh
+App lifecycle management:
+- Reads `autolanmode` property from app.json
+- Sets up LD_LIBRARY_PATH for RKMPI libs
+- Manages process lifecycle
+
+## Local Binary API (Port 18086)
+
+The printer's local binary API uses TCP with ETX (0x03) message terminator.
+
+### Query LAN Mode Status
+```json
+{"id": 2016, "method": "Printer/QueryLanPrintStatus", "params": null}
+```
+Response: `{"id": 2016, "result": {"open": 0|1}}`
+
+### Enable LAN Mode
+```json
+{"id": 2016, "method": "Printer/OpenLanPrint", "params": null}
+```
+
+### Disable LAN Mode
+```json
+{"id": 2016, "method": "Printer/CloseLanPrint", "params": null}
+```
+
+**Note:** After enabling LAN mode, gkcam must be killed to free the camera device.
+
+## MQTT Camera Control (Port 9883)
+
+gkcam requires an MQTT `startCapture` command to begin streaming. The printer runs a Mochi MQTT broker on port 9883 (TLS).
+
+### Topic Format
+```
+anycubic/anycubicCloud/v1/web/printer/{modelId}/{deviceId}/video
+```
+
+### startCapture Command
+```json
+{
+  "type": "video",
+  "action": "startCapture",
+  "timestamp": 1700000000000,
+  "msgid": "uuid-string",
+  "data": null
+}
+```
+
+### Model IDs (from `/userdata/app/gk/config/api.cfg`)
+| Model Code | Model ID | Printer |
+|------------|----------|---------|
+| K2P | 20021 | Kobra 2 Pro |
+| K3 | 20024 | Kobra 3 |
+| KS1 | 20025 | Kobra S1 |
+| K3M | 20026 | Kobra 3 Max |
+| K3V2 | 20027 | Kobra 3 V2 |
+| KS1M | 20029 | Kobra S1 Max |
+
+### Credentials
+- **Path:** `/userdata/app/gk/config/device_account.json`
+- **Fields:** `deviceId`, `username`, `password`
+
+**Important:** Uses QoS 1 (AtLeastOnce) for reliable delivery. The model ID must be read from `api.cfg`, not guessed.
+
+## Control Page Features
+
+The `/control` endpoint provides a web UI with:
+- **Tab-based preview**: Snapshot, MJPEG Stream, H.264 Stream
+- **H.264 player**: Uses flv.js from CDN for live FLV playback in browser
+- **Performance stats**: Real-time MJPEG FPS, H.264 FPS, Total CPU, Encoder CPU
+- **Settings**:
+  - Auto LAN mode toggle
+  - H.264 encoding toggle
+  - **Frame Rate slider**: 0-100% with text input (100%=all frames, 0%=~1fps)
+  - **Auto Skip toggle**: CPU-based dynamic frame rate adjustment
+  - **Target CPU %**: Maximum CPU target when auto-skip enabled (30-90%)
+
+### API Stats Response (`/api/stats`)
+```json
+{
+  "cpu": {"total": 47.4, "processes": {"2673": 18.6, "2591": 11.3}},
+  "fps": {"mjpeg": 10.0, "h264": 5.0},
+  "h264_enabled": true,
+  "skip_ratio": 2,
+  "auto_skip": true,
+  "target_cpu": 60,
+  "autolanmode": true
+}
+```
+
+## Properties (app.json)
+
+- `encoder_type` (string, default: "rkmpi-yuyv") - Encoder mode: "gkcam", "rkmpi", or "rkmpi-yuyv"
+- `gkcam_all_frames` (bool, default: false) - In gkcam mode, decode all frames (true) or keyframes only (false)
+- `autolanmode` (bool, default: true) - Automatically enable LAN mode on startup
+- `auto_skip` (bool, default: false) - Enable automatic skip ratio based on CPU usage (rkmpi only)
+- `target_cpu` (int, default: 60) - Target max CPU usage % for auto-skip (30-90, rkmpi only)
+- `bitrate` (int, default: 512) - H.264 bitrate in kbps (100-4000, rkmpi only)
+- `mjpeg_fps` (int, default: 10) - MJPEG camera framerate (2-30, rkmpi only). Actual rate depends on camera support.
+- `jpeg_quality` (int, default: 85) - JPEG quality for hardware encoding (1-99, rkmpi-yuyv only)
+- `port` (int, default: 8080) - Main HTTP server port (MJPEG, snapshots, control)
+- `logging` (bool, default: false) - Enable debug logging
+
+**Note:** The FLV endpoint is always on port 18088:
+- In **gkcam mode**: served by gkcam natively
+- In **rkmpi/rkmpi-yuyv mode**: served by h264-streamer
+
+## Encoder Modes
+
+### gkcam mode (default)
+- Uses gkcam's built-in FLV stream at `:18088/flv`
+- Lower CPU usage (no encoding required)
+- Does NOT kill gkcam
+
+**Two sub-modes controlled by `gkcam_all_frames`:**
+
+1. **Keyframes only** (`gkcam_all_frames=false`, default):
+   - Decodes only H.264 keyframes (IDR) via ffmpeg single-frame decode
+   - ~1 FPS MJPEG output (keyframes typically arrive at 1/sec)
+   - Lowest CPU usage
+
+2. **All frames** (`gkcam_all_frames=true`):
+   - Uses streaming ffmpeg transcoder to decode all frames
+   - ~2 FPS MJPEG output (limited by transcoding overhead)
+   - Higher CPU usage but smoother video
+
+### rkmpi mode
+- Uses rkmpi_enc binary for direct USB camera capture (MJPEG format)
+- Hardware H.264 encoding via RV1106 VENC
+- TurboJPEG software JPEG decoding (~15% CPU at 720p)
+- Higher quality, more configurable
+- Kills gkcam to access camera
+- Maximum FPS: 30 fps (camera MJPEG limit)
+
+### rkmpi-yuyv mode
+- Uses rkmpi_enc binary with YUYV capture from USB camera
+- **Both H.264 and JPEG use hardware encoding** via RV1106 VENC
+- Lower CPU usage (~5-10%) - only YUYV→NV12 conversion in software
+- No TurboJPEG dependency
+- Kills gkcam to access camera
+- Maximum FPS: ~5-10 fps (YUYV bandwidth limit at 720p)
+
+**Comparison:**
+| Feature | rkmpi (MJPEG) | rkmpi-yuyv |
+|---------|---------------|------------|
+| Camera Format | MJPEG | YUYV |
+| JPEG Output | Pass-through | HW Encode |
+| H.264 Encoding | HW (VENC) | HW (VENC) |
+| CPU Usage | ~15-20% | ~5-10% |
+| Max FPS (720p) | 30 fps | 5-10 fps |
+| Best For | High FPS | Low CPU |
+
+## Building rkmpi_enc
+
+### Prerequisites
+- RV1106 cross-compilation toolchain at `/shared/dev/rv1106-toolchain`
+- RKMPI SDK libraries (rockit, mpp, rga, turbojpeg)
+
+### Build Commands
+```bash
+cd /shared/dev/anycubic/rkmpi-encoder
+
+# Build with dynamic linking (requires libs on target)
+make dynamic
+
+# Copy to h264-streamer directory
+make install-h264
+```
+
+### Required Libraries on Printer
+Located in `/oem/usr/lib/`:
+- librockit_full.so
+- librockchip_mpp.so
+- librga.so
+- libdrm.so
+- libturbojpeg.so
+
+## Building SWU Package
+
+SWU packages are built via the Rinkhals build system.
+
+### Build Scripts Location
+- **Local build script:** `/shared/dev/Rinkhals/build/swu-tools/h264-streamer/build-local.sh`
+- **Build tools:** `/shared/dev/Rinkhals/build/tools.sh`
+
+### Build All Models (Local)
+```bash
+/shared/dev/Rinkhals/build/swu-tools/h264-streamer/build-local.sh
+```
+
+This builds SWU packages for all Kobra models (K2P, K3, K3V2, KS1, KS1M, K3M) to `/shared/dev/Rinkhals/build/dist/`.
+
+### Build Single Model
+```bash
+/shared/dev/Rinkhals/build/swu-tools/h264-streamer/build-local.sh KS1
+```
+
+### SWU Passwords by Model (Reference)
+Handled automatically by build scripts via `build/tools.sh`:
+- K2P, K3, K3V2: `U2FsdGVkX19deTfqpXHZnB5GeyQ/dtlbHjkUnwgCi+w=`
+- KS1, KS1M: `U2FsdGVkX1+lG6cHmshPLI/LaQr9cZCjA8HZt6Y8qmbB7riY`
+- K3M: `4DKXtEGStWHpPgZm8Xna9qluzAI8VJzpOsEIgd8brTLiXs8fLSu3vRx8o7fMf4h6`
+
+### Installation
+1. Rename SWU to `update.swu`
+2. Copy to `aGVscF9zb3Nf` folder on FAT32 USB drive (MBR, not GPT)
+3. Plug USB into printer
+
+## File Locations
+
+### Development Workflow
+All development is done in the **anycubic** repository. Rinkhals uses a symlink to reference it.
+
+```
+# Source (edit and commit here)
+/shared/dev/anycubic/h264-streamer/29-h264-streamer/
+
+# Rinkhals symlink (DO NOT edit directly)
+/shared/dev/Rinkhals/files/4-apps/home/rinkhals/apps/29-h264-streamer/
+  -> /srv/dev-disk-by-label-opt/dev/anycubic/h264-streamer/29-h264-streamer/
+```
+
+### File Locations
+- **App source (primary):** `/shared/dev/anycubic/h264-streamer/29-h264-streamer/`
+- **Encoder source:** `/shared/dev/anycubic/rkmpi-encoder/`
+- **SWU build tools:** `/shared/dev/Rinkhals/build/swu-tools/h264-streamer/`
+- **Built SWU:** `/shared/dev/Rinkhals/build/dist/h264-streamer-KS1.swu`
+
+### On Printer
+- App install path: `/useremain/home/rinkhals/apps/29-h264-streamer/` (SWU packages install apps here)
+- RKMPI libraries: `/oem/usr/lib/`
+- FIFO pipes: `/tmp/mjpeg.pipe`, `/tmp/h264.pipe`
+
+## Testing on Printer
+
+### Printer Connection
+- **IP:** 192.168.178.43
+- **User:** root
+- **Password:** rockchip
+- **App path:** /useremain/home/rinkhals/apps/29-h264-streamer
+
+### Deploy and test manually
+```bash
+PRINTER_IP=192.168.178.43
+
+# Copy files
+sshpass -p 'rockchip' scp -r /shared/dev/anycubic/h264-streamer/29-h264-streamer/* root@$PRINTER_IP:/useremain/home/rinkhals/apps/29-h264-streamer/
+
+# Start app
+sshpass -p 'rockchip' ssh root@$PRINTER_IP '/useremain/home/rinkhals/apps/29-h264-streamer/app.sh start'
+
+# Test endpoints
+curl http://$PRINTER_IP:8554/status
+curl http://$PRINTER_IP:8554/snapshot -o snapshot.jpg
+```
+
+### Check logs
+```bash
+sshpass -p 'rockchip' ssh root@$PRINTER_IP 'cat /tmp/h264_server.log'
+```
+
+## Camera Compatibility
+
+The encoder auto-detects USB cameras via `/dev/v4l/by-id/` symlinks. It works with any USB camera that:
+- Supports MJPEG output format
+- Provides at least 1280x720 resolution
+
+Resolution detection falls back to 1280x720 if v4l2-ctl is not available.
+
+## Known Issues
+
+- `VideoCapture/StartFluency` API method is not registered on some printer models - not needed, camera works after enabling LAN mode and killing gkcam
+- `pkill` not available on printer - use rinkhals `kill_by_name` function instead
+- `timeout` command not available on printer - removed from commands
+- `v4l2-ctl` may not be available - resolution detection has fallback
+
+## Development Notes
+
+### Process Management
+**⛔ See CRITICAL WARNING at top of this file! ⛔**
+
+Use app.sh for all process management:
+```bash
+sshpass -p 'rockchip' ssh root@$PRINTER_IP '/useremain/home/rinkhals/apps/29-h264-streamer/app.sh stop'
+sshpass -p 'rockchip' ssh root@$PRINTER_IP '/useremain/home/rinkhals/apps/29-h264-streamer/app.sh start'
+sshpass -p 'rockchip' ssh root@$PRINTER_IP '/useremain/home/rinkhals/apps/29-h264-streamer/app.sh status'
+```
+
+## RV1106 Hardware Constraints
+
+### CPU & Memory
+- **CPU:** Single-core ARM Cortex-A7 @ 1.2GHz (ARMv7-A + NEON)
+- **RAM:** 256MB DDR3 shared with system (~100-150MB available)
+- **Implication:** Limited concurrent processing, memory-constrained
+
+### Video Encoding Limits
+| Resolution | Framerate | CPU Usage | Recommended |
+|------------|-----------|-----------|-------------|
+| 720p | 10-15 fps | 15-25% | **Yes** |
+| 720p | 30 fps | 35-45% | Acceptable |
+| 1080p | 15 fps | 40-50% | Marginal |
+| 1080p | 30 fps | 60%+ | Not recommended |
+
+### Hardware Acceleration
+- **VENC:** H.264/H.265 hardware encoder (up to 2304x1296 @ 30fps)
+- **VDEC:** H.264/H.265/MJPEG hardware decoder (not used - TurboJPEG simpler)
+- **RGA:** 2D graphics accelerator for scaling/conversion
+
+### Why Software MJPEG Decode?
+Hardware MJPEG decode (VDEC) requires complex buffer management. At 720p15, TurboJPEG software decode uses only ~15% CPU and is much simpler to implement.
+
+## USB Camera Constraints
+
+### Bandwidth
+- USB 2.0: 480 Mbps theoretical, ~35-40 MB/s practical
+- MJPEG 720p30: ~3-8 MB/s (fits comfortably)
+- Raw YUYV 720p30: ~27 MB/s (too high, don't use)
+
+### Camera Requirements
+- UVC (USB Video Class) compliant
+- **Must support MJPEG output** (not just raw YUV)
+- Common compatible: Logitech C270/C920, generic HD webcams
+
+### Resolution/Format Support
+- **Preferred:** 1280x720 MJPEG @ 15fps
+- **Maximum practical:** 1920x1080 MJPEG @ 15fps
+- **Fallback:** 1280x720 if detection fails
+
+### Known Camera Behaviors
+- Some cameras report capabilities they can't sustain at full framerate
+- Dark scenes = larger MJPEG frames (less compression)
+- Cheap cameras may have unstable USB connections
+- Camera must be released by gkcam before h264-streamer can use it
+
+## Performance Tuning
+
+### skip_ratio Setting
+Controls frame skipping to reduce CPU/bandwidth:
+- `1` = All frames (no skip)
+- `2` = Skip every other frame (half framerate)
+- `3` = Skip 2 of 3 frames (1/3 framerate)
+
+### auto_skip Setting (CPU-based Dynamic Skip)
+When enabled, the encoder automatically adjusts skip_ratio based on CPU usage:
+- **target_cpu**: Maximum CPU usage target (default: 60%)
+- If CPU > target+5%: increases skip_ratio (fewer frames)
+- If CPU < target-10%: decreases skip_ratio (more frames)
+- Range: 1 (all frames) to 10 (max skip)
+
+This ensures the printer maintains at least 40% CPU headroom for other tasks.
+
+### h264_enabled Setting
+- `true` = Full H.264 encoding (higher CPU, lower bandwidth)
+- `false` = MJPEG only (lower CPU, higher bandwidth)
+
+### Recommended Settings
+- **Monitoring:** 720p, 10-15 fps, skip_ratio=1, h264_enabled=true
+- **Auto-adjust:** auto_skip=true, target_cpu=60 (recommended for most users)
+- **Timelapse:** 720p, 1 fps, skip_ratio=0, h264_enabled=false
+- **Low resource:** 720p, 5 fps, skip_ratio=2, h264_enabled=false
+
+### Auto-Skip Test Results
+
+| Target CPU | Skip Ratio | Total CPU | Enc CPU | H.264 FPS | Status |
+|------------|------------|-----------|---------|-----------|--------|
+| 30% | 5 | 36.4% | 9.5% | 3.8 | LOW* |
+| 40% | 4 | 33.9% | 10.7% | 2.3 | OK |
+| 50% | 3 | 44.2% | 11.5% | 2.6 | OK |
+| 60% | 1 | 60.0% | 33.5% | 6.7 | OK |
+| 70% | 2 | 62.4% | 37.1% | 10.0 | OK |
+| 80% | 2 | 62.8% | 38.2% | 10.0 | OK |
+
+*30% target is below encoder baseline (~35% CPU minimum)
+
+## Timelapse Recording
+
+**Status:** ✅ **Fully supported** in rkmpi/rkmpi-yuyv modes. The native `rkmpi_enc` encoder includes a built-in RPC client that handles timelapse commands.
+
+### How It Works
+
+1. Slicer sends print start with `timelapse.status=1`
+2. Firmware sends `openDelayCamera` RPC with gcode filepath
+3. `rkmpi_enc` RPC client receives command, initializes timelapse recording
+4. On each layer change, firmware sends `startLanCapture` RPC
+5. `rkmpi_enc` captures JPEG frame from its internal frame buffer to temp storage
+6. On print complete (`print_stats.state == "complete"`), `rkmpi_enc` runs ffmpeg to assemble MP4
+
+### RPC Commands Handled
+
+| Method | Handler | Action |
+|--------|---------|--------|
+| `openDelayCamera` | `timelapse_init()` | Create temp dir, extract gcode name |
+| `startLanCapture` | `timelapse_capture_frame()` | Copy JPEG from frame buffer |
+| `stopLanCapture` | Reply only | No action needed |
+| `SetLed` | Reply only | LED controlled by firmware |
+
+### Print Completion Detection
+
+The RPC client monitors `print_stats.state` in status updates:
+- `"complete"` → `timelapse_finalize()` - Assemble MP4 with ffmpeg
+- `"cancelled"` or `"error"` → `timelapse_cancel()` - Clean up temp files
+
+### Output Location
+
+- Videos: `/useremain/app/gk/Time-lapse-Video/`
+- Naming: `{gcode_name}_{seq}.mp4` (e.g., `Benchy_PLA_0.2_1h_01.mp4`)
+- Thumbnail: `{gcode_name}_{seq}_{frames}.jpg` (last frame)
+
+### Implementation Files
+
+- `rpc_client.c` - RPC client with timelapse command handlers
+- `timelapse.c` / `timelapse.h` - Frame capture and MP4 assembly
+- Source: `/shared/dev/anycubic/rkmpi-encoder/`
+
+### Reference Data
+
+- Protocol doc: `/shared/dev/anycubic/knowledge/TIMELAPSE_PROTOCOL.md`
+- Timelapse captures: `/shared/dev/Rinkhals/docs/timelapse-captures/`

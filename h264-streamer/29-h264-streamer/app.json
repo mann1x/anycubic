@@ -1,0 +1,39 @@
+{
+    "$version": "1",
+
+    "name": "h264-streamer",
+    "description": "Combined MJPEG/H.264 camera streamer - provides MJPEG stream for Mainsail/Fluidd and H.264 FLV stream for Anycubic slicer. Uses USB camera with hardware H.264 encoding.",
+    "version": "0.2",
+
+    "properties": {
+        "autolanmode": {
+            "display": "Auto-enable LAN mode",
+            "description": "Automatically enable LAN mode on startup if not already enabled. Required for camera access.",
+            "type": "bool",
+            "default": "true"
+        },
+        "auto_skip": {
+            "display": "Auto skip ratio",
+            "description": "Automatically adjust frame skip ratio based on CPU usage to keep at least 40% CPU free.",
+            "type": "bool",
+            "default": "false"
+        },
+        "target_cpu": {
+            "display": "Target CPU %",
+            "description": "Target maximum CPU usage when auto-skip is enabled (30-90%).",
+            "type": "int",
+            "default": "60"
+        },
+        "logging": {
+            "display": "Enable logging",
+            "type": "bool",
+            "default": "false"
+        },
+        "jpeg_quality": {
+            "display": "JPEG Quality",
+            "description": "JPEG quality for hardware encoding in rkmpi-yuyv mode (1-99).",
+            "type": "int",
+            "default": "85"
+        }
+    }
+}
