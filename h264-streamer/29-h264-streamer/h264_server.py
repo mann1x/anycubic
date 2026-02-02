@@ -2191,7 +2191,7 @@ class StreamerApp:
 
         # Display capture settings (disabled by default to save CPU)
         self.display_enabled = getattr(args, 'display_enabled', False)
-        self.display_fps = getattr(args, 'display_fps', 1)
+        self.display_fps = getattr(args, 'display_fps', 5)
 
         # MJPEG frame buffer (for rkmpi mode)
         self.current_frame = None
@@ -5187,7 +5187,7 @@ def main():
     args.h264_resolution = saved_config.get('h264_resolution', getattr(args, 'h264_resolution', '1280x720'))
     # Display capture settings (disabled by default)
     args.display_enabled = saved_config.get('display_enabled', 'false') == 'true'
-    args.display_fps = max(1, min(10, int(saved_config.get('display_fps', 1))))
+    args.display_fps = max(1, min(10, int(saved_config.get('display_fps', 5))))
 
     app = StreamerApp(args)
 
