@@ -109,7 +109,7 @@ RKMPI VENC Ch0 (hardware H.264) → FLV HTTP server (:18088)
 RKMPI VENC Ch1 (hardware MJPEG) → MJPEG HTTP server (:8080)
 
 Display Capture (optional, --display flag):
-    Framebuffer (/dev/fb0) → memcpy → CPU rotation → RGA (BGRX→NV12) → VENC Ch2 (MJPEG)
+    Framebuffer (/dev/fb0) → memcpy → RGA rotation → RGA (BGRX→NV12) → VENC Ch2 (MJPEG)
                                                                             ↓
                                                               /display endpoint (:8080)
 ```
@@ -198,51 +198,59 @@ The encoder includes several CPU optimizations:
 
 1. **Pre-allocated YUV buffer**: Avoids per-frame malloc/free overhead
 2. **NEON SIMD UV interleaving**: Uses ARM NEON intrinsics for U/V plane interleaving
-3. **NEON SIMD rotation**: Uses NEON intrinsics for 180° display rotation
+3. **RGA hardware rotation**: Uses RGA `imflip()`/`imrotate()` for display rotation (0% CPU)
 4. **TurboJPEG fast flags**: Uses `TJFLAG_FASTDCT | TJFLAG_FASTUPSAMPLE` for faster decoding
 5. **Auto-skip**: Dynamically adjusts skip ratio based on CPU usage
 6. **DMA buffers**: Uses RK_MPI_MMZ for hardware-accessible memory
+7. **On-demand encoding**: Display capture only encodes when clients are connected
 
 ## Display Capture
 
 The `--display` flag enables capturing the printer's LCD framebuffer (/dev/fb0) for remote viewing.
 
-### Pipeline
+### Pipeline (Full Hardware Acceleration)
 ```
 Framebuffer (800x480 BGRX)
     ↓ memcpy to DMA buffer (fb mmap is slow/uncached)
-    ↓ CPU rotation (NEON SIMD for 180°)
+    ↓ RGA rotation/flip (imflip or imrotate)
     ↓ RGA color conversion (BGRX → NV12)
     ↓ VENC Ch2 (MJPEG encoding)
     ↓
-/display endpoint (5 fps)
+/display endpoint (1-10 fps, configurable)
 ```
+
+### Features
+- **On-demand encoding**: Only captures when clients connected AND enabled
+- **Disabled by default**: Enable via control page to save CPU when not needed
+- **Configurable FPS**: 1-10 fps selectable via control page
+- **Full hardware pipeline**: RGA rotation + RGA color conversion + VENC encoding
 
 ### Screen Orientation
 Auto-detected from `/userdata/app/gk/config/api.cfg` (JSON format with `modelId`):
 
-| Model | Model ID | Orientation |
-|-------|----------|-------------|
-| KS1, KS1M | 20025, 20029 | 180° flip |
-| K3M | 20026 | 270° rotation |
-| K3, K2P, K3V2 | 20024, 20021, 20027 | 90° rotation |
+| Model | Model ID | Orientation | RGA Operation |
+|-------|----------|-------------|---------------|
+| KS1, KS1M | 20025, 20029 | 180° flip | `imflip()` FLIP_H_V |
+| K3M | 20026 | 270° rotation | `imrotate()` ROT_270 |
+| K3, K2P, K3V2 | 20024, 20021, 20027 | 90° rotation | `imrotate()` ROT_90 |
 
 ### Endpoints
-- `/display` - MJPEG multipart stream (5 fps)
-- `/display/snapshot` - Single JPEG frame
+- `/display` - MJPEG multipart stream (configurable 1-10 fps)
+- `/display/snapshot` - Single JPEG frame (on-demand capture)
 
 ### Performance
-- **CPU usage**: ~15% at 5 fps (800x480)
+- **CPU usage**: ~0-10% when active (full hardware pipeline)
 - **Memory**: 3 DMA buffers (~4.5MB total)
   - Source BGRX: 800×480×4 = 1.5MB
   - Rotation BGRX: 800×480×4 = 1.5MB
   - NV12 output: 800×480×1.5 = 0.6MB
 
 ### Implementation Details
-- Rotation done in CPU (RGA combined rotation+color conversion unreliable)
+- Two-step RGA pipeline: rotation/flip first, then color conversion
 - DMA buffers allocated via `RK_MPI_MMZ_Alloc` for RGA/VENC access
 - Cache flush required after CPU writes, before hardware reads
 - Uses VENC channel 2 (separate from camera channels 0, 1)
+- CPU fallback available if RGA rotation fails
 
 ## Output Pipes
 

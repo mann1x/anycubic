@@ -21,12 +21,14 @@ Native USB camera capture with RV1106 hardware H.264 encoding.
 - TurboJPEG software decode OR hardware JPEG encoding
 - RKMPI VENC hardware H.264 encoding
 - Built-in HTTP, MQTT, and RPC servers
+- **Display capture** with full hardware acceleration (RGA + VENC)
 - **Timelapse recording** with automatic MP4 assembly
 - See: `rkmpi-encoder/claude.md`
 
 ### h264-streamer
 HTTP streaming application for Rinkhals custom firmware.
 - MJPEG and H.264 FLV streaming
+- **Display capture** for remote LCD viewing (RGA hardware rotation)
 - Web control interface with live preview
 - Moonraker webcam integration
 - CPU-based auto frame skipping

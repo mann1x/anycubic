@@ -19,6 +19,7 @@ This repository contains development tools for working with the RV1106 SoC found
 - USB camera capture (MJPEG or YUYV)
 - Hardware H.264 encoding via RV1106 VENC
 - MJPEG and FLV HTTP streaming
+- **Display capture** for remote LCD viewing (full hardware acceleration)
 - Web-based control interface
 - Moonraker webcam integration
 
@@ -84,6 +85,8 @@ The h264-streamer provides HTTP endpoints:
 | `/stream` | MJPEG multipart stream |
 | `/snapshot` | Single JPEG frame |
 | `/flv` | H.264 in FLV container |
+| `/display` | LCD framebuffer MJPEG stream |
+| `/display/snapshot` | Single LCD frame |
 | `/control` | Web UI with settings |
 
 ### Framebuffer Display
