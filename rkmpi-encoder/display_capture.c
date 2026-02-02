@@ -18,6 +18,10 @@
 #include <sys/ioctl.h>
 #include <linux/fb.h>
 
+/* DRM headers for framebuffer DMA-buf export */
+#include <drm/drm.h>
+#include <drm/drm_mode.h>
+
 /* RKMPI headers for hardware JPEG encoding */
 #include "rk_mpi_sys.h"
 #include "rk_mpi_venc.h"
@@ -58,12 +62,17 @@ static volatile int g_display_target_fps = DISPLAY_DEFAULT_FPS;
 static pthread_mutex_t g_display_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /* DMA buffers for RGA and VENC */
-static MB_BLK g_display_src_mb = MB_INVALID_HANDLE;  /* Source BGRX buffer */
+static MB_BLK g_display_src_mb = MB_INVALID_HANDLE;  /* Source BGRX buffer (fallback) */
 static MB_BLK g_display_rot_mb = MB_INVALID_HANDLE;  /* Rotated BGRX buffer */
 static MB_BLK g_display_dst_mb = MB_INVALID_HANDLE;  /* Destination NV12 buffer */
 static void *g_display_src_vaddr = NULL;
 static void *g_display_rot_vaddr = NULL;
 static void *g_display_dst_vaddr = NULL;
+
+/* DRM framebuffer DMA-buf fd (zero-copy mode) */
+static int g_drm_fd = -1;
+static int g_fb_dmabuf_fd = -1;
+static uint32_t g_fb_gem_handle = 0;
 
 static void log_info(const char *fmt, ...) {
     if (g_verbose) {
@@ -83,6 +92,130 @@ static void log_error(const char *fmt, ...) {
     vfprintf(stderr, fmt, args);
     va_end(args);
     fflush(stderr);
+}
+
+/*
+ * Try to get framebuffer DMA-buf fd via DRM
+ * This allows RGA to read directly from the framebuffer without copying
+ * Returns: 0 on success, -1 on failure
+ */
+static int get_framebuffer_dmabuf(int width, int height) {
+    struct drm_mode_card_res res;
+    struct drm_mode_crtc crtc;
+    struct drm_mode_fb_cmd fb;
+    struct drm_prime_handle prime;
+    uint32_t *crtc_ids = NULL;
+
+    /* Open DRM device */
+    g_drm_fd = open("/dev/dri/card0", O_RDWR);
+    if (g_drm_fd < 0) {
+        log_info("Cannot open /dev/dri/card0: %s (will use copy mode)\n", strerror(errno));
+        return -1;
+    }
+
+    /* Get DRM resources */
+    memset(&res, 0, sizeof(res));
+    if (ioctl(g_drm_fd, DRM_IOCTL_MODE_GETRESOURCES, &res) < 0) {
+        log_info("DRM_IOCTL_MODE_GETRESOURCES failed: %s\n", strerror(errno));
+        goto fail;
+    }
+
+    if (res.count_crtcs == 0) {
+        log_info("No CRTCs found\n");
+        goto fail;
+    }
+
+    /* Allocate and get CRTC IDs */
+    crtc_ids = malloc(res.count_crtcs * sizeof(uint32_t));
+    if (!crtc_ids) goto fail;
+
+    res.crtc_id_ptr = (uint64_t)(uintptr_t)crtc_ids;
+    /* Need to allocate other arrays even if unused */
+    uint32_t *conn_ids = malloc(res.count_connectors * sizeof(uint32_t));
+    uint32_t *enc_ids = malloc(res.count_encoders * sizeof(uint32_t));
+    res.connector_id_ptr = (uint64_t)(uintptr_t)conn_ids;
+    res.encoder_id_ptr = (uint64_t)(uintptr_t)enc_ids;
+
+    if (ioctl(g_drm_fd, DRM_IOCTL_MODE_GETRESOURCES, &res) < 0) {
+        free(conn_ids);
+        free(enc_ids);
+        goto fail;
+    }
+    free(conn_ids);
+    free(enc_ids);
+
+    /* Find active CRTC with framebuffer */
+    for (uint32_t i = 0; i < res.count_crtcs; i++) {
+        memset(&crtc, 0, sizeof(crtc));
+        crtc.crtc_id = crtc_ids[i];
+
+        if (ioctl(g_drm_fd, DRM_IOCTL_MODE_GETCRTC, &crtc) < 0)
+            continue;
+
+        if (crtc.fb_id == 0)
+            continue;
+
+        /* Get framebuffer info */
+        memset(&fb, 0, sizeof(fb));
+        fb.fb_id = crtc.fb_id;
+
+        if (ioctl(g_drm_fd, DRM_IOCTL_MODE_GETFB, &fb) < 0)
+            continue;
+
+        /* Verify dimensions match */
+        if (fb.width != (uint32_t)width || fb.height != (uint32_t)height) {
+            log_info("FB size mismatch: %ux%u vs %dx%d\n", fb.width, fb.height, width, height);
+            continue;
+        }
+
+        if (fb.handle == 0) {
+            log_info("No GEM handle for FB\n");
+            continue;
+        }
+
+        g_fb_gem_handle = fb.handle;
+
+        /* Export as DMA-buf */
+        memset(&prime, 0, sizeof(prime));
+        prime.handle = fb.handle;
+        prime.flags = DRM_CLOEXEC | DRM_RDWR;
+
+        if (ioctl(g_drm_fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &prime) < 0) {
+            log_info("PRIME_HANDLE_TO_FD failed: %s\n", strerror(errno));
+            continue;
+        }
+
+        g_fb_dmabuf_fd = prime.fd;
+        free(crtc_ids);
+        log_info("Got framebuffer DMA-buf fd=%d (zero-copy mode)\n", g_fb_dmabuf_fd);
+        return 0;
+    }
+
+fail:
+    free(crtc_ids);
+    if (g_drm_fd >= 0) {
+        close(g_drm_fd);
+        g_drm_fd = -1;
+    }
+    return -1;
+}
+
+static void cleanup_framebuffer_dmabuf(void) {
+    if (g_fb_dmabuf_fd >= 0) {
+        close(g_fb_dmabuf_fd);
+        g_fb_dmabuf_fd = -1;
+    }
+    /* Close GEM handle */
+    if (g_drm_fd >= 0 && g_fb_gem_handle != 0) {
+        struct drm_gem_close gem_close;
+        gem_close.handle = g_fb_gem_handle;
+        ioctl(g_drm_fd, DRM_IOCTL_GEM_CLOSE, &gem_close);
+        g_fb_gem_handle = 0;
+    }
+    if (g_drm_fd >= 0) {
+        close(g_drm_fd);
+        g_drm_fd = -1;
+    }
 }
 
 const char *display_orientation_name(DisplayOrientation orient) {
@@ -336,6 +469,97 @@ static int rga_copy_framebuffer(void *src, void *dst, int width, int height) {
 }
 
 /*
+ * Flip 180° directly from DMA-buf fd to DMA buffer (zero-copy from framebuffer)
+ */
+static int rga_flip_180_from_fd(int src_fd, void *dst_bgrx, int width, int height) {
+    rga_buffer_t src_buf, dst_buf;
+    IM_STATUS status;
+
+    src_buf = wrapbuffer_fd(src_fd, width, height, RK_FORMAT_BGRX_8888);
+    if (src_buf.width == 0) return -1;
+
+    dst_buf = wrapbuffer_virtualaddr(dst_bgrx, width, height, RK_FORMAT_BGRX_8888);
+    if (dst_buf.width == 0) return -1;
+
+    status = imflip(src_buf, dst_buf, IM_HAL_TRANSFORM_FLIP_H_V, 1);
+    if (status != IM_STATUS_SUCCESS) {
+        log_error("RGA flip from fd failed: %s\n", imStrError(status));
+        return -1;
+    }
+
+    return 0;
+}
+
+/*
+ * Rotate 90° directly from DMA-buf fd to DMA buffer (zero-copy from framebuffer)
+ */
+static int rga_rotate_90_from_fd(int src_fd, void *dst_bgrx, int width, int height) {
+    rga_buffer_t src_buf, dst_buf;
+    IM_STATUS status;
+
+    src_buf = wrapbuffer_fd(src_fd, width, height, RK_FORMAT_BGRX_8888);
+    if (src_buf.width == 0) return -1;
+
+    /* Output is rotated: width becomes height */
+    dst_buf = wrapbuffer_virtualaddr(dst_bgrx, height, width, RK_FORMAT_BGRX_8888);
+    if (dst_buf.width == 0) return -1;
+
+    status = imrotate(src_buf, dst_buf, IM_HAL_TRANSFORM_ROT_90, 1);
+    if (status != IM_STATUS_SUCCESS) {
+        log_error("RGA rotate 90 from fd failed: %s\n", imStrError(status));
+        return -1;
+    }
+
+    return 0;
+}
+
+/*
+ * Rotate 270° directly from DMA-buf fd to DMA buffer (zero-copy from framebuffer)
+ */
+static int rga_rotate_270_from_fd(int src_fd, void *dst_bgrx, int width, int height) {
+    rga_buffer_t src_buf, dst_buf;
+    IM_STATUS status;
+
+    src_buf = wrapbuffer_fd(src_fd, width, height, RK_FORMAT_BGRX_8888);
+    if (src_buf.width == 0) return -1;
+
+    /* Output is rotated: width becomes height */
+    dst_buf = wrapbuffer_virtualaddr(dst_bgrx, height, width, RK_FORMAT_BGRX_8888);
+    if (dst_buf.width == 0) return -1;
+
+    status = imrotate(src_buf, dst_buf, IM_HAL_TRANSFORM_ROT_270, 1);
+    if (status != IM_STATUS_SUCCESS) {
+        log_error("RGA rotate 270 from fd failed: %s\n", imStrError(status));
+        return -1;
+    }
+
+    return 0;
+}
+
+/*
+ * Convert BGRX to NV12 directly from DMA-buf fd (for no-rotation case)
+ */
+static int rga_convert_from_fd(int src_fd, void *dst_nv12, int width, int height) {
+    rga_buffer_t src_buf, dst_buf;
+    IM_STATUS status;
+
+    src_buf = wrapbuffer_fd(src_fd, width, height, RK_FORMAT_BGRX_8888);
+    if (src_buf.width == 0) return -1;
+
+    dst_buf = wrapbuffer_virtualaddr(dst_nv12, width, height, RK_FORMAT_YCbCr_420_SP);
+    if (dst_buf.width == 0) return -1;
+
+    status = imcvtcolor(src_buf, dst_buf, RK_FORMAT_BGRX_8888, RK_FORMAT_YCbCr_420_SP,
+                       IM_RGB_TO_YUV_BT601_LIMIT, 1);
+    if (status != IM_STATUS_SUCCESS) {
+        log_error("RGA convert from fd failed: %s\n", imStrError(status));
+        return -1;
+    }
+
+    return 0;
+}
+
+/*
  * Initialize VENC for display JPEG encoding
  */
 static int init_display_venc(int width, int height, int fps, int quality) {
@@ -444,20 +668,27 @@ int display_capture_init(DisplayCapture *ctx, int fps) {
 
     log_info("Output dimensions: %dx%d\n", ctx->output_width, ctx->output_height);
 
-    /* Allocate DMA buffer for source BGRX (copy from framebuffer) */
-    size_t src_size = ctx->fb_size;
-    RK_S32 ret = RK_MPI_MMZ_Alloc(&g_display_src_mb, src_size, RK_MMZ_ALLOC_CACHEABLE);
-    if (ret != RK_SUCCESS || g_display_src_mb == MB_INVALID_HANDLE) {
-        log_error("RK_MPI_MMZ_Alloc(src) failed: 0x%x\n", ret);
-        munmap(ctx->fb_pixels, ctx->fb_size);
-        close(ctx->fb_fd);
-        return -1;
+    /* Try to get framebuffer DMA-buf fd for zero-copy mode */
+    if (get_framebuffer_dmabuf(ctx->fb_width, ctx->fb_height) == 0) {
+        /* Zero-copy mode: don't need source DMA buffer */
+        log_info("Using zero-copy mode (DMA-buf fd)\n");
+    } else {
+        /* Fallback: allocate DMA buffer for source BGRX (copy from framebuffer) */
+        size_t src_size = ctx->fb_size;
+        RK_S32 ret = RK_MPI_MMZ_Alloc(&g_display_src_mb, src_size, RK_MMZ_ALLOC_CACHEABLE);
+        if (ret != RK_SUCCESS || g_display_src_mb == MB_INVALID_HANDLE) {
+            log_error("RK_MPI_MMZ_Alloc(src) failed: 0x%x\n", ret);
+            munmap(ctx->fb_pixels, ctx->fb_size);
+            close(ctx->fb_fd);
+            return -1;
+        }
+        g_display_src_vaddr = RK_MPI_MMZ_Handle2VirAddr(g_display_src_mb);
+        log_info("Allocated source DMA buffer: %zu bytes (copy mode)\n", src_size);
     }
-    g_display_src_vaddr = RK_MPI_MMZ_Handle2VirAddr(g_display_src_mb);
-    log_info("Allocated source DMA buffer: %zu bytes\n", src_size);
 
-    /* Allocate DMA buffer for rotation (CPU rotation output, RGA input) */
-    ret = RK_MPI_MMZ_Alloc(&g_display_rot_mb, src_size, RK_MMZ_ALLOC_CACHEABLE);
+    /* Allocate DMA buffer for rotation (RGA rotation output) */
+    size_t src_size = ctx->fb_size;
+    RK_S32 ret = RK_MPI_MMZ_Alloc(&g_display_rot_mb, src_size, RK_MMZ_ALLOC_CACHEABLE);
     if (ret != RK_SUCCESS || g_display_rot_mb == MB_INVALID_HANDLE) {
         log_error("RK_MPI_MMZ_Alloc(rot) failed: 0x%x\n", ret);
         RK_MPI_MMZ_Free(g_display_src_mb);
@@ -528,6 +759,9 @@ void display_capture_cleanup(DisplayCapture *ctx) {
         g_display_src_vaddr = NULL;
     }
 
+    /* Cleanup DRM/DMA-buf */
+    cleanup_framebuffer_dmabuf();
+
     if (ctx->fb_pixels && ctx->fb_pixels != MAP_FAILED) {
         munmap(ctx->fb_pixels, ctx->fb_size);
         ctx->fb_pixels = NULL;
@@ -558,80 +792,122 @@ static uint64_t g_timing_output = 0;
 #endif /* DISPLAY_TIMING */
 
 size_t display_capture_frame(DisplayCapture *ctx, uint8_t *jpeg_buf, size_t jpeg_buf_size) {
-    if (!ctx->running || !ctx->fb_pixels || !g_display_src_vaddr || !g_display_rot_vaddr || !g_display_dst_vaddr) {
+    if (!ctx->running || !g_display_rot_vaddr || !g_display_dst_vaddr) {
         return 0;
     }
 
-    void *rga_src;
-    int rga_width, rga_height;
+    /* Need either DMA-buf fd (zero-copy) or source buffer (copy mode) */
+    int zero_copy = (g_fb_dmabuf_fd >= 0);
+    if (!zero_copy && !g_display_src_vaddr) {
+        return 0;
+    }
+
+    void *rga_src = NULL;
+    int rga_width = ctx->fb_width;
+    int rga_height = ctx->fb_height;
 
 #ifdef DISPLAY_TIMING
     uint64_t t0, t1, t2, t3, t4, t5, t6, t7;
     t0 = get_time_us();
 #endif
 
-    /* Copy framebuffer to DMA buffer
-     * Try RGA DMA copy first (much faster than CPU memcpy from uncached memory)
-     * Fall back to CPU memcpy if RGA fails
-     */
-    if (rga_copy_framebuffer(ctx->fb_pixels, g_display_src_vaddr, ctx->fb_width, ctx->fb_height) != 0) {
-        /* RGA copy failed, use CPU memcpy */
-        memcpy(g_display_src_vaddr, ctx->fb_pixels, ctx->fb_size);
-        /* Flush cache after CPU write */
-        RK_MPI_MMZ_FlushCacheStart(g_display_src_mb, 0, ctx->fb_size, RK_MMZ_SYNC_WRITEONLY);
-        RK_MPI_MMZ_FlushCacheEnd(g_display_src_mb, 0, ctx->fb_size, RK_MMZ_SYNC_WRITEONLY);
+    if (zero_copy) {
+        /*
+         * Zero-copy mode: RGA reads directly from framebuffer via DMA-buf fd
+         * No copy needed - just do rotation directly from fb
+         */
+        if (ctx->orientation == DISPLAY_ORIENT_FLIP_180) {
+            rga_width = ctx->fb_width;
+            rga_height = ctx->fb_height;
+            if (rga_flip_180_from_fd(g_fb_dmabuf_fd, g_display_rot_vaddr, ctx->fb_width, ctx->fb_height) != 0) {
+                /* Fallback to copy mode for this frame */
+                zero_copy = 0;
+            } else {
+                rga_src = g_display_rot_vaddr;
+            }
+        } else if (ctx->orientation == DISPLAY_ORIENT_ROTATE_90) {
+            rga_width = ctx->fb_height;
+            rga_height = ctx->fb_width;
+            if (rga_rotate_90_from_fd(g_fb_dmabuf_fd, g_display_rot_vaddr, ctx->fb_width, ctx->fb_height) != 0) {
+                zero_copy = 0;
+            } else {
+                rga_src = g_display_rot_vaddr;
+            }
+        } else if (ctx->orientation == DISPLAY_ORIENT_ROTATE_270) {
+            rga_width = ctx->fb_height;
+            rga_height = ctx->fb_width;
+            if (rga_rotate_270_from_fd(g_fb_dmabuf_fd, g_display_rot_vaddr, ctx->fb_width, ctx->fb_height) != 0) {
+                zero_copy = 0;
+            } else {
+                rga_src = g_display_rot_vaddr;
+            }
+        } else {
+            /* No rotation - convert directly from fd */
+            rga_width = ctx->fb_width;
+            rga_height = ctx->fb_height;
+            /* Skip rotation step, will use convert_from_fd below */
+            rga_src = NULL;
+        }
     }
 
 #ifdef DISPLAY_TIMING
     t1 = get_time_us();
-    t2 = t1; /* No cache flush needed after RGA - it uses DMA directly */
+    t2 = t1;
 #endif
 
-    /* Apply rotation using RGA hardware, with CPU fallback */
-    if (ctx->orientation == DISPLAY_ORIENT_FLIP_180) {
-        rga_width = ctx->fb_width;
-        rga_height = ctx->fb_height;
-        /* Try RGA flip first */
-        if (rga_flip_180(g_display_src_vaddr, g_display_rot_vaddr, ctx->fb_width, ctx->fb_height) == 0) {
-            rga_src = g_display_rot_vaddr;
-        } else {
-            /* CPU fallback */
-            rotate_bgrx_180((uint32_t *)g_display_src_vaddr, (uint32_t *)g_display_rot_vaddr, ctx->fb_width, ctx->fb_height);
-            rga_src = g_display_rot_vaddr;
-            RK_MPI_MMZ_FlushCacheStart(g_display_rot_mb, 0, ctx->fb_size, RK_MMZ_SYNC_WRITEONLY);
-            RK_MPI_MMZ_FlushCacheEnd(g_display_rot_mb, 0, ctx->fb_size, RK_MMZ_SYNC_WRITEONLY);
+    if (!zero_copy && g_display_src_vaddr) {
+        /* Copy mode: Copy framebuffer then rotate */
+        if (rga_copy_framebuffer(ctx->fb_pixels, g_display_src_vaddr, ctx->fb_width, ctx->fb_height) != 0) {
+            /* RGA copy failed, use CPU memcpy */
+            memcpy(g_display_src_vaddr, ctx->fb_pixels, ctx->fb_size);
+            RK_MPI_MMZ_FlushCacheStart(g_display_src_mb, 0, ctx->fb_size, RK_MMZ_SYNC_WRITEONLY);
+            RK_MPI_MMZ_FlushCacheEnd(g_display_src_mb, 0, ctx->fb_size, RK_MMZ_SYNC_WRITEONLY);
         }
-    } else if (ctx->orientation == DISPLAY_ORIENT_ROTATE_90) {
-        rga_width = ctx->fb_height;  /* Swapped */
-        rga_height = ctx->fb_width;
-        /* Try RGA rotate first */
-        if (rga_rotate_90(g_display_src_vaddr, g_display_rot_vaddr, ctx->fb_width, ctx->fb_height) == 0) {
-            rga_src = g_display_rot_vaddr;
+
+#ifdef DISPLAY_TIMING
+        t1 = get_time_us();
+        t2 = t1;
+#endif
+
+        /* Apply rotation using RGA hardware */
+        if (ctx->orientation == DISPLAY_ORIENT_FLIP_180) {
+            rga_width = ctx->fb_width;
+            rga_height = ctx->fb_height;
+            if (rga_flip_180(g_display_src_vaddr, g_display_rot_vaddr, ctx->fb_width, ctx->fb_height) == 0) {
+                rga_src = g_display_rot_vaddr;
+            } else {
+                rotate_bgrx_180((uint32_t *)g_display_src_vaddr, (uint32_t *)g_display_rot_vaddr, ctx->fb_width, ctx->fb_height);
+                rga_src = g_display_rot_vaddr;
+                RK_MPI_MMZ_FlushCacheStart(g_display_rot_mb, 0, ctx->fb_size, RK_MMZ_SYNC_WRITEONLY);
+                RK_MPI_MMZ_FlushCacheEnd(g_display_rot_mb, 0, ctx->fb_size, RK_MMZ_SYNC_WRITEONLY);
+            }
+        } else if (ctx->orientation == DISPLAY_ORIENT_ROTATE_90) {
+            rga_width = ctx->fb_height;
+            rga_height = ctx->fb_width;
+            if (rga_rotate_90(g_display_src_vaddr, g_display_rot_vaddr, ctx->fb_width, ctx->fb_height) == 0) {
+                rga_src = g_display_rot_vaddr;
+            } else {
+                rotate_bgrx_90((uint32_t *)g_display_src_vaddr, (uint32_t *)g_display_rot_vaddr, ctx->fb_width, ctx->fb_height);
+                rga_src = g_display_rot_vaddr;
+                RK_MPI_MMZ_FlushCacheStart(g_display_rot_mb, 0, ctx->fb_size, RK_MMZ_SYNC_WRITEONLY);
+                RK_MPI_MMZ_FlushCacheEnd(g_display_rot_mb, 0, ctx->fb_size, RK_MMZ_SYNC_WRITEONLY);
+            }
+        } else if (ctx->orientation == DISPLAY_ORIENT_ROTATE_270) {
+            rga_width = ctx->fb_height;
+            rga_height = ctx->fb_width;
+            if (rga_rotate_270(g_display_src_vaddr, g_display_rot_vaddr, ctx->fb_width, ctx->fb_height) == 0) {
+                rga_src = g_display_rot_vaddr;
+            } else {
+                rotate_bgrx_270((uint32_t *)g_display_src_vaddr, (uint32_t *)g_display_rot_vaddr, ctx->fb_width, ctx->fb_height);
+                rga_src = g_display_rot_vaddr;
+                RK_MPI_MMZ_FlushCacheStart(g_display_rot_mb, 0, ctx->fb_size, RK_MMZ_SYNC_WRITEONLY);
+                RK_MPI_MMZ_FlushCacheEnd(g_display_rot_mb, 0, ctx->fb_size, RK_MMZ_SYNC_WRITEONLY);
+            }
         } else {
-            /* CPU fallback */
-            rotate_bgrx_90((uint32_t *)g_display_src_vaddr, (uint32_t *)g_display_rot_vaddr, ctx->fb_width, ctx->fb_height);
-            rga_src = g_display_rot_vaddr;
-            RK_MPI_MMZ_FlushCacheStart(g_display_rot_mb, 0, ctx->fb_size, RK_MMZ_SYNC_WRITEONLY);
-            RK_MPI_MMZ_FlushCacheEnd(g_display_rot_mb, 0, ctx->fb_size, RK_MMZ_SYNC_WRITEONLY);
+            rga_src = g_display_src_vaddr;
+            rga_width = ctx->fb_width;
+            rga_height = ctx->fb_height;
         }
-    } else if (ctx->orientation == DISPLAY_ORIENT_ROTATE_270) {
-        rga_width = ctx->fb_height;  /* Swapped */
-        rga_height = ctx->fb_width;
-        /* Try RGA rotate first */
-        if (rga_rotate_270(g_display_src_vaddr, g_display_rot_vaddr, ctx->fb_width, ctx->fb_height) == 0) {
-            rga_src = g_display_rot_vaddr;
-        } else {
-            /* CPU fallback */
-            rotate_bgrx_270((uint32_t *)g_display_src_vaddr, (uint32_t *)g_display_rot_vaddr, ctx->fb_width, ctx->fb_height);
-            rga_src = g_display_rot_vaddr;
-            RK_MPI_MMZ_FlushCacheStart(g_display_rot_mb, 0, ctx->fb_size, RK_MMZ_SYNC_WRITEONLY);
-            RK_MPI_MMZ_FlushCacheEnd(g_display_rot_mb, 0, ctx->fb_size, RK_MMZ_SYNC_WRITEONLY);
-        }
-    } else {
-        /* No rotation needed, use source buffer directly */
-        rga_src = g_display_src_vaddr;
-        rga_width = ctx->fb_width;
-        rga_height = ctx->fb_height;
     }
 
 #ifdef DISPLAY_TIMING
@@ -639,7 +915,15 @@ size_t display_capture_frame(DisplayCapture *ctx, uint8_t *jpeg_buf, size_t jpeg
 #endif
 
     /* RGA color conversion (BGRX to NV12) */
-    if (rga_convert_bgrx_to_nv12(rga_src, g_display_dst_vaddr, rga_width, rga_height) != 0) {
+    int convert_ok;
+    if (zero_copy && rga_src == NULL && ctx->orientation == DISPLAY_ORIENT_NORMAL) {
+        /* No rotation needed - convert directly from DMA-buf fd */
+        convert_ok = (rga_convert_from_fd(g_fb_dmabuf_fd, g_display_dst_vaddr, rga_width, rga_height) == 0);
+    } else {
+        convert_ok = (rga_convert_bgrx_to_nv12(rga_src, g_display_dst_vaddr, rga_width, rga_height) == 0);
+    }
+
+    if (!convert_ok) {
         log_error("RGA conversion failed\n");
         return 0;
     }
