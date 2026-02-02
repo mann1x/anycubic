@@ -291,6 +291,21 @@ For **external Klipper** setups (e.g., Raspberry Pi) or testing without firmware
 | Anycubic slicer | ✅ | ❌ |
 | External Klipper | ❌ | ✅ |
 
+### Setting the Mode
+
+To switch to vanilla-klipper mode, use the Rinkhals `set_app_property` command:
+
+```bash
+set_app_property 29-h264-streamer mode vanilla-klipper
+```
+
+Then restart the app:
+
+```bash
+/useremain/home/rinkhals/apps/29-h264-streamer/app.sh stop
+/useremain/home/rinkhals/apps/29-h264-streamer/app.sh start
+```
+
 ## Encoder Modes
 
 ### rkmpi-yuyv (Recommended)
