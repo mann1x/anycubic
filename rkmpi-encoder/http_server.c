@@ -7,6 +7,7 @@
 #include "http_server.h"
 #include "frame_buffer.h"
 #include "flv_mux.h"
+#include "display_capture.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
@@ -276,9 +277,62 @@ static void http_send_snapshot(int fd) {
     http_send_snapshot_from_buffer(fd, &g_jpeg_buffer, FRAME_BUFFER_MAX_JPEG);
 }
 
-/* Send single JPEG snapshot (display) */
+/* Send single JPEG snapshot (display)
+ * Since display capture only runs when clients are connected,
+ * we need to trigger capture and wait for a frame.
+ */
 static void http_send_display_snapshot(int fd) {
-    http_send_snapshot_from_buffer(fd, &g_display_buffer, FRAME_BUFFER_MAX_DISPLAY);
+    /* Trigger capture by incrementing client count */
+    display_client_connect();
+
+    /* Wait for a frame (up to 5 seconds) */
+    uint8_t *jpeg_buf = malloc(FRAME_BUFFER_MAX_DISPLAY);
+    if (!jpeg_buf) {
+        display_client_disconnect();
+        http_send_404(fd);
+        return;
+    }
+
+    size_t jpeg_size = 0;
+    int waited_ms = 0;
+    const int max_wait_ms = 5000;
+    const int poll_ms = 100;
+
+    /* Get initial sequence to detect new frames */
+    uint64_t start_seq = frame_buffer_get_sequence(&g_display_buffer);
+
+    /* Wait for a new frame (sequence must increase) */
+    while (waited_ms < max_wait_ms) {
+        usleep(poll_ms * 1000);
+        waited_ms += poll_ms;
+
+        uint64_t cur_seq = frame_buffer_get_sequence(&g_display_buffer);
+        if (cur_seq > start_seq) {
+            /* New frame available - copy it */
+            jpeg_size = frame_buffer_copy(&g_display_buffer, jpeg_buf,
+                                         FRAME_BUFFER_MAX_DISPLAY, NULL, NULL);
+            if (jpeg_size > 0) break;
+        }
+    }
+
+    display_client_disconnect();
+
+    if (jpeg_size > 0) {
+        char headers[256];
+        int hlen = snprintf(headers, sizeof(headers),
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: image/jpeg\r\n"
+            "Content-Length: %zu\r\n"
+            "Cache-Control: no-cache\r\n"
+            "Connection: close\r\n"
+            "\r\n", jpeg_size);
+        http_send(fd, headers, hlen);
+        http_send(fd, jpeg_buf, jpeg_size);
+    } else {
+        http_send_404(fd);
+    }
+
+    free(jpeg_buf);
 }
 
 /* Send FLV stream headers (gkcam-compatible) */
@@ -333,6 +387,7 @@ static void http_handle_client_read(HttpServer *srv, HttpClient *client) {
                 http_send_mjpeg_headers(client->fd);
                 client->state = CLIENT_STATE_STREAMING;
                 client->header_sent = 1;
+                display_client_connect();
                 log_info("HTTP[%d]: Display stream started\n", srv->port);
                 break;
 
@@ -364,6 +419,11 @@ static void http_handle_client_read(HttpServer *srv, HttpClient *client) {
 /* Close client and cleanup */
 static void http_close_client(HttpServer *srv, int slot) {
     HttpClient *client = &srv->clients[slot];
+
+    /* Track display client disconnect */
+    if (client->request == REQUEST_DISPLAY_STREAM) {
+        display_client_disconnect();
+    }
 
     if (client->fd > 0) {
         close(client->fd);

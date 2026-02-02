@@ -28,7 +28,10 @@
 #define DISPLAY_JPEG_QUALITY  80
 
 /* Default capture FPS (display updates are typically slow) */
-#define DISPLAY_DEFAULT_FPS   5
+#define DISPLAY_DEFAULT_FPS   1
+
+/* Maximum display FPS */
+#define DISPLAY_MAX_FPS       10
 
 /* Screen orientation modes (based on printer model) */
 typedef enum {
@@ -75,5 +78,18 @@ int display_capture_is_running(void);
 
 /* Get current orientation name (for logging) */
 const char *display_orientation_name(DisplayOrientation orient);
+
+/* Client tracking - only encode when clients are connected */
+void display_client_connect(void);
+void display_client_disconnect(void);
+int display_get_client_count(void);
+
+/* Enable/disable display capture (pauses encoding when disabled) */
+void display_set_enabled(int enabled);
+int display_is_enabled(void);
+
+/* Set display FPS (1-10) */
+void display_set_fps(int fps);
+int display_get_fps(void);
 
 #endif /* DISPLAY_CAPTURE_H */

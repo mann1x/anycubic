@@ -2189,6 +2189,10 @@ class StreamerApp:
         self.mjpeg_fps_target = getattr(args, 'mjpeg_fps', 10)  # Target MJPEG framerate
         self.max_camera_fps = 30  # Will be detected from camera
 
+        # Display capture settings (disabled by default to save CPU)
+        self.display_enabled = getattr(args, 'display_enabled', False)
+        self.display_fps = getattr(args, 'display_fps', 1)
+
         # MJPEG frame buffer (for rkmpi mode)
         self.current_frame = None
         self.frame_lock = threading.Lock()
@@ -2282,6 +2286,9 @@ class StreamerApp:
                 f.write(f"skip={self.skip_ratio}\n")
                 f.write(f"auto_skip={'1' if self.auto_skip else '0'}\n")
                 f.write(f"target_cpu={self.target_cpu}\n")
+                # Display capture settings
+                f.write(f"display_enabled={'1' if self.display_enabled else '0'}\n")
+                f.write(f"display_fps={self.display_fps}\n")
         except Exception as e:
             print(f"Error writing control file: {e}", flush=True)
 
@@ -2344,6 +2351,8 @@ class StreamerApp:
             config['streaming_port'] = str(self.streaming_port)
             config['control_port'] = str(self.control_port)
             config['h264_resolution'] = self.h264_resolution
+            config['display_enabled'] = 'true' if self.display_enabled else 'false'
+            config['display_fps'] = str(self.display_fps)
 
             # Write back
             with open(config_path, 'w') as f:
@@ -2584,7 +2593,9 @@ class StreamerApp:
             cmd.append('-n')
 
         # Enable display capture (printer LCD framebuffer)
+        # Always start the thread, but it idles until enabled via control file
         cmd.append('--display')
+        cmd.extend(['--display-fps', str(self.display_fps)])
 
         print(f"Starting encoder (server mode): {' '.join(cmd)}", flush=True)
 
@@ -3650,6 +3661,32 @@ class StreamerApp:
                     </div>
                     <div class="setting-note">Lower resolution = less TurboJPEG decode CPU. Requires restart.</div>
                 </div>
+                <div class="setting rkmpi-only" style="{'display:none' if not self.is_rkmpi_mode() else ''}; border-top: 1px solid #444; padding-top: 15px; margin-top: 15px;">
+                    <div class="setting-row">
+                        <span class="label">Display Capture:</span>
+                        <div class="control">
+                            <label class="toggle">
+                                <input type="checkbox" name="display_enabled" {'checked' if self.display_enabled else ''} onchange="updateDisplaySettings()">
+                                <span class="slider"></span>
+                            </label>
+                        </div>
+                    </div>
+                    <div class="setting-note">Capture printer LCD screen (uses ~15% CPU when active)</div>
+                </div>
+                <div class="setting rkmpi-only" style="{'display:none' if not self.is_rkmpi_mode() else ''}">
+                    <div class="setting-row">
+                        <span class="label">Display FPS:</span>
+                        <div class="control">
+                            <select name="display_fps" id="display_fps_select" style="padding:8px;border-radius:4px;border:1px solid #555;background:#333;color:#fff;" {'disabled' if not self.display_enabled else ''}>
+                                <option value="1" {'selected' if self.display_fps == 1 else ''}>1 fps (lowest CPU)</option>
+                                <option value="2" {'selected' if self.display_fps == 2 else ''}>2 fps</option>
+                                <option value="5" {'selected' if self.display_fps == 5 else ''}>5 fps</option>
+                                <option value="10" {'selected' if self.display_fps == 10 else ''}>10 fps (highest)</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="setting-note">Higher FPS = more CPU usage</div>
+                </div>
                 <div class="setting" style="margin-top: 15px;">
                     <div class="setting-row">
                         <button type="submit">Apply Settings</button>
@@ -4072,6 +4109,11 @@ if(flvjs.isSupported()){{
             }}
         }}
 
+        function updateDisplaySettings() {{
+            const enabled = document.querySelector('[name=display_enabled]').checked;
+            document.getElementById('display_fps_select').disabled = !enabled;
+        }}
+
         // Update stats every second
         function updateStats() {{
             fetch('/api/stats')
@@ -4270,6 +4312,16 @@ if(flvjs.isSupported()){{
             res = params['h264_resolution']
             if res in ('1280x720', '640x360'):
                 self.h264_resolution = res
+        # Display capture settings
+        if 'display_enabled' in params:
+            self.display_enabled = params['display_enabled'] == 'on'
+        else:
+            self.display_enabled = False
+        if 'display_fps' in params:
+            try:
+                self.display_fps = max(1, min(10, int(params['display_fps'])))
+            except ValueError:
+                pass
 
         # Update control file (for rkmpi encoder)
         if self.is_rkmpi_mode():
@@ -4346,7 +4398,9 @@ if(flvjs.isSupported()){{
             'autolanmode': self.autolanmode,
             'mjpeg_fps_target': self.mjpeg_fps_target,
             'max_camera_fps': self.max_camera_fps,
-            'session_id': self.session_id
+            'session_id': self.session_id,
+            'display_enabled': self.display_enabled,
+            'display_fps': self.display_fps
         }
         body = json.dumps(stats)
         response = (
@@ -5126,6 +5180,9 @@ def main():
     args.streaming_port = int(saved_config.get('streaming_port', getattr(args, 'streaming_port', 8080)))
     args.control_port = int(saved_config.get('control_port', getattr(args, 'control_port', 8081)))
     args.h264_resolution = saved_config.get('h264_resolution', getattr(args, 'h264_resolution', '1280x720'))
+    # Display capture settings (disabled by default)
+    args.display_enabled = saved_config.get('display_enabled', 'false') == 'true'
+    args.display_fps = max(1, min(10, int(saved_config.get('display_fps', 1))))
 
     app = StreamerApp(args)
 

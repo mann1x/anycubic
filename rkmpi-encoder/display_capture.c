@@ -51,6 +51,12 @@ static pthread_t g_display_thread;
 static DisplayCapture g_display_ctx;
 static volatile int g_display_running = 0;
 
+/* Client tracking and enable/disable */
+static volatile int g_display_client_count = 0;
+static volatile int g_display_enabled = 0;  /* Disabled by default */
+static volatile int g_display_target_fps = DISPLAY_DEFAULT_FPS;
+static pthread_mutex_t g_display_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 /* DMA buffers for RGA and VENC */
 static MB_BLK g_display_src_mb = MB_INVALID_HANDLE;  /* Source BGRX buffer */
 static MB_BLK g_display_rot_mb = MB_INVALID_HANDLE;  /* Rotated BGRX buffer */
@@ -553,6 +559,7 @@ size_t display_capture_frame(DisplayCapture *ctx, uint8_t *jpeg_buf, size_t jpeg
 
 /*
  * Display capture thread function
+ * Only encodes when: display is enabled AND clients are connected
  */
 static void *display_capture_thread(void *arg) {
     DisplayCapture *ctx = (DisplayCapture *)arg;
@@ -565,14 +572,37 @@ static void *display_capture_thread(void *arg) {
         return NULL;
     }
 
-    /* Calculate frame interval */
-    uint64_t frame_interval_us = 1000000 / ctx->fps;
     struct timespec ts;
+    int was_active = 0;
 
-    log_info("Capture thread started: %d fps (interval %lu us)\n",
-             ctx->fps, (unsigned long)frame_interval_us);
+    log_info("Capture thread started (idle until clients connect)\n");
 
     while (ctx->running && g_display_running) {
+        /* Check if we should be encoding */
+        int is_active = g_display_enabled && (g_display_client_count > 0);
+
+        if (!is_active) {
+            /* Idle mode - sleep and check periodically */
+            if (was_active) {
+                log_info("Display capture paused (no clients or disabled)\n");
+                was_active = 0;
+            }
+            usleep(100000);  /* 100ms idle poll */
+            continue;
+        }
+
+        if (!was_active) {
+            log_info("Display capture active: %d client(s), %d fps\n",
+                     g_display_client_count, g_display_target_fps);
+            was_active = 1;
+        }
+
+        /* Calculate frame interval from current FPS setting */
+        int current_fps = g_display_target_fps;
+        if (current_fps < 1) current_fps = 1;
+        if (current_fps > DISPLAY_MAX_FPS) current_fps = DISPLAY_MAX_FPS;
+        uint64_t frame_interval_us = 1000000 / current_fps;
+
         clock_gettime(CLOCK_MONOTONIC, &ts);
         uint64_t start_us = (uint64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
 
@@ -604,6 +634,11 @@ int display_capture_start(int fps) {
         return 0;
     }
 
+    /* Set initial FPS */
+    g_display_target_fps = fps;
+    if (g_display_target_fps < 1) g_display_target_fps = 1;
+    if (g_display_target_fps > DISPLAY_MAX_FPS) g_display_target_fps = DISPLAY_MAX_FPS;
+
     /* Initialize display capture context */
     if (display_capture_init(&g_display_ctx, fps) != 0) {
         return -1;
@@ -619,7 +654,7 @@ int display_capture_start(int fps) {
         return -1;
     }
 
-    log_info("Display capture started at %d fps (RGA + VENC hardware)\n", fps);
+    log_info("Display capture ready (disabled, %d fps target, waiting for clients)\n", g_display_target_fps);
     return 0;
 }
 
@@ -642,4 +677,52 @@ void display_capture_stop(void) {
 
 int display_capture_is_running(void) {
     return g_display_running;
+}
+
+/* Client tracking */
+void display_client_connect(void) {
+    pthread_mutex_lock(&g_display_mutex);
+    g_display_client_count++;
+    log_info("Display client connected (total: %d)\n", g_display_client_count);
+    pthread_mutex_unlock(&g_display_mutex);
+}
+
+void display_client_disconnect(void) {
+    pthread_mutex_lock(&g_display_mutex);
+    if (g_display_client_count > 0) {
+        g_display_client_count--;
+    }
+    log_info("Display client disconnected (total: %d)\n", g_display_client_count);
+    pthread_mutex_unlock(&g_display_mutex);
+}
+
+int display_get_client_count(void) {
+    return g_display_client_count;
+}
+
+/* Enable/disable display capture */
+void display_set_enabled(int enabled) {
+    int was_enabled = g_display_enabled;
+    g_display_enabled = enabled ? 1 : 0;
+    if (was_enabled != g_display_enabled) {
+        log_info("Display capture %s\n", g_display_enabled ? "enabled" : "disabled");
+    }
+}
+
+int display_is_enabled(void) {
+    return g_display_enabled;
+}
+
+/* FPS setting */
+void display_set_fps(int fps) {
+    if (fps < 1) fps = 1;
+    if (fps > DISPLAY_MAX_FPS) fps = DISPLAY_MAX_FPS;
+    if (fps != g_display_target_fps) {
+        g_display_target_fps = fps;
+        log_info("Display FPS set to %d\n", fps);
+    }
+}
+
+int display_get_fps(void) {
+    return g_display_target_fps;
 }

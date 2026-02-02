@@ -263,6 +263,10 @@ static void read_ctrl_file(void) {
                 g_ctrl.target_cpu = val;
                 log_info("Target CPU set to %d%%\n", val);
             }
+        } else if (sscanf(line, "display_enabled=%d", &val) == 1) {
+            display_set_enabled(val);
+        } else if (sscanf(line, "display_fps=%d", &val) == 1) {
+            display_set_fps(val);
         }
     }
     fclose(f);
@@ -285,11 +289,15 @@ static void write_ctrl_file(void) {
         fprintf(f, "skip=%d\n", g_ctrl.skip_ratio);
     }
     fprintf(f, "auto_skip=%d\n", g_ctrl.auto_skip);
+    /* Display capture settings */
+    fprintf(f, "display_enabled=%d\n", display_is_enabled());
+    fprintf(f, "display_fps=%d\n", display_get_fps());
     /* Stats for Python (server mode) */
     fprintf(f, "mjpeg_fps=%.1f\n", g_stats.mjpeg_fps);
     fprintf(f, "h264_fps=%.1f\n", g_stats.h264_fps);
     fprintf(f, "mjpeg_clients=%d\n", g_stats.mjpeg_clients);
     fprintf(f, "flv_clients=%d\n", g_stats.flv_clients);
+    fprintf(f, "display_clients=%d\n", display_get_client_count());
     fclose(f);
 }
 
@@ -1361,7 +1369,8 @@ int main(int argc, char *argv[]) {
     signal(SIGTERM, signal_handler);
     signal(SIGPIPE, SIG_IGN);
 
-    /* Write initial control file */
+    /* Read control file first (Python may have written settings) then write */
+    read_ctrl_file();
     write_ctrl_file();
 
     log_info("Combined MJPEG/H.264 Streamer v%s starting...\n", VERSION);
@@ -1960,7 +1969,8 @@ int main(int argc, char *argv[]) {
                 g_stats.mjpeg_clients = mjpeg_server_client_count();
                 g_stats.flv_clients = flv_server_client_count();
             }
-            /* Write to control file for Python */
+            /* Read before write to preserve Python-set values (display settings) */
+            read_ctrl_file();
             write_ctrl_file();
             last_stats_write = now;
         }
