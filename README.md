@@ -24,7 +24,7 @@ Hardware H.264/JPEG encoder using the RV1106 Video Encoder (VENC).
 - Hardware MJPEG encoding for snapshots
 - Display capture with hardware rotation (RGA)
 - Built-in HTTP/MQTT/RPC servers
-- Timelapse recording support
+- Timelapse recording (native Anycubic + advanced Moonraker modes)
 
 ```bash
 # Quick start
@@ -42,6 +42,8 @@ HTTP streaming server with web UI for Rinkhals custom firmware.
 - Web control interface with live preview
 - Moonraker webcam integration
 - Auto frame skipping based on CPU load
+- **Timelapse recording** - native Anycubic slicer support + advanced Moonraker mode
+- **Timelapse management** - browse, preview, download, delete recordings
 
 ```bash
 # Endpoints
@@ -50,6 +52,7 @@ HTTP streaming server with web UI for Rinkhals custom firmware.
 /flv             # H.264 in FLV container
 /display         # LCD framebuffer stream
 /control         # Web UI
+/timelapse       # Timelapse management
 ```
 
 ### [fb-status](fb-status/)
@@ -100,8 +103,8 @@ Pre-built binaries and SWU packages are available on the [Releases](https://gith
 
 | Component | Latest Release | Assets |
 |-----------|---------------|--------|
-| rkmpi-encoder | [v1.0.0](https://github.com/mann1x/anycubic/releases/tag/rkmpi-encoder/v1.0.0) | `rkmpi_enc` binary |
-| h264-streamer | [v1.0.0](https://github.com/mann1x/anycubic/releases/tag/h264-streamer/v1.0.0) | SWU packages for all models |
+| rkmpi-encoder | [v1.1.0](https://github.com/mann1x/anycubic/releases/tag/rkmpi-encoder/v1.1.0) | `rkmpi_enc` binary |
+| h264-streamer | [v1.2.0](https://github.com/mann1x/anycubic/releases/tag/h264-streamer/v1.2.0) | SWU packages for all models |
 | fb-status | [v1.0.0](https://github.com/mann1x/anycubic/releases/tag/fb-status/v1.0.0) | `fb_status` binary |
 
 ### Creating a Release

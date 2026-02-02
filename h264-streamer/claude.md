@@ -679,9 +679,29 @@ The touch panel is aligned with the native framebuffer (800×480), but the web d
 
 ## Timelapse Recording
 
-**Status:** ✅ **Fully supported** in rkmpi/rkmpi-yuyv modes. The native `rkmpi_enc` encoder includes a built-in RPC client that handles timelapse commands.
+**Status:** ✅ **Fully supported** in rkmpi/rkmpi-yuyv modes.
 
-### How It Works
+h264-streamer supports two timelapse recording modes:
+
+| Feature | Native (Anycubic Slicer) | Advanced (Moonraker) |
+|---------|--------------------------|----------------------|
+| Trigger | Enable in slicer before slicing | Enable in control panel |
+| Layer detection | Slicer G-code → RPC commands | Moonraker WebSocket API |
+| Hyperlapse mode | ❌ | ✅ |
+| USB storage | ❌ | ✅ |
+| Variable FPS | ❌ | ✅ |
+| Configuration | None needed | Full control |
+| Section | This section | [Advanced Timelapse](#advanced-timelapse-moonraker-integration) |
+
+**Note**: When Advanced Timelapse is enabled, Native timelapse commands are ignored to prevent conflicts.
+
+---
+
+### Native Anycubic Timelapse
+
+The native `rkmpi_enc` encoder includes a built-in RPC client that handles timelapse commands from the Anycubic slicer.
+
+#### How It Works
 
 1. Slicer sends print start with `timelapse.status=1`
 2. Firmware sends `openDelayCamera` RPC with gcode filepath
@@ -742,19 +762,55 @@ When enabled, this mode captures timelapse frames independently of the Anycubic 
 
 ### Configuration Settings
 
+All timelapse settings are available in the Timelapse Settings panel on the control page (`/control`).
+
+#### General Settings
+
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `timelapse_enabled` | false | Enable advanced timelapse |
-| `timelapse_mode` | layer | `layer` or `hyperlapse` |
-| `timelapse_hyperlapse_interval` | 30 | Seconds between captures (hyperlapse mode) |
-| `timelapse_storage` | internal | `internal` or `usb` |
-| `moonraker_host` | 127.0.0.1 | Moonraker server IP |
+| `timelapse_enabled` | false | Enable advanced timelapse recording |
+| `timelapse_mode` | layer | Capture mode: `layer` (on layer change) or `hyperlapse` (time-based) |
+| `timelapse_hyperlapse_interval` | 30 | Seconds between captures in hyperlapse mode (5-300) |
+
+#### Storage Settings
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `timelapse_storage` | internal | Storage location: `internal` or `usb` |
+| `timelapse_usb_path` | /mnt/udisk/timelapse | USB output directory (folder picker available) |
+
+#### Moonraker Connection
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `moonraker_host` | 127.0.0.1 | Moonraker server IP address |
 | `moonraker_port` | 7125 | Moonraker WebSocket port |
-| `timelapse_output_fps` | 30 | Video playback framerate |
-| `timelapse_variable_fps` | false | Auto-adjust FPS for target length |
-| `timelapse_target_length` | 10 | Target video length in seconds |
-| `timelapse_crf` | 23 | H.264 quality (0=best, 51=worst) |
-| `timelapse_flip_x` | false | Horizontal flip |
+
+#### Video Output Settings
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `timelapse_output_fps` | 30 | Video playback framerate (1-120 fps) |
+| `timelapse_crf` | 23 | H.264 quality factor (0=best/lossless, 51=worst) |
+| `timelapse_duplicate_last_frame` | 0 | Repeat final frame N times (creates pause at video end) |
+
+#### Variable FPS Settings
+
+When enabled, the output FPS is calculated as: `fps = max(min, min(max, frames / target_length))`
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `timelapse_variable_fps` | false | Auto-calculate FPS based on frame count |
+| `timelapse_target_length` | 10 | Target video duration in seconds |
+| `timelapse_variable_fps_min` | 5 | Minimum FPS (prevents overly slow videos) |
+| `timelapse_variable_fps_max` | 60 | Maximum FPS (prevents frame rate issues) |
+
+#### Capture Settings
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `timelapse_stream_delay` | 0.05 | Delay (seconds) after layer change before capture (allows print head to stabilize) |
+| `timelapse_flip_x` | false | Horizontal flip (mirror) |
 | `timelapse_flip_y` | false | Vertical flip |
 
 ### API Endpoints
@@ -832,7 +888,9 @@ This allows the advanced timelapse to operate independently without interference
 ### Features
 
 - **Recording List** - Shows all MP4 recordings with thumbnails
-- **Metadata Display** - Duration, file size, frame count for each recording
+- **Storage Selection** - Switch between internal and USB storage locations
+- **Auto Thumbnail Generation** - Creates thumbnails from videos using ffprobe/ffmpeg
+- **Metadata Display** - Duration, file size, frame count, creation date
 - **Video Preview** - Play videos in browser modal (HTML5 video player)
 - **Download** - Download MP4 files directly
 - **Delete** - Remove recordings with confirmation dialog
@@ -844,10 +902,10 @@ This allows the advanced timelapse to operate independently without interference
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/timelapse` | GET | Timelapse manager HTML page |
-| `/api/timelapse/list` | GET | JSON list of recordings with metadata |
-| `/api/timelapse/thumb/<name>` | GET | Serve thumbnail JPEG |
-| `/api/timelapse/video/<name>` | GET | Serve MP4 video (supports HTTP Range) |
-| `/api/timelapse/delete/<name>` | DELETE | Delete recording and thumbnail |
+| `/api/timelapse/list?storage=internal\|usb` | GET | JSON list of recordings with metadata |
+| `/api/timelapse/thumb/<name>?storage=...` | GET | Serve thumbnail JPEG (auto-generates if missing) |
+| `/api/timelapse/video/<name>?storage=...` | GET | Serve MP4 video (supports HTTP Range) |
+| `/api/timelapse/delete/<name>?storage=...` | DELETE | Delete recording and thumbnail |
 
 ### List API Response
 
@@ -882,11 +940,22 @@ This allows the advanced timelapse to operate independently without interference
 
 ### File Storage
 
-| Item | Path |
-|------|------|
-| Directory | `/useremain/app/gk/Time-lapse-Video/` |
+| Storage | Path |
+|---------|------|
+| Internal | `/useremain/app/gk/Time-lapse-Video/` |
+| USB | `/mnt/udisk/Time-lapse-Video/` |
+
+| File Type | Pattern |
+|-----------|---------|
 | Video | `{gcode_name}_{sequence}.mp4` |
 | Thumbnail | `{gcode_name}_{sequence}_{frames}.jpg` |
+
+### Thumbnail Generation
+
+When a thumbnail doesn't exist, the system auto-generates it:
+1. Uses `ffprobe` to extract video duration and frame count
+2. Uses `ffmpeg` to extract the last frame as JPEG thumbnail
+3. Saves thumbnail with frame count in filename
 
 ### Security
 

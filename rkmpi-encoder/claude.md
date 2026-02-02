@@ -328,6 +328,14 @@ For **external Klipper** setups or testing without Anycubic firmware.
 | Timelapse recording | ✅ | ❌ |
 | Works without firmware | ❌ | ✅ |
 
+### MQTT Keepalive
+
+The MQTT client sends PINGREQ packets every 45 seconds when idle to prevent broker disconnections. This is handled automatically in the MQTT client thread:
+- Tracks `last_activity` timestamp for send/receive operations
+- Sends PINGREQ (0xC0, 0x00) when no activity for 45 seconds
+- Broker responds with PINGRESP (0xD0)
+- Prevents "Connection closed by broker" errors
+
 ### Setting the Mode
 
 ```bash
@@ -424,14 +432,24 @@ This ensures short prints don't have overly long videos and long prints don't ex
 
 ### Video Assembly (ffmpeg)
 
-The `timelapse_finalize()` function assembles frames using ffmpeg:
+The `timelapse_finalize()` function assembles frames using ffmpeg with memory-optimized settings:
 
+**Primary encoder (libx264):**
 ```bash
-ffmpeg -y -framerate <fps> -i frames/%06d.jpg \
-    [-vf "hflip,vflip"] \
-    -c:v libx264 -crf <crf> -pix_fmt yuv420p \
-    output.mp4
+ffmpeg -y -framerate <fps> -i frames/frame_%04d.jpg \
+    -c:v libx264 -preset ultrafast -tune zerolatency \
+    -x264-params keyint=30:min-keyint=10:scenecut=0:bframes=0:ref=1:rc-lookahead=0:threads=1 \
+    -crf <crf> -pix_fmt yuv420p output.mp4
 ```
+
+**Fallback encoder (mpeg4):**
+If libx264 fails (e.g., OOM on low-memory systems), falls back to mpeg4:
+```bash
+ffmpeg -y -framerate <fps> -i frames/frame_%04d.jpg \
+    -c:v mpeg4 -q:v 5 -pix_fmt yuv420p output.mp4
+```
+
+**Note:** mpeg4 videos may not play in browser preview but will work when downloaded.
 
 Flip filters are applied based on configuration:
 - `flip_x=1, flip_y=0` → `-vf hflip`

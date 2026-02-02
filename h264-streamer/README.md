@@ -93,6 +93,39 @@ The server automatically transforms coordinates based on printer model orientati
 | K3, K2P, K3V2 | 480x800 | `(y, 480-x)` |
 | K3M | 480x800 | `(800-y, x)` |
 
+## Timelapse Recording
+
+h264-streamer supports two timelapse recording modes:
+
+### Native Anycubic Timelapse
+
+Works automatically with Anycubic slicer's built-in timelapse feature.
+
+- **Trigger**: Enable timelapse in Anycubic slicer before slicing
+- **Capture**: Slicer inserts layer-change commands that trigger frame capture via RPC
+- **Output**: Videos saved to `/useremain/app/gk/Time-lapse-Video/`
+- **No configuration needed** - works out of the box in go-klipper mode
+
+### Advanced Timelapse (Moonraker)
+
+Independent timelapse via Moonraker integration (see [Advanced Timelapse](#advanced-timelapse) section below).
+
+- **Trigger**: Enable in h264-streamer control panel
+- **Capture**: Layer-based or time-based (hyperlapse) via Moonraker WebSocket
+- **Output**: Internal storage or USB drive
+- **Configurable**: FPS, quality, variable FPS, flip options
+
+| Feature | Native (Anycubic) | Advanced (Moonraker) |
+|---------|-------------------|----------------------|
+| Trigger | Slicer setting | Control panel setting |
+| Layer detection | Slicer G-code | Moonraker API |
+| Hyperlapse mode | ❌ | ✅ |
+| USB storage | ❌ | ✅ |
+| Variable FPS | ❌ | ✅ |
+| Configuration | None | Full control |
+
+**Note**: When Advanced Timelapse is enabled, Native Anycubic timelapse commands are ignored to prevent duplicate recordings.
+
 ## Timelapse Management
 
 Access at `http://<printer-ip>:8081/timelapse` or via the "Time Lapse" button on the control page.
@@ -100,14 +133,20 @@ Access at `http://<printer-ip>:8081/timelapse` or via the "Time Lapse" button on
 ### Features
 
 - **Browse Recordings** - View all timelapse videos with thumbnails
-- **Preview** - Play videos directly in the browser
+- **Storage Selection** - Switch between internal and USB storage
+- **Auto Thumbnails** - Generates thumbnails from videos using ffprobe/ffmpeg
+- **Metadata Display** - Duration, file size, frame count, creation date
+- **Preview** - Play videos directly in browser (HTML5 video player)
 - **Download** - Download MP4 files to your computer
-- **Delete** - Remove recordings to free up space
-- **Sorting** - Sort by date, name, or file size
+- **Delete** - Remove recordings with confirmation dialog
+- **Sorting** - Sort by date (newest/oldest), name, or file size
 
-### Storage Location
+### Storage Locations
 
-Recordings are stored at `/useremain/app/gk/Time-lapse-Video/` on the printer.
+| Storage | Path |
+|---------|------|
+| Internal | `/useremain/app/gk/Time-lapse-Video/` |
+| USB | `/mnt/udisk/Time-lapse-Video/` |
 
 | File Type | Naming Pattern |
 |-----------|----------------|
@@ -131,19 +170,51 @@ Independent timelapse recording via Moonraker integration, inspired by [moonrake
 
 Enable in the Timelapse Settings panel on the control page:
 
+#### General Settings
+
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `timelapse_enabled` | false | Enable advanced timelapse |
-| `timelapse_mode` | layer | `layer` or `hyperlapse` |
-| `timelapse_hyperlapse_interval` | 30 | Seconds between captures (hyperlapse) |
-| `timelapse_storage` | internal | `internal` or `usb` |
-| `moonraker_host` | 127.0.0.1 | Moonraker server IP |
-| `moonraker_port` | 7125 | Moonraker server port |
-| `timelapse_output_fps` | 30 | Video playback framerate |
-| `timelapse_variable_fps` | false | Auto-adjust FPS for target length |
-| `timelapse_target_length` | 10 | Target video length (seconds) |
-| `timelapse_crf` | 23 | H.264 quality (0=best, 51=worst) |
-| `timelapse_flip_x` | false | Horizontal flip |
+| `timelapse_enabled` | false | Enable advanced timelapse recording |
+| `timelapse_mode` | layer | Capture mode: `layer` (on layer change) or `hyperlapse` (time-based) |
+| `timelapse_hyperlapse_interval` | 30 | Seconds between captures in hyperlapse mode (5-300) |
+
+#### Storage Settings
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `timelapse_storage` | internal | Storage location: `internal` or `usb` |
+| `timelapse_usb_path` | /mnt/udisk/timelapse | USB output directory (click to browse) |
+
+#### Moonraker Connection
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `moonraker_host` | 127.0.0.1 | Moonraker server IP address |
+| `moonraker_port` | 7125 | Moonraker WebSocket port |
+
+#### Video Output Settings
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `timelapse_output_fps` | 30 | Video playback framerate (1-120 fps) |
+| `timelapse_crf` | 23 | H.264 quality factor (0=best, 51=worst) |
+| `timelapse_duplicate_last_frame` | 0 | Repeat final frame N times (pause at end) |
+
+#### Variable FPS Settings
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `timelapse_variable_fps` | false | Auto-calculate FPS based on frame count |
+| `timelapse_target_length` | 10 | Target video duration in seconds |
+| `timelapse_variable_fps_min` | 5 | Minimum FPS when using variable FPS |
+| `timelapse_variable_fps_max` | 60 | Maximum FPS when using variable FPS |
+
+#### Capture Settings
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `timelapse_stream_delay` | 0.05 | Delay (seconds) after layer change before capture |
+| `timelapse_flip_x` | false | Horizontal flip (mirror) |
 | `timelapse_flip_y` | false | Vertical flip |
 
 ### API Endpoints
@@ -161,13 +232,22 @@ Enable in the Timelapse Settings panel on the control page:
 3. In layer mode: captures on each `print_stats.info.current_layer` change
 4. In hyperlapse mode: captures at configured interval
 5. On print complete: assembles frames into MP4 with thumbnail
-6. On print cancel: discards temporary frames
+6. On print cancel: saves partial timelapse (frames captured so far)
+
+### Video Encoding
+
+Videos are encoded using libx264 with memory-optimized settings for the RV1106:
+- **Codec**: H.264 (libx264) with ultrafast preset
+- **Fallback**: mpeg4 if libx264 fails (OOM)
+- **Quality**: Configurable CRF (0-51, default 23)
+- **Compatibility**: HTML5 video playback in browsers
 
 ### Notes
 
 - When advanced timelapse is enabled, Anycubic slicer timelapse commands are ignored
 - USB storage requires a mounted USB drive at `/mnt/udisk`
 - Requires rkmpi encoder mode (not gkcam)
+- Cancelled prints save partial timelapse video instead of discarding frames
 
 ## Configuration
 

@@ -9,7 +9,8 @@ Hardware H.264/JPEG encoder for RV1106-based Anycubic 3D printers.
 - **Hardware MJPEG Encoding** - For snapshots and MJPEG streaming
 - **Display Capture** - Stream the printer's LCD via RGA hardware rotation
 - **Built-in Servers** - HTTP, MQTT, and RPC servers for streaming and control
-- **Timelapse Recording** - Capture frames per layer, assemble to MP4
+- **Timelapse Recording** - Layer-by-layer or interval-based capture to MP4
+- **MQTT Keepalive** - Automatic PINGREQ to prevent broker disconnections
 
 ## Usage
 
@@ -274,6 +275,45 @@ export LD_LIBRARY_PATH=/oem/usr/lib:$LD_LIBRARY_PATH
 | `rpc_client.c` | RPC client for timelapse |
 | `timelapse.c` | Timelapse recording logic |
 | `flv_mux.c` | FLV container muxer |
+
+## Timelapse Recording
+
+The encoder includes built-in timelapse recording with frame capture and MP4 assembly.
+
+### Timelapse Modes
+
+| Mode | Trigger | Description |
+|------|---------|-------------|
+| RPC (Legacy) | Anycubic firmware | `openDelayCamera` / `startLanCapture` RPC commands |
+| Custom | h264_server.py | Moonraker integration via control file |
+
+### Control File Commands
+
+Commands sent via `/tmp/h264_ctrl`:
+
+| Command | Description |
+|---------|-------------|
+| `timelapse_init:<gcode>:<output_dir>` | Initialize timelapse |
+| `timelapse_capture` | Capture single frame |
+| `timelapse_finalize` | Assemble MP4 video |
+| `timelapse_cancel` | Save partial video (or cleanup if no frames) |
+| `timelapse_fps:<n>` | Set output FPS |
+| `timelapse_crf:<n>` | Set H.264 quality (0-51) |
+| `timelapse_flip:<x>:<y>` | Set flip options |
+| `timelapse_custom_mode:<0\|1>` | Enable/disable custom mode |
+
+### Video Encoding
+
+- **Primary**: libx264 with memory-optimized settings (ultrafast, zerolatency, no bframes)
+- **Fallback**: mpeg4 if libx264 fails (OOM on low-memory systems)
+- **Output**: `/useremain/app/gk/Time-lapse-Video/` or USB at `/mnt/udisk/Time-lapse-Video/`
+
+### Output Files
+
+| File | Pattern |
+|------|---------|
+| Video | `{gcode_name}_{sequence}.mp4` |
+| Thumbnail | `{gcode_name}_{sequence}_{frames}.jpg` |
 
 ## Documentation
 

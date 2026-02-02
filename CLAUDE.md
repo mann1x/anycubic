@@ -22,7 +22,8 @@ Native USB camera capture with RV1106 hardware H.264 encoding.
 - RKMPI VENC hardware H.264 encoding
 - Built-in HTTP, MQTT, and RPC servers
 - **Display capture** with full hardware acceleration (RGA + VENC)
-- **Timelapse recording** with automatic MP4 assembly
+- **Timelapse recording** with automatic MP4 assembly (libx264 + mpeg4 fallback)
+- **MQTT keepalive** - automatic PINGREQ to prevent broker disconnections
 - See: `rkmpi-encoder/claude.md`
 
 ### h264-streamer
@@ -32,6 +33,8 @@ HTTP streaming application for Rinkhals custom firmware.
 - Web control interface with live preview
 - Moonraker webcam integration
 - CPU-based auto frame skipping
+- **Timelapse management UI** - browse, preview, download, delete recordings
+- **Advanced timelapse** - layer/hyperlapse modes via Moonraker integration
 - See: `h264-streamer/claude.md`
 
 ### fb-status
@@ -168,7 +171,10 @@ Credentials: `/userdata/app/gk/config/device_account.json`
 ```
 /userdata/app/gk/config/api.cfg         # Model ID
 /userdata/app/gk/config/device_account.json  # MQTT credentials
-/useremain/app/gk/Time-lapse-Video/     # Timelapse output
+/useremain/app/gk/Time-lapse-Video/     # Timelapse output (internal)
+/mnt/udisk/Time-lapse-Video/            # Timelapse output (USB)
+/ac_lib/lib/third_bin/ffmpeg            # ffmpeg binary for timelapse
+/ac_lib/lib/third_bin/ffprobe           # ffprobe for metadata extraction
 /oem/usr/lib/                           # SDK libraries
 ```
 
