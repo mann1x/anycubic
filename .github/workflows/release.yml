@@ -141,7 +141,7 @@ jobs:
         run: |
           cd rkmpi-encoder
           make clean || true
-          make dynamic TOOLCHAIN_PATH=${{ github.workspace }}/toolchain
+          make dynamic TOOLCHAIN_PATH=${{ github.workspace }}/toolchain/arm-rockchip830-linux-uclibcgnueabihf
           file rkmpi_enc
           ls -la rkmpi_enc
 
@@ -200,7 +200,7 @@ jobs:
         run: |
           cd fb-status
           make clean || true
-          make TOOLCHAIN_PATH=${{ github.workspace }}/toolchain
+          make TOOLCHAIN_PATH=${{ github.workspace }}/toolchain/arm-rockchip830-linux-uclibcgnueabihf
           file fb_status
           ls -la fb_status
 
@@ -262,7 +262,7 @@ jobs:
         run: |
           cd rkmpi-encoder
           make clean || true
-          make dynamic TOOLCHAIN_PATH=${{ github.workspace }}/toolchain
+          make dynamic TOOLCHAIN_PATH=${{ github.workspace }}/toolchain/arm-rockchip830-linux-uclibcgnueabihf
           cp rkmpi_enc ../h264-streamer/29-h264-streamer/
           chmod +x ../h264-streamer/29-h264-streamer/rkmpi_enc
           ls -la ../h264-streamer/29-h264-streamer/rkmpi_enc
