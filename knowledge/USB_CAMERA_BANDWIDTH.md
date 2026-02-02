@@ -119,29 +119,52 @@ cat /sys/bus/usb/devices/X-Y/power/autosuspend_delay_ms
 | Camera | SunplusIT Integrated Camera | - |
 | USB Speed | 480 Mbps (High-Speed) | - |
 
-### CPU Usage
+### CPU Usage (MJPEG Mode)
 
-| Scenario | CPU Usage |
-|----------|-----------|
-| Idle (no clients) | 0% |
-| Active MJPEG stream | 6-8% |
-| Connection spike | ~36% (brief) |
+| Scenario | CPU Usage | Notes |
+|----------|-----------|-------|
+| Idle (no clients) | 0% | Pre-DQBUF sleep skips V4L2 entirely |
+| MJPEG client only | 4-8% | Pass-through, no TurboJPEG decode |
+| FLV client (H.264) | 35-50% | TurboJPEG decode is CPU-intensive |
+| Connection spike | <15% | Mitigated with ramp-up throttling |
+
+### CPU Usage (YUYV Mode)
+
+| Scenario | CPU Usage | Notes |
+|----------|-----------|-------|
+| Idle (no clients) | 0% | Same idle logic |
+| Active stream | 5-6% | Hardware JPEG encode, YUYV→NV12 only |
+
+## Adaptive Frame Rate Detection
+
+Cameras may advertise higher frame rates than they actually deliver (e.g., 30fps advertised but only 10fps actual due to USB bandwidth or camera limitations).
+
+The encoder detects actual camera frame rate and adjusts accordingly:
+
+```c
+/* Measure inter-frame timing over 30 frames */
+camera_interval = (camera_interval * 3 + measured_interval) / 4;  /* EMA */
+
+/* After detection, only rate-limit if camera is faster than target */
+rate_limit_needed = (camera_fps > target_fps + 2);
+```
+
+On KS1 printer with Integrated Camera:
+- Advertised: 30fps MJPEG
+- Actual: 9fps (100ms interval)
+- Rate limiting: disabled (camera already at target)
 
 ## Connection Spike Mitigation
 
-The 36% CPU spike on client connection is caused by the encoder suddenly ramping up. Mitigated with warmup throttling:
+The CPU spike on client connection is mitigated with gradual ramp-up:
 
 ```c
-#define CLIENT_WARMUP_FRAMES  10  // Skip frames during warmup
-#define CLIENT_WARMUP_SKIP    2   // Skip every 2nd frame
-
-// In streaming loop:
-if (client->frames_sent < CLIENT_WARMUP_FRAMES) {
-    if ((client->frames_sent % CLIENT_WARMUP_SKIP) != 0) {
-        client->last_frame_seq = current_seq;
-        client->frames_sent++;
-        continue;  // Skip this frame
-    }
+/* Ramp-up phases: 25% → 50% → 75% → 100% over 4 seconds */
+switch (ramp_phase) {
+    case 0: process = (frame_counter % 4) == 1; break;  /* 25% */
+    case 1: process = (frame_counter % 2) == 1; break;  /* 50% */
+    case 2: process = (frame_counter % 4) != 0; break;  /* 75% */
+    default: process = 1; break;                        /* 100% */
 }
 ```
 

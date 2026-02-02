@@ -63,6 +63,13 @@
 #include "rpc_client.h"
 #include "display_capture.h"
 
+/* Forward declarations */
+static void log_info(const char *fmt, ...);
+static void log_error(const char *fmt, ...);
+
+/* Global verbose flag (shared with other modules) */
+int g_verbose = 0;
+
 /*
  * Timing instrumentation for profiling - enable with -DENCODER_TIMING
  * Measures time spent in each stage of the encoder pipeline
@@ -184,11 +191,11 @@ typedef struct {
 static EncoderStats g_stats = {0};
 
 /*
- * MJPEG frame rate control (time-based)
+ * MJPEG frame rate control with adaptive detection
  *
- * The camera delivers frames at its native rate (e.g., 30fps).
- * We skip frames BEFORE TurboJPEG decode to reduce CPU usage.
- * Uses time-based control for accurate framerate (not integer skip ratios).
+ * Detects actual camera frame rate and only sleeps when camera is faster
+ * than target. If camera is slower (e.g., 10fps vs 30fps advertised),
+ * we process every frame without rate limiting.
  */
 typedef struct {
     int target_fps;         /* User-configured target fps (2-30) */
@@ -198,6 +205,11 @@ typedef struct {
     int frames_in;          /* Frames received since last log */
     int frames_out;         /* Frames output since last log */
     float actual_fps;       /* Measured output fps */
+    /* Adaptive rate detection */
+    RK_U64 last_dqbuf_time; /* Timestamp of last DQBUF (for measuring camera rate) */
+    RK_U64 camera_interval; /* Measured camera inter-frame interval (microseconds) */
+    int camera_fps_detected;/* 1 if we've detected the actual camera rate */
+    int rate_limit_needed;  /* 1 if camera is faster than target, need to sleep */
 } MjpegRateCtrl;
 
 static MjpegRateCtrl g_mjpeg_ctrl = {
@@ -207,12 +219,120 @@ static MjpegRateCtrl g_mjpeg_ctrl = {
     .last_log_time = 0,
     .frames_in = 0,
     .frames_out = 0,
-    .actual_fps = 0
+    .actual_fps = 0,
+    .last_dqbuf_time = 0,
+    .camera_interval = 0,
+    .camera_fps_detected = 0,
+    .rate_limit_needed = 1  /* Assume rate limiting needed until detection */
 };
+
+/*
+ * Client activity tracking for idle/ramp-up logic
+ *
+ * When no clients are connected, skip expensive TurboJPEG decode.
+ * When a client connects, gradually ramp up frame processing to prevent CPU spikes:
+ *   - Second 0-1: 25% of frames (process 1 in 4)
+ *   - Second 1-2: 50% of frames (process 1 in 2)
+ *   - Second 2-3: 75% of frames (process 3 in 4)
+ *   - Second 3+:  100% of frames (process all)
+ */
+typedef struct {
+    int prev_client_count;      /* Previous client count (to detect transitions) */
+    RK_U64 client_connect_time; /* Timestamp when client(s) connected (0 = idle) */
+    int ramp_phase;             /* Current ramp-up phase (0-3, 3 = full speed) */
+    int frame_counter;          /* Counter for skip logic within ramp phase */
+} ClientActivityState;
+
+static ClientActivityState g_client_state = {
+    .prev_client_count = 0,
+    .client_connect_time = 0,
+    .ramp_phase = 3,            /* Start at full speed (will reset on first client) */
+    .frame_counter = 0
+};
+
+/* Get current time in microseconds (local helper for client activity) */
+static inline RK_U64 client_get_time_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (RK_U64)ts.tv_sec * 1000000 + (RK_U64)ts.tv_nsec / 1000;
+}
+
+/* Check if we should process this frame based on client activity and ramp-up state
+ * Returns: 1 = process frame, 0 = skip frame
+ */
+static int client_activity_check(int mjpeg_clients, int flv_clients, int server_mode) {
+    /* In non-server mode, always process */
+    if (!server_mode) {
+        return 1;
+    }
+
+    int total_clients = mjpeg_clients + flv_clients;
+    RK_U64 now = client_get_time_us();
+
+    /* Detect client connection transition (0 -> N clients) */
+    if (total_clients > 0 && g_client_state.prev_client_count == 0) {
+        /* Client just connected - start ramp-up */
+        g_client_state.client_connect_time = now;
+        g_client_state.ramp_phase = 0;
+        g_client_state.frame_counter = 0;
+        log_info("Client connected, starting ramp-up\n");
+    }
+    /* Detect client disconnection transition (N -> 0 clients) */
+    else if (total_clients == 0 && g_client_state.prev_client_count > 0) {
+        /* All clients disconnected - go idle */
+        g_client_state.client_connect_time = 0;
+        g_client_state.ramp_phase = 0;
+        log_info("All clients disconnected, going idle\n");
+    }
+
+    g_client_state.prev_client_count = total_clients;
+
+    /* If no clients, skip processing (idle mode) */
+    if (total_clients == 0) {
+        return 0;
+    }
+
+    /* Calculate ramp-up phase based on time since connection */
+    if (g_client_state.client_connect_time > 0) {
+        RK_U64 elapsed_us = now - g_client_state.client_connect_time;
+        int elapsed_sec = (int)(elapsed_us / 1000000);
+
+        /* Update ramp phase: 0=25%, 1=50%, 2=75%, 3=100% */
+        int new_phase = (elapsed_sec >= 3) ? 3 : elapsed_sec;
+        if (new_phase != g_client_state.ramp_phase) {
+            g_client_state.ramp_phase = new_phase;
+            g_client_state.frame_counter = 0;
+            if (g_verbose) {
+                const char *pct[] = {"25%", "50%", "75%", "100%"};
+                log_info("Ramp-up phase %d: %s frame rate\n", new_phase, pct[new_phase]);
+            }
+        }
+    }
+
+    /* Apply skip logic based on ramp phase */
+    g_client_state.frame_counter++;
+    int process = 0;
+
+    switch (g_client_state.ramp_phase) {
+        case 0:  /* 25% - process 1 in 4 */
+            process = (g_client_state.frame_counter % 4) == 1;
+            break;
+        case 1:  /* 50% - process 1 in 2 */
+            process = (g_client_state.frame_counter % 2) == 1;
+            break;
+        case 2:  /* 75% - process 3 in 4 */
+            process = (g_client_state.frame_counter % 4) != 0;
+            break;
+        default: /* 100% - process all */
+            process = 1;
+            break;
+    }
+
+    return process;
+}
 
 /* Global state */
 static volatile int g_running = 1;
-int g_verbose = 0;  /* Non-static: shared with other modules for logging */
 
 /* V4L2 buffer info */
 typedef struct {
@@ -1702,6 +1822,33 @@ int main(int argc, char *argv[]) {
             last_ctrl_check = captured_count;
         }
 
+        /*
+         * MJPEG mode pre-DQBUF rate control (adaptive)
+         * Only sleep if camera delivers faster than target fps.
+         * If camera is slower (e.g., 10fps vs 30fps advertised), process every frame.
+         */
+        if (!cfg.yuyv_mode) {
+            int mjpeg_clients = cfg.server_mode ? mjpeg_server_client_count() : 0;
+            int flv_clients = cfg.server_mode ? flv_server_client_count() : 0;
+            int total_clients = mjpeg_clients + flv_clients;
+
+            /* Idle mode - no clients, sleep longer */
+            if (cfg.server_mode && !cfg.mjpeg_stdout && total_clients == 0) {
+                usleep(500000);  /* 500ms sleep when fully idle */
+                continue;
+            }
+
+            /* Only rate limit if camera is faster than target (adaptive) */
+            if (g_mjpeg_ctrl.rate_limit_needed) {
+                RK_U64 now = get_timestamp_us();
+                RK_U64 next_frame_time = g_mjpeg_ctrl.last_output_time + g_mjpeg_ctrl.target_interval;
+                if (now < next_frame_time) {
+                    RK_U64 sleep_time = next_frame_time - now;
+                    usleep(sleep_time);  /* Sleep without touching V4L2 */
+                }
+            }
+        }
+
         /* Dequeue frame from V4L2 */
         struct v4l2_buffer buf = {0};
         buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -1721,6 +1868,34 @@ int main(int argc, char *argv[]) {
         captured_count++;
         uint8_t *capture_data = v4l2_buffers[buf.index].start;
         size_t capture_len = buf.bytesused;
+
+        /*
+         * MJPEG mode: Detect actual camera frame rate (adaptive)
+         * Measure inter-frame timing to determine if camera is faster/slower than target
+         */
+        if (!cfg.yuyv_mode && !g_mjpeg_ctrl.camera_fps_detected) {
+            RK_U64 now = get_timestamp_us();
+            if (g_mjpeg_ctrl.last_dqbuf_time > 0) {
+                RK_U64 interval = now - g_mjpeg_ctrl.last_dqbuf_time;
+                /* Use exponential moving average for stability */
+                if (g_mjpeg_ctrl.camera_interval == 0) {
+                    g_mjpeg_ctrl.camera_interval = interval;
+                } else {
+                    g_mjpeg_ctrl.camera_interval = (g_mjpeg_ctrl.camera_interval * 3 + interval) / 4;
+                }
+                /* After 30 frames (1-3 seconds), finalize detection */
+                if (captured_count >= 30) {
+                    int camera_fps = 1000000 / g_mjpeg_ctrl.camera_interval;
+                    g_mjpeg_ctrl.camera_fps_detected = 1;
+                    /* Only rate limit if camera is significantly faster than target */
+                    g_mjpeg_ctrl.rate_limit_needed = (camera_fps > g_mjpeg_ctrl.target_fps + 2);
+                    log_info("Camera rate detected: %d fps (interval %llu us), target %d fps, rate limiting: %s\n",
+                             camera_fps, g_mjpeg_ctrl.camera_interval, g_mjpeg_ctrl.target_fps,
+                             g_mjpeg_ctrl.rate_limit_needed ? "enabled" : "disabled");
+                }
+            }
+            g_mjpeg_ctrl.last_dqbuf_time = now;
+        }
 
         /*
          * Rate control for both modes to reduce CPU usage
@@ -1877,28 +2052,24 @@ int main(int argc, char *argv[]) {
 #endif
         } else {
             /*
-             * MJPEG MODE: Rate control to reduce CPU usage from TurboJPEG decode
+             * MJPEG MODE: Process frame (rate control already done before DQBUF)
              */
-            int process_frame = mjpeg_rate_control(captured_count);
-            if (!process_frame) {
-                /* Skip this frame - just requeue buffer */
-                ioctl(v4l2_fd, VIDIOC_QBUF, &buf);
-                /* Small sleep to prevent busy-loop when camera fps > target fps */
-                usleep(5000);  /* 5ms */
-                continue;
-            }
+            int mjpeg_clients = cfg.server_mode ? mjpeg_server_client_count() : 0;
 
-            /* Frame passed rate control - count it for H.264 skip ratio */
+            /* Update rate control timestamp (sleep was done before DQBUF) */
+            g_mjpeg_ctrl.last_output_time = get_timestamp_us();
+            g_mjpeg_ctrl.frames_out++;
             processed_count++;
+
             /*
              * MJPEG MODE: Pass-through JPEG to stdout, TurboJPEG decode for H.264
              */
             uint8_t *jpeg_data = capture_data;
             size_t jpeg_len = capture_len;
 
-            /* Write JPEG to frame buffer for HTTP servers */
+            /* Write JPEG to frame buffer for HTTP servers (only if clients connected) */
             TIMING_START(frame_buffer);
-            if (cfg.server_mode && frame_buffers_initialized) {
+            if (cfg.server_mode && frame_buffers_initialized && mjpeg_clients > 0) {
                 frame_buffer_write(&g_jpeg_buffer, jpeg_data, jpeg_len,
                                    get_timestamp_us(), 0);
             }
@@ -1933,9 +2104,28 @@ int main(int argc, char *argv[]) {
             /*
              * Optionally encode to H.264 (based on runtime control)
              * Uses processed_count (post rate-control) for skip ratio
+             *
+             * Client-based idle logic (server mode):
+             * - Skip expensive TurboJPEG decode when no FLV clients connected
+             * - When clients connect, ramp up gradually to prevent CPU spikes
              */
-            int do_h264 = (h264_available || cfg.server_mode) && g_ctrl.h264_enabled &&
+            int do_h264 = 0;
+
+            if (cfg.server_mode) {
+                /* Server mode: only encode H.264 when FLV clients are connected */
+                int flv_clients = flv_server_client_count();
+                if (flv_clients > 0) {
+                    /* Apply ramp-up logic to prevent CPU spikes */
+                    int ramp_ok = client_activity_check(0, flv_clients, 1);
+                    do_h264 = ramp_ok && g_ctrl.h264_enabled &&
+                              ((processed_count % g_ctrl.skip_ratio) == 1 || g_ctrl.skip_ratio == 1);
+                }
+                /* else: no FLV clients, skip H.264 entirely (idle mode) */
+            } else {
+                /* Non-server mode: encode H.264 for file output */
+                do_h264 = h264_available && g_ctrl.h264_enabled &&
                           ((processed_count % g_ctrl.skip_ratio) == 1 || g_ctrl.skip_ratio == 1);
+            }
 
             if (do_h264) {
                 uint8_t *nv12_y = (uint8_t *)mb_vaddr;
