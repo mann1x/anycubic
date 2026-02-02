@@ -26,6 +26,43 @@
 MjpegServerThread g_mjpeg_server;
 FlvServerThread g_flv_server;
 
+/*
+ * Timing instrumentation - enable with -DENCODER_TIMING
+ */
+#ifdef ENCODER_TIMING
+#define HTTP_TIMING_INTERVAL 500  /* Log every N iterations */
+
+typedef struct {
+    uint64_t select_time;     /* Time in select() */
+    uint64_t fb_copy_time;    /* Frame buffer copy */
+    uint64_t net_send_time;   /* Network send */
+    uint64_t total_iter;      /* Total iteration time */
+    int count;
+} HttpTiming;
+
+static HttpTiming g_mjpeg_timing = {0};
+static HttpTiming g_flv_timing = {0};
+
+#define HTTP_TIMING_START(var) uint64_t _ht_##var = get_time_us()
+#define HTTP_TIMING_END(timing, field) (timing)->field += get_time_us() - _ht_##field
+#define HTTP_TIMING_LOG(name, t) do { \
+    if ((t)->count >= HTTP_TIMING_INTERVAL) { \
+        double n = (double)(t)->count; \
+        fprintf(stderr, "[HTTP %s] iters=%d avg(us): select=%.1f fb_copy=%.1f send=%.1f total=%.1f\n", \
+                name, (t)->count, \
+                (t)->select_time / n, \
+                (t)->fb_copy_time / n, \
+                (t)->net_send_time / n, \
+                (t)->total_iter / n); \
+        memset((t), 0, sizeof(*(t))); \
+    } \
+} while(0)
+#else
+#define HTTP_TIMING_START(var) (void)0
+#define HTTP_TIMING_END(timing, field) (void)0
+#define HTTP_TIMING_LOG(name, t) (void)0
+#endif
+
 /* Logging (use external if available) */
 extern int g_verbose;
 static void log_info(const char *fmt, ...) {
@@ -454,6 +491,9 @@ static void *mjpeg_server_thread(void *arg) {
     char header_buf[256];
 
     while (st->running && srv->running) {
+#ifdef ENCODER_TIMING
+        HTTP_TIMING_START(total_iter);
+#endif
         fd_set read_fds;
         FD_ZERO(&read_fds);
         FD_SET(srv->listen_fd, &read_fds);
@@ -469,8 +509,10 @@ static void *mjpeg_server_thread(void *arg) {
             }
         }
 
+        HTTP_TIMING_START(select_time);
         struct timeval tv = { .tv_sec = 0, .tv_usec = 50000 };  /* 50ms timeout */
         int ret = select(max_fd + 1, &read_fds, NULL, NULL, &tv);
+        HTTP_TIMING_END(&g_mjpeg_timing, select_time);
 
         if (ret > 0) {
             /* Check for new connections */
@@ -519,7 +561,9 @@ static void *mjpeg_server_thread(void *arg) {
 
                 if (buffer && buf && current_seq > client->last_frame_seq) {
                     uint64_t seq;
+                    HTTP_TIMING_START(fb_copy_time);
                     size_t jpeg_size = frame_buffer_copy(buffer, buf, buf_size, &seq, NULL);
+                    HTTP_TIMING_END(&g_mjpeg_timing, fb_copy_time);
 
                     if (jpeg_size > 0) {
                         /* Send multipart frame */
@@ -527,6 +571,7 @@ static void *mjpeg_server_thread(void *arg) {
                             "--%s\r\nContent-Type: image/jpeg\r\nContent-Length: %zu\r\n\r\n",
                             MJPEG_BOUNDARY, jpeg_size);
 
+                        HTTP_TIMING_START(net_send_time);
                         if (http_send(client->fd, header_buf, hlen) < 0 ||
                             http_send(client->fd, buf, jpeg_size) < 0 ||
                             http_send(client->fd, "\r\n", 2) < 0) {
@@ -534,10 +579,17 @@ static void *mjpeg_server_thread(void *arg) {
                         } else {
                             client->last_frame_seq = seq;
                         }
+                        HTTP_TIMING_END(&g_mjpeg_timing, net_send_time);
                     }
                 }
             }
         }
+
+#ifdef ENCODER_TIMING
+        HTTP_TIMING_END(&g_mjpeg_timing, total_iter);
+        g_mjpeg_timing.count++;
+        HTTP_TIMING_LOG("MJPEG", &g_mjpeg_timing);
+#endif
     }
 
     free(display_buf);
@@ -601,6 +653,9 @@ static void *flv_server_thread(void *arg) {
     }
 
     while (st->running && srv->running) {
+#ifdef ENCODER_TIMING
+        HTTP_TIMING_START(total_iter);
+#endif
         fd_set read_fds;
         FD_ZERO(&read_fds);
         FD_SET(srv->listen_fd, &read_fds);
@@ -616,8 +671,10 @@ static void *flv_server_thread(void *arg) {
             }
         }
 
+        HTTP_TIMING_START(select_time);
         struct timeval tv = { .tv_sec = 0, .tv_usec = 50000 };
         int ret = select(max_fd + 1, &read_fds, NULL, NULL, &tv);
+        HTTP_TIMING_END(&g_flv_timing, select_time);
 
         if (ret > 0) {
             if (FD_ISSET(srv->listen_fd, &read_fds)) {
@@ -670,8 +727,10 @@ static void *flv_server_thread(void *arg) {
                 if (current_seq > client->last_frame_seq) {
                     uint64_t seq;
                     int is_keyframe;
+                    HTTP_TIMING_START(fb_copy_time);
                     size_t h264_size = frame_buffer_copy(&g_h264_buffer, h264_buf,
                                                          FRAME_BUFFER_MAX_H264, &seq, &is_keyframe);
+                    HTTP_TIMING_END(&g_flv_timing, fb_copy_time);
 
                     if (h264_size > 0) {
                         /* Mux to FLV */
@@ -679,16 +738,24 @@ static void *flv_server_thread(void *arg) {
                                                        flv_buf, FLV_MAX_TAG_SIZE);
 
                         if (flv_size > 0) {
+                            HTTP_TIMING_START(net_send_time);
                             if (http_send(client->fd, flv_buf, flv_size) < 0) {
                                 client->state = CLIENT_STATE_CLOSING;
                             } else {
                                 client->last_frame_seq = seq;
                             }
+                            HTTP_TIMING_END(&g_flv_timing, net_send_time);
                         }
                     }
                 }
             }
         }
+
+#ifdef ENCODER_TIMING
+        HTTP_TIMING_END(&g_flv_timing, total_iter);
+        g_flv_timing.count++;
+        HTTP_TIMING_LOG("FLV", &g_flv_timing);
+#endif
     }
 
     /* Cleanup */

@@ -65,9 +65,16 @@ HDRS = frame_buffer.h \
        timelapse.h \
        display_capture.h
 
-.PHONY: all clean install static dynamic server-only
+.PHONY: all clean install static dynamic server-only timing
 
 all: dynamic
+
+# Build with timing instrumentation (for profiling)
+timing: CFLAGS += -DENCODER_TIMING -DDISPLAY_TIMING
+timing: clean $(TARGET)
+	@echo "Built $(TARGET) with timing instrumentation"
+	@echo "  Timing output will be printed to stderr every 100 frames"
+	@ls -lh $(TARGET)
 
 # Dynamic linking (smaller, ~100KB, needs libs)
 dynamic: LIBS = $(LIBS_DYNAMIC)
@@ -137,6 +144,7 @@ help:
 	@echo "Targets:"
 	@echo "  all/dynamic  Build with dynamic linking (default)"
 	@echo "  static       Build with static linking (standalone)"
+	@echo "  timing       Build with timing instrumentation (profiling)"
 	@echo "  clean        Remove build artifacts"
 	@echo "  deploy       Copy binary to printer"
 	@echo "  test         Deploy and show help on printer"

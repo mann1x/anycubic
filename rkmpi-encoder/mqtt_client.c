@@ -36,6 +36,48 @@ MQTTClient g_mqtt_client;
 /* External verbose flag */
 extern int g_verbose;
 
+/*
+ * Timing instrumentation - enable with -DENCODER_TIMING
+ */
+#ifdef ENCODER_TIMING
+#define MQTT_TIMING_INTERVAL 100
+
+typedef struct {
+    uint64_t select_time;
+    uint64_t ssl_read_time;
+    uint64_t json_parse_time;
+    uint64_t total_iter;
+    int count;
+} MqttTiming;
+
+static MqttTiming g_mqtt_timing = {0};
+
+static uint64_t mqtt_timing_get_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+}
+
+#define MQTT_TIMING_START(var) uint64_t _mt_##var = mqtt_timing_get_us()
+#define MQTT_TIMING_END(field) g_mqtt_timing.field += mqtt_timing_get_us() - _mt_##field
+#define MQTT_TIMING_LOG() do { \
+    if (g_mqtt_timing.count >= MQTT_TIMING_INTERVAL) { \
+        double n = (double)g_mqtt_timing.count; \
+        fprintf(stderr, "[MQTT] iters=%d avg(us): select=%.1f ssl=%.1f json=%.1f total=%.1f\n", \
+                g_mqtt_timing.count, \
+                g_mqtt_timing.select_time / n, \
+                g_mqtt_timing.ssl_read_time / n, \
+                g_mqtt_timing.json_parse_time / n, \
+                g_mqtt_timing.total_iter / n); \
+        memset(&g_mqtt_timing, 0, sizeof(g_mqtt_timing)); \
+    } \
+} while(0)
+#else
+#define MQTT_TIMING_START(var) (void)0
+#define MQTT_TIMING_END(field) (void)0
+#define MQTT_TIMING_LOG() (void)0
+#endif
+
 static void mqtt_log(const char *fmt, ...) {
     va_list args;
     va_start(args, fmt);
@@ -537,6 +579,8 @@ static void *mqtt_thread(void *arg) {
     uint8_t recv_buf[4096];
 
     while (client->running) {
+        MQTT_TIMING_START(total_iter);
+
         /* Connect if not connected */
         if (!client->connected) {
             if (mqtt_connect(client) != 0) {
@@ -552,25 +596,36 @@ static void *mqtt_thread(void *arg) {
         FD_ZERO(&read_fds);
         FD_SET(client->ssl_fd, &read_fds);
 
+        MQTT_TIMING_START(select_time);
         struct timeval tv = { .tv_sec = MQTT_RECV_TIMEOUT, .tv_usec = 0 };
         int sel_ret = select(client->ssl_fd + 1, &read_fds, NULL, NULL, &tv);
+        MQTT_TIMING_END(select_time);
 
         if (sel_ret <= 0) {
             /* Timeout or error - just continue (this prevents busy-wait) */
+#ifdef ENCODER_TIMING
+            MQTT_TIMING_END(total_iter);
+            g_mqtt_timing.count++;
+            MQTT_TIMING_LOG();
+#endif
             continue;
         }
 
         /* Data available - try to read */
+        MQTT_TIMING_START(ssl_read_time);
         int n = SSL_read((SSL *)client->ssl, recv_buf, sizeof(recv_buf));
+        MQTT_TIMING_END(ssl_read_time);
 
         if (n > 0) {
             /* Process all packets in buffer */
+            MQTT_TIMING_START(json_parse_time);
             size_t offset = 0;
             while (offset < (size_t)n) {
                 int consumed = mqtt_handle_packet(client, recv_buf + offset, n - offset);
                 if (consumed <= 0) break;
                 offset += consumed;
             }
+            MQTT_TIMING_END(json_parse_time);
         } else if (n <= 0) {
             int err = SSL_get_error((SSL *)client->ssl, n);
             if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
@@ -587,6 +642,12 @@ static void *mqtt_thread(void *arg) {
                 mqtt_disconnect(client);
             }
         }
+
+#ifdef ENCODER_TIMING
+        MQTT_TIMING_END(total_iter);
+        g_mqtt_timing.count++;
+        MQTT_TIMING_LOG();
+#endif
     }
 
     mqtt_disconnect(client);

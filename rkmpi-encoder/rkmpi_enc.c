@@ -64,6 +64,56 @@
 #include "display_capture.h"
 
 /*
+ * Timing instrumentation for profiling - enable with -DENCODER_TIMING
+ * Measures time spent in each stage of the encoder pipeline
+ */
+#ifdef ENCODER_TIMING
+#define TIMING_INTERVAL_FRAMES 100  /* Log timing every N frames */
+
+static inline uint64_t timing_get_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+}
+
+typedef struct {
+    uint64_t v4l2_dqbuf;      /* V4L2 dequeue time */
+    uint64_t yuyv_to_nv12;    /* YUYV→NV12 conversion */
+    uint64_t jpeg_decode;     /* TurboJPEG decode (MJPEG mode) */
+    uint64_t venc_jpeg;       /* VENC JPEG encode (YUYV mode) */
+    uint64_t venc_h264;       /* VENC H.264 encode */
+    uint64_t frame_buffer;    /* Frame buffer writes */
+    uint64_t total_frame;     /* Total frame processing time */
+    int count;                /* Number of frames measured */
+} EncoderTiming;
+
+static EncoderTiming g_timing = {0};
+
+#define TIMING_START(var) uint64_t _t_##var = timing_get_us()
+#define TIMING_END(field) g_timing.field += timing_get_us() - _t_##field
+#define TIMING_LOG() do { \
+    if (g_timing.count >= TIMING_INTERVAL_FRAMES) { \
+        double n = (double)g_timing.count; \
+        fprintf(stderr, "[TIMING] frames=%d avg(us): dqbuf=%.1f yuyv=%.1f jpeg_dec=%.1f " \
+                "venc_jpeg=%.1f venc_h264=%.1f fb=%.1f total=%.1f\n", \
+                g_timing.count, \
+                g_timing.v4l2_dqbuf / n, \
+                g_timing.yuyv_to_nv12 / n, \
+                g_timing.jpeg_decode / n, \
+                g_timing.venc_jpeg / n, \
+                g_timing.venc_h264 / n, \
+                g_timing.frame_buffer / n, \
+                g_timing.total_frame / n); \
+        memset(&g_timing, 0, sizeof(g_timing)); \
+    } \
+} while(0)
+#else
+#define TIMING_START(var) (void)0
+#define TIMING_END(field) (void)0
+#define TIMING_LOG() (void)0
+#endif /* ENCODER_TIMING */
+
+/*
  * Stack Smashing Protection stubs for uClibc without SSP support
  * The printer's librkaiq.so requires these symbols
  */
@@ -1644,6 +1694,8 @@ int main(int argc, char *argv[]) {
     }
 
     while (g_running) {
+        TIMING_START(total_frame);
+
         /* Periodically check control file */
         if (captured_count - last_ctrl_check >= CTRL_CHECK_INTERVAL) {
             read_ctrl_file();
@@ -1655,6 +1707,7 @@ int main(int argc, char *argv[]) {
         buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         buf.memory = V4L2_MEMORY_MMAP;
 
+        TIMING_START(v4l2_dqbuf);
         if (ioctl(v4l2_fd, VIDIOC_DQBUF, &buf) < 0) {
             if (errno == EAGAIN) {
                 usleep(1000);
@@ -1663,6 +1716,7 @@ int main(int argc, char *argv[]) {
             log_error("VIDIOC_DQBUF failed: %s\n", strerror(errno));
             break;
         }
+        TIMING_END(v4l2_dqbuf);
 
         captured_count++;
         uint8_t *capture_data = v4l2_buffers[buf.index].start;
@@ -1691,12 +1745,14 @@ int main(int argc, char *argv[]) {
             uint8_t *nv12_uv = nv12_y + cfg.width * cfg.height;
 
             /* Convert YUYV to NV12 (simple CPU conversion, ~5% CPU at 720p) */
+            TIMING_START(yuyv_to_nv12);
             yuyv_to_nv12(capture_data, nv12_y, nv12_uv, cfg.width, cfg.height);
 
             /* Flush cache for DMA (if cacheable) */
             if (mb_cacheable) {
                 RK_MPI_MMZ_FlushCacheEnd(mb_blk, 0, nv12_size, RK_MMZ_SYNC_WRITEONLY);
             }
+            TIMING_END(yuyv_to_nv12);
 
             /* Prepare frame structure (shared by both encoders) */
             VIDEO_FRAME_INFO_S stEncFrame;
@@ -1713,19 +1769,23 @@ int main(int argc, char *argv[]) {
              * Encode to JPEG (hardware) and output to stdout/frame buffer
              */
             if (cfg.mjpeg_stdout || cfg.server_mode) {
+                TIMING_START(venc_jpeg);
                 ret = RK_MPI_VENC_SendFrame(VENC_CHN_JPEG, &stEncFrame, 1000);
                 if (ret == RK_SUCCESS) {
                     ret = RK_MPI_VENC_GetStream(VENC_CHN_JPEG, &stJpegStream, 1000);
                     if (ret == RK_SUCCESS) {
+                        TIMING_END(venc_jpeg);
                         void *jpeg_data = RK_MPI_MB_Handle2VirAddr(stJpegStream.pstPack->pMbBlk);
                         RK_U32 jpeg_len = stJpegStream.pstPack->u32Len;
 
                         if (jpeg_data && jpeg_len > 0) {
                             /* Write to frame buffer for HTTP servers */
+                            TIMING_START(frame_buffer);
                             if (cfg.server_mode && frame_buffers_initialized) {
                                 frame_buffer_write(&g_jpeg_buffer, jpeg_data, jpeg_len,
                                                    get_timestamp_us(), 0);
                             }
+                            TIMING_END(frame_buffer);
 
                             /* Write to stdout */
                             if (cfg.mjpeg_stdout) {
@@ -1763,10 +1823,12 @@ int main(int argc, char *argv[]) {
              * No skip ratio needed since HW encoding has minimal CPU impact
              */
             if (h264_available || cfg.server_mode) {
+                TIMING_START(venc_h264);
                 ret = RK_MPI_VENC_SendFrame(VENC_CHN_H264, &stEncFrame, 1000);
                 if (ret == RK_SUCCESS) {
                     ret = RK_MPI_VENC_GetStream(VENC_CHN_H264, &stStream, 1000);
                     if (ret == RK_SUCCESS) {
+                        TIMING_END(venc_h264);
                         void *pData = RK_MPI_MB_Handle2VirAddr(stStream.pstPack->pMbBlk);
                         RK_U32 len = stStream.pstPack->u32Len;
 
@@ -1807,6 +1869,12 @@ int main(int argc, char *argv[]) {
                     }
                 }
             }
+
+#ifdef ENCODER_TIMING
+            TIMING_END(total_frame);
+            g_timing.count++;
+            TIMING_LOG();
+#endif
         } else {
             /*
              * MJPEG MODE: Rate control to reduce CPU usage from TurboJPEG decode
@@ -1829,10 +1897,12 @@ int main(int argc, char *argv[]) {
             size_t jpeg_len = capture_len;
 
             /* Write JPEG to frame buffer for HTTP servers */
+            TIMING_START(frame_buffer);
             if (cfg.server_mode && frame_buffers_initialized) {
                 frame_buffer_write(&g_jpeg_buffer, jpeg_data, jpeg_len,
                                    get_timestamp_us(), 0);
             }
+            TIMING_END(frame_buffer);
 
             /* Output MJPEG to stdout (multipart format for HTTP streaming) */
             if (cfg.mjpeg_stdout) {
@@ -1872,10 +1942,13 @@ int main(int argc, char *argv[]) {
                 uint8_t *nv12_uv = nv12_y + h264_w * h264_h;
 
                 /* Decode JPEG to NV12 using TurboJPEG (with optional scaling) */
-                if (decode_jpeg_to_nv12(jpeg_data, jpeg_len, nv12_y, nv12_uv,
+                TIMING_START(jpeg_decode);
+                int decode_ok = decode_jpeg_to_nv12(jpeg_data, jpeg_len, nv12_y, nv12_uv,
                                          cfg.width, cfg.height,
-                                         h264_w, h264_h) == 0) {
+                                         h264_w, h264_h) == 0;
+                TIMING_END(jpeg_decode);
 
+                if (decode_ok) {
                     /* Flush cache for DMA (if cacheable) */
                     if (mb_cacheable) {
                         RK_MPI_MMZ_FlushCacheEnd(mb_blk, 0, nv12_size, RK_MMZ_SYNC_WRITEONLY);
@@ -1893,11 +1966,13 @@ int main(int argc, char *argv[]) {
                     stEncFrame.stVFrame.u64PTS = get_timestamp_us();
 
                     /* Send frame to encoder */
+                    TIMING_START(venc_h264);
                     ret = RK_MPI_VENC_SendFrame(VENC_CHN_H264, &stEncFrame, 1000);
                     if (ret == RK_SUCCESS) {
                         /* Get encoded stream */
                         ret = RK_MPI_VENC_GetStream(VENC_CHN_H264, &stStream, 1000);
                         if (ret == RK_SUCCESS) {
+                            TIMING_END(venc_h264);
                             void *pData = RK_MPI_MB_Handle2VirAddr(stStream.pstPack->pMbBlk);
                             RK_U32 len = stStream.pstPack->u32Len;
 
@@ -1938,6 +2013,12 @@ int main(int argc, char *argv[]) {
                     }
                 }
             }
+
+#ifdef ENCODER_TIMING
+            TIMING_END(total_frame);
+            g_timing.count++;
+            TIMING_LOG();
+#endif
         }
 
         /* Requeue V4L2 buffer */

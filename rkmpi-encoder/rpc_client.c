@@ -24,6 +24,49 @@ RPCClient g_rpc_client;
 /* External verbose flag */
 extern int g_verbose;
 
+/*
+ * Timing instrumentation - enable with -DENCODER_TIMING
+ */
+#ifdef ENCODER_TIMING
+#include <time.h>
+#define RPC_TIMING_INTERVAL 100
+
+typedef struct {
+    uint64_t select_time;
+    uint64_t recv_time;
+    uint64_t json_parse_time;
+    uint64_t total_iter;
+    int count;
+} RpcTiming;
+
+static RpcTiming g_rpc_timing = {0};
+
+static uint64_t rpc_timing_get_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+}
+
+#define RPC_TIMING_START(var) uint64_t _rt_##var = rpc_timing_get_us()
+#define RPC_TIMING_END(field) g_rpc_timing.field += rpc_timing_get_us() - _rt_##field
+#define RPC_TIMING_LOG() do { \
+    if (g_rpc_timing.count >= RPC_TIMING_INTERVAL) { \
+        double n = (double)g_rpc_timing.count; \
+        fprintf(stderr, "[RPC] iters=%d avg(us): select=%.1f recv=%.1f json=%.1f total=%.1f\n", \
+                g_rpc_timing.count, \
+                g_rpc_timing.select_time / n, \
+                g_rpc_timing.recv_time / n, \
+                g_rpc_timing.json_parse_time / n, \
+                g_rpc_timing.total_iter / n); \
+        memset(&g_rpc_timing, 0, sizeof(g_rpc_timing)); \
+    } \
+} while(0)
+#else
+#define RPC_TIMING_START(var) (void)0
+#define RPC_TIMING_END(field) (void)0
+#define RPC_TIMING_LOG() (void)0
+#endif
+
 static void rpc_log(const char *fmt, ...) {
     va_list args;
     va_start(args, fmt);
@@ -239,6 +282,8 @@ static void *rpc_thread(void *arg) {
     const char *print_needle = "\"print_stats\"";
 
     while (client->running) {
+        RPC_TIMING_START(total_iter);
+
         /* Connect if not connected */
         if (!client->connected) {
             if (rpc_connect(client) != 0) {
@@ -252,13 +297,24 @@ static void *rpc_thread(void *arg) {
         FD_ZERO(&read_fds);
         FD_SET(client->sock_fd, &read_fds);
 
+        RPC_TIMING_START(select_time);
         struct timeval tv = { .tv_sec = 0, .tv_usec = 500000 };  /* 500ms */
         int ret = select(client->sock_fd + 1, &read_fds, NULL, NULL, &tv);
+        RPC_TIMING_END(select_time);
 
-        if (ret <= 0) continue;
+        if (ret <= 0) {
+#ifdef ENCODER_TIMING
+            RPC_TIMING_END(total_iter);
+            g_rpc_timing.count++;
+            RPC_TIMING_LOG();
+#endif
+            continue;
+        }
 
         /* Receive data */
+        RPC_TIMING_START(recv_time);
         ssize_t n = recv(client->sock_fd, recv_buf, sizeof(recv_buf) - 1, 0);
+        RPC_TIMING_END(recv_time);
 
         if (n <= 0) {
             if (n == 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) {
@@ -278,7 +334,14 @@ static void *rpc_thread(void *arg) {
                 found = strstr((char *)recv_buf, print_needle);
             }
         }
-        if (!found) continue;
+        if (!found) {
+#ifdef ENCODER_TIMING
+            RPC_TIMING_END(total_iter);
+            g_rpc_timing.count++;
+            RPC_TIMING_LOG();
+#endif
+            continue;
+        }
 
         /* Find message boundaries (ETX delimited) */
         char *msg_start = (char *)recv_buf;
@@ -297,6 +360,7 @@ static void *rpc_thread(void *arg) {
         if (!msg_end) continue;
 
         /* Extract and handle message */
+        RPC_TIMING_START(json_parse_time);
         size_t msg_len = msg_end - msg_start;
         char *msg = malloc(msg_len + 1);
         if (msg) {
@@ -305,6 +369,13 @@ static void *rpc_thread(void *arg) {
             rpc_handle_message(client, msg);
             free(msg);
         }
+        RPC_TIMING_END(json_parse_time);
+
+#ifdef ENCODER_TIMING
+        RPC_TIMING_END(total_iter);
+        g_rpc_timing.count++;
+        RPC_TIMING_LOG();
+#endif
     }
 
     rpc_disconnect(client);
