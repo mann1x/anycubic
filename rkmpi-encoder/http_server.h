@@ -44,6 +44,10 @@ typedef enum {
     REQUEST_DISPLAY_SNAPSHOT    /* /display/snapshot */
 } RequestType;
 
+/* Connection warmup to prevent CPU spikes */
+#define CLIENT_WARMUP_FRAMES  15  /* Frames with throttling during warmup */
+#define CLIENT_WARMUP_DELAY_MS 30 /* Delay per frame during warmup (ms) */
+
 /* Client connection */
 typedef struct {
     int fd;
@@ -55,6 +59,7 @@ typedef struct {
     size_t send_buf_size;
     size_t send_buf_pos;        /* Current position in send buffer */
     int header_sent;            /* Have we sent HTTP headers? */
+    int frames_sent;            /* Frames sent to this client (for warmup) */
 } HttpClient;
 
 /* HTTP server instance */

@@ -560,6 +560,12 @@ static void *mjpeg_server_thread(void *arg) {
                 }
 
                 if (buffer && buf && current_seq > client->last_frame_seq) {
+                    /* Warmup pacing: add delays during initial connection
+                     * to spread CPU load and prevent spikes that could affect printing */
+                    if (client->frames_sent < CLIENT_WARMUP_FRAMES) {
+                        usleep(CLIENT_WARMUP_DELAY_MS * 1000);
+                    }
+
                     uint64_t seq;
                     HTTP_TIMING_START(fb_copy_time);
                     size_t jpeg_size = frame_buffer_copy(buffer, buf, buf_size, &seq, NULL);
@@ -578,6 +584,7 @@ static void *mjpeg_server_thread(void *arg) {
                             client->state = CLIENT_STATE_CLOSING;
                         } else {
                             client->last_frame_seq = seq;
+                            client->frames_sent++;
                         }
                         HTTP_TIMING_END(&g_mjpeg_timing, net_send_time);
                     }
@@ -725,6 +732,12 @@ static void *flv_server_thread(void *arg) {
                 client->request == REQUEST_FLV_STREAM) {
 
                 if (current_seq > client->last_frame_seq) {
+                    /* Warmup pacing: add delays during initial connection
+                     * to spread CPU load (can't skip H.264 frames due to dependencies) */
+                    if (client->frames_sent < CLIENT_WARMUP_FRAMES) {
+                        usleep(CLIENT_WARMUP_DELAY_MS * 1000);
+                    }
+
                     uint64_t seq;
                     int is_keyframe;
                     HTTP_TIMING_START(fb_copy_time);
@@ -743,6 +756,7 @@ static void *flv_server_thread(void *arg) {
                                 client->state = CLIENT_STATE_CLOSING;
                             } else {
                                 client->last_frame_seq = seq;
+                                client->frames_sent++;
                             }
                             HTTP_TIMING_END(&g_flv_timing, net_send_time);
                         }
