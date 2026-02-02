@@ -230,6 +230,102 @@ make install-h264
 
 ---
 
+## Releases & Versioning
+
+### Version Files
+Each component has its own `VERSION` file:
+```
+rkmpi-encoder/VERSION    # e.g., "1.0.0"
+h264-streamer/VERSION    # e.g., "1.0.0"
+fb-status/VERSION        # e.g., "1.0.0"
+```
+
+### Release Tags
+| Tag Format | Example | Effect |
+|------------|---------|--------|
+| `{component}/v{version}` | `rkmpi-encoder/v1.0.1` | Release single component |
+| `release/{date}` | `release/2024-02-02` | Release all unreleased components |
+
+### Creating a Release
+
+**Single component:**
+```bash
+# 1. Update version
+echo "1.0.1" > h264-streamer/VERSION
+
+# 2. Commit and push
+git add h264-streamer/VERSION
+git commit -m "Bump h264-streamer to 1.0.1"
+git push
+
+# 3. Tag and push (triggers CI)
+git tag h264-streamer/v1.0.1
+git push origin h264-streamer/v1.0.1
+```
+
+**Release all components:**
+```bash
+# Updates VERSION files first, then:
+git tag release/2024-02-02
+git push origin release/2024-02-02
+```
+The workflow checks existing releases and only builds components with new versions.
+
+### GitHub Actions Workflow
+The `.github/workflows/release.yml` workflow:
+1. Parses the tag to determine which components to build
+2. Downloads the cross-compilation toolchain
+3. Builds binaries (rkmpi_enc, fb_status)
+4. Packages h264-streamer SWU for all 6 printer models
+5. Creates GitHub releases with assets and release notes
+
+### CI Build Requirements
+These directories are tracked in git for CI builds:
+```
+rkmpi-encoder/include/       # SDK headers (~11MB)
+rkmpi-encoder/lib-printer/   # Runtime libs for linking (~5MB)
+rkmpi-encoder/openssl-arm/   # OpenSSL headers + static libs (~6MB)
+```
+
+### SWU Package Structure
+```
+h264-streamer-{MODEL}.swu    # Password-protected zip
+└── update_swu/
+    ├── setup.tar.gz         # Compressed tarball
+    ├── setup.tar.gz.md5     # Checksum
+    └── [contents]:
+        ├── update.sh        # Installer script
+        └── app/
+            ├── app.json     # Rinkhals app metadata
+            ├── app.sh       # Start/stop script
+            ├── h264_monitor.sh
+            ├── h264_server.py
+            └── rkmpi_enc    # Encoder binary
+```
+
+### SWU Passwords by Model
+| Models | Password |
+|--------|----------|
+| K2P, K3, K3V2 | `U2FsdGVkX19deTfqpXHZnB5GeyQ/dtlbHjkUnwgCi+w=` |
+| KS1, KS1M | `U2FsdGVkX1+lG6cHmshPLI/LaQr9cZCjA8HZt6Y8qmbB7riY` |
+| K3M | `4DKXtEGStWHpPgZm8Xna9qluzAI8VJzpOsEIgd8brTLiXs8fLSu3vRx8o7fMf4h6` |
+
+### Local SWU Build
+```bash
+# Build encoder and copy to h264-streamer
+cd rkmpi-encoder
+make dynamic
+make install-h264
+
+# Build SWU for specific model
+./scripts/build-h264-swu.sh KS1 ./dist
+
+# Or use Rinkhals build system for all models
+/shared/dev/Rinkhals/build/swu-tools/h264-streamer/build-local.sh
+```
+
+---
+
 ## Related Projects
 
 - **Rinkhals** - Custom firmware for Anycubic printers: `/shared/dev/Rinkhals`
