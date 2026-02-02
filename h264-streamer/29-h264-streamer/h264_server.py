@@ -5438,6 +5438,11 @@ def main():
         args.autolanmode = saved_config['autolanmode'] == 'true'
     else:
         args.autolanmode = not args.no_autolanmode
+    # Debug logging
+    if 'logging' in saved_config:
+        args.logging = saved_config['logging'] == 'true'
+    else:
+        args.logging = getattr(args, 'logging', False)
     # Auto-skip and related settings
     if 'auto_skip' in saved_config:
         args.auto_skip = saved_config['auto_skip'] == 'true'
