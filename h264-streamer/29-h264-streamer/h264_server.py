@@ -2518,13 +2518,13 @@ class StreamerApp:
         # Initialize FLV muxer
         self.flv_muxer = FLVMuxer(self.camera_width, self.camera_height, 10)
 
+        # Write control file BEFORE starting encoder (so encoder reads correct settings)
+        self.write_ctrl_file()
+
         # Start encoder process
         if not self.start_encoder():
             print("ERROR: Failed to start encoder!", flush=True)
             return False
-
-        # Write initial control file
-        self.write_ctrl_file()
 
         return True
 
