@@ -299,11 +299,24 @@ To switch to vanilla-klipper mode, use the Rinkhals `set_app_property` command:
 set_app_property 29-h264-streamer mode vanilla-klipper
 ```
 
-Then restart the app:
+To switch back to go-klipper mode:
 
 ```bash
-/useremain/home/rinkhals/apps/29-h264-streamer/app.sh stop
-/useremain/home/rinkhals/apps/29-h264-streamer/app.sh start
+set_app_property 29-h264-streamer mode go-klipper
+```
+
+After changing mode, restart the app:
+
+```bash
+cd home/rinkhals/apps/29-h264-streamer/ && ./app.sh stop && sleep 2 && ./app.sh start
+```
+
+### Troubleshooting
+
+Enable logging in the control panel settings, then view logs with:
+
+```bash
+tail -F /tmp/rinkhals/app-h264-streamer.log -n 100
 ```
 
 ## Encoder Modes
