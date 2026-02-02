@@ -314,6 +314,28 @@ static int rga_rotate_270(void *src_bgrx, void *dst_bgrx, int width, int height)
 }
 
 /*
+ * Copy framebuffer using RGA DMA copy (much faster than CPU memcpy from uncached memory)
+ */
+static int rga_copy_framebuffer(void *src, void *dst, int width, int height) {
+    rga_buffer_t src_buf, dst_buf;
+    IM_STATUS status;
+
+    src_buf = wrapbuffer_virtualaddr(src, width, height, RK_FORMAT_BGRX_8888);
+    if (src_buf.width == 0) return -1;
+
+    dst_buf = wrapbuffer_virtualaddr(dst, width, height, RK_FORMAT_BGRX_8888);
+    if (dst_buf.width == 0) return -1;
+
+    status = imcopy(src_buf, dst_buf, 1);
+    if (status != IM_STATUS_SUCCESS) {
+        log_error("RGA copy failed: %s\n", imStrError(status));
+        return -1;
+    }
+
+    return 0;
+}
+
+/*
  * Initialize VENC for display JPEG encoding
  */
 static int init_display_venc(int width, int height, int fps, int quality) {
@@ -517,6 +539,24 @@ void display_capture_cleanup(DisplayCapture *ctx) {
     }
 }
 
+/* Timing instrumentation for profiling - enable with -DDISPLAY_TIMING */
+#ifdef DISPLAY_TIMING
+static inline uint64_t get_time_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+}
+
+static int g_timing_frame_count = 0;
+static uint64_t g_timing_memcpy = 0;
+static uint64_t g_timing_flush1 = 0;
+static uint64_t g_timing_rotate = 0;
+static uint64_t g_timing_convert = 0;
+static uint64_t g_timing_flush2 = 0;
+static uint64_t g_timing_venc = 0;
+static uint64_t g_timing_output = 0;
+#endif /* DISPLAY_TIMING */
+
 size_t display_capture_frame(DisplayCapture *ctx, uint8_t *jpeg_buf, size_t jpeg_buf_size) {
     if (!ctx->running || !ctx->fb_pixels || !g_display_src_vaddr || !g_display_rot_vaddr || !g_display_dst_vaddr) {
         return 0;
@@ -525,12 +565,27 @@ size_t display_capture_frame(DisplayCapture *ctx, uint8_t *jpeg_buf, size_t jpeg
     void *rga_src;
     int rga_width, rga_height;
 
-    /* Copy framebuffer to cached DMA buffer first (fb mmap is slow/uncached) */
-    memcpy(g_display_src_vaddr, ctx->fb_pixels, ctx->fb_size);
+#ifdef DISPLAY_TIMING
+    uint64_t t0, t1, t2, t3, t4, t5, t6, t7;
+    t0 = get_time_us();
+#endif
 
-    /* Flush source buffer cache so RGA can see it */
-    RK_MPI_MMZ_FlushCacheStart(g_display_src_mb, 0, ctx->fb_size, RK_MMZ_SYNC_WRITEONLY);
-    RK_MPI_MMZ_FlushCacheEnd(g_display_src_mb, 0, ctx->fb_size, RK_MMZ_SYNC_WRITEONLY);
+    /* Copy framebuffer to DMA buffer
+     * Try RGA DMA copy first (much faster than CPU memcpy from uncached memory)
+     * Fall back to CPU memcpy if RGA fails
+     */
+    if (rga_copy_framebuffer(ctx->fb_pixels, g_display_src_vaddr, ctx->fb_width, ctx->fb_height) != 0) {
+        /* RGA copy failed, use CPU memcpy */
+        memcpy(g_display_src_vaddr, ctx->fb_pixels, ctx->fb_size);
+        /* Flush cache after CPU write */
+        RK_MPI_MMZ_FlushCacheStart(g_display_src_mb, 0, ctx->fb_size, RK_MMZ_SYNC_WRITEONLY);
+        RK_MPI_MMZ_FlushCacheEnd(g_display_src_mb, 0, ctx->fb_size, RK_MMZ_SYNC_WRITEONLY);
+    }
+
+#ifdef DISPLAY_TIMING
+    t1 = get_time_us();
+    t2 = t1; /* No cache flush needed after RGA - it uses DMA directly */
+#endif
 
     /* Apply rotation using RGA hardware, with CPU fallback */
     if (ctx->orientation == DISPLAY_ORIENT_FLIP_180) {
@@ -579,16 +634,28 @@ size_t display_capture_frame(DisplayCapture *ctx, uint8_t *jpeg_buf, size_t jpeg
         rga_height = ctx->fb_height;
     }
 
+#ifdef DISPLAY_TIMING
+    t3 = get_time_us();
+#endif
+
     /* RGA color conversion (BGRX to NV12) */
     if (rga_convert_bgrx_to_nv12(rga_src, g_display_dst_vaddr, rga_width, rga_height) != 0) {
         log_error("RGA conversion failed\n");
         return 0;
     }
 
+#ifdef DISPLAY_TIMING
+    t4 = get_time_us();
+#endif
+
     /* Flush destination cache for VENC */
     size_t nv12_size = ctx->output_width * ctx->output_height * 3 / 2;
     RK_MPI_MMZ_FlushCacheStart(g_display_dst_mb, 0, nv12_size, RK_MMZ_SYNC_WRITEONLY);
     RK_MPI_MMZ_FlushCacheEnd(g_display_dst_mb, 0, nv12_size, RK_MMZ_SYNC_WRITEONLY);
+
+#ifdef DISPLAY_TIMING
+    t5 = get_time_us();
+#endif
 
     /* Setup frame info for VENC */
     VIDEO_FRAME_INFO_S stFrame;
@@ -624,6 +691,10 @@ size_t display_capture_frame(DisplayCapture *ctx, uint8_t *jpeg_buf, size_t jpeg
         return 0;
     }
 
+#ifdef DISPLAY_TIMING
+    t6 = get_time_us();
+#endif
+
     /* Copy JPEG data to output buffer */
     size_t jpeg_size = 0;
     if (stStream.u32PackCount > 0 && stStream.pstPack) {
@@ -640,6 +711,37 @@ size_t display_capture_frame(DisplayCapture *ctx, uint8_t *jpeg_buf, size_t jpeg
     /* Release stream */
     RK_MPI_VENC_ReleaseStream(VENC_CHN_DISPLAY, &stStream);
     free(stStream.pstPack);
+
+#ifdef DISPLAY_TIMING
+    t7 = get_time_us();
+
+    /* Accumulate timing stats */
+    g_timing_memcpy += (t1 - t0);
+    g_timing_flush1 += (t2 - t1);
+    g_timing_rotate += (t3 - t2);
+    g_timing_convert += (t4 - t3);
+    g_timing_flush2 += (t5 - t4);
+    g_timing_venc += (t6 - t5);
+    g_timing_output += (t7 - t6);
+    g_timing_frame_count++;
+
+    /* Log timing every 10 frames */
+    if (g_timing_frame_count >= 10) {
+        log_info("TIMING (avg us/frame): memcpy=%llu flush1=%llu rotate=%llu convert=%llu flush2=%llu venc=%llu output=%llu total=%llu\n",
+                 (unsigned long long)(g_timing_memcpy / 10),
+                 (unsigned long long)(g_timing_flush1 / 10),
+                 (unsigned long long)(g_timing_rotate / 10),
+                 (unsigned long long)(g_timing_convert / 10),
+                 (unsigned long long)(g_timing_flush2 / 10),
+                 (unsigned long long)(g_timing_venc / 10),
+                 (unsigned long long)(g_timing_output / 10),
+                 (unsigned long long)((g_timing_memcpy + g_timing_flush1 + g_timing_rotate +
+                                       g_timing_convert + g_timing_flush2 + g_timing_venc + g_timing_output) / 10));
+        g_timing_frame_count = 0;
+        g_timing_memcpy = g_timing_flush1 = g_timing_rotate = g_timing_convert = 0;
+        g_timing_flush2 = g_timing_venc = g_timing_output = 0;
+    }
+#endif /* DISPLAY_TIMING */
 
     return jpeg_size;
 }

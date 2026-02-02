@@ -180,7 +180,10 @@ static RequestType parse_http_request(const char *buf, size_t len, int port) {
 
     size_t path_len = path_end - path;
 
-    if (port == HTTP_MJPEG_PORT) {
+    /* Use actual MJPEG server port for routing (supports custom ports) */
+    int mjpeg_port = g_mjpeg_server.server.port > 0 ? g_mjpeg_server.server.port : HTTP_MJPEG_PORT;
+
+    if (port == mjpeg_port) {
         if (path_len >= 7 && strncmp(path, "/stream", 7) == 0) {
             return REQUEST_MJPEG_STREAM;
         }
