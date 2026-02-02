@@ -1,0 +1,366 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'rkmpi-encoder/v*'
+      - 'h264-streamer/v*'
+      - 'fb-status/v*'
+      - 'release/*'
+
+permissions:
+  contents: write
+
+env:
+  TOOLCHAIN_REPO: mann1x/rv1106-cross-compilation-toolchain
+  TOOLCHAIN_REF: main
+
+jobs:
+  # ==========================================================================
+  # Prepare: Parse tag and determine what to build
+  # ==========================================================================
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      build_rkmpi_encoder: ${{ steps.parse.outputs.build_rkmpi_encoder }}
+      build_fb_status: ${{ steps.parse.outputs.build_fb_status }}
+      build_h264_streamer: ${{ steps.parse.outputs.build_h264_streamer }}
+      rkmpi_encoder_version: ${{ steps.parse.outputs.rkmpi_encoder_version }}
+      fb_status_version: ${{ steps.parse.outputs.fb_status_version }}
+      h264_streamer_version: ${{ steps.parse.outputs.h264_streamer_version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse tag and determine builds
+        id: parse
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          echo "Tag: $TAG"
+
+          # Read version files
+          RKMPI_VERSION=$(cat rkmpi-encoder/VERSION)
+          FB_VERSION=$(cat fb-status/VERSION)
+          H264_VERSION=$(cat h264-streamer/VERSION)
+
+          echo "rkmpi_encoder_version=$RKMPI_VERSION" >> $GITHUB_OUTPUT
+          echo "fb_status_version=$FB_VERSION" >> $GITHUB_OUTPUT
+          echo "h264_streamer_version=$H264_VERSION" >> $GITHUB_OUTPUT
+
+          # Initialize build flags
+          BUILD_RKMPI=false
+          BUILD_FB=false
+          BUILD_H264=false
+
+          # Check if releases already exist (for release-all)
+          check_release_exists() {
+            local name="$1"
+            local version="$2"
+            if gh release view "${name}/v${version}" &>/dev/null; then
+              echo "true"
+            else
+              echo "false"
+            fi
+          }
+
+          if [[ "$TAG" == rkmpi-encoder/v* ]]; then
+            # Single component release
+            TAG_VERSION="${TAG#rkmpi-encoder/v}"
+            if [[ "$TAG_VERSION" != "$RKMPI_VERSION" ]]; then
+              echo "::error::Tag version ($TAG_VERSION) doesn't match VERSION file ($RKMPI_VERSION)"
+              exit 1
+            fi
+            BUILD_RKMPI=true
+
+          elif [[ "$TAG" == fb-status/v* ]]; then
+            TAG_VERSION="${TAG#fb-status/v}"
+            if [[ "$TAG_VERSION" != "$FB_VERSION" ]]; then
+              echo "::error::Tag version ($TAG_VERSION) doesn't match VERSION file ($FB_VERSION)"
+              exit 1
+            fi
+            BUILD_FB=true
+
+          elif [[ "$TAG" == h264-streamer/v* ]]; then
+            TAG_VERSION="${TAG#h264-streamer/v}"
+            if [[ "$TAG_VERSION" != "$H264_VERSION" ]]; then
+              echo "::error::Tag version ($TAG_VERSION) doesn't match VERSION file ($H264_VERSION)"
+              exit 1
+            fi
+            BUILD_H264=true
+
+          elif [[ "$TAG" == release/* ]]; then
+            # Release all components that don't have a release yet
+            echo "Release-all triggered, checking existing releases..."
+
+            if [[ $(check_release_exists "rkmpi-encoder" "$RKMPI_VERSION") == "false" ]]; then
+              echo "rkmpi-encoder v$RKMPI_VERSION not released yet"
+              BUILD_RKMPI=true
+            else
+              echo "rkmpi-encoder v$RKMPI_VERSION already released, skipping"
+            fi
+
+            if [[ $(check_release_exists "fb-status" "$FB_VERSION") == "false" ]]; then
+              echo "fb-status v$FB_VERSION not released yet"
+              BUILD_FB=true
+            else
+              echo "fb-status v$FB_VERSION already released, skipping"
+            fi
+
+            if [[ $(check_release_exists "h264-streamer" "$H264_VERSION") == "false" ]]; then
+              echo "h264-streamer v$H264_VERSION not released yet"
+              BUILD_H264=true
+            else
+              echo "h264-streamer v$H264_VERSION already released, skipping"
+            fi
+          fi
+
+          echo "build_rkmpi_encoder=$BUILD_RKMPI" >> $GITHUB_OUTPUT
+          echo "build_fb_status=$BUILD_FB" >> $GITHUB_OUTPUT
+          echo "build_h264_streamer=$BUILD_H264" >> $GITHUB_OUTPUT
+
+          echo "Build flags:"
+          echo "  rkmpi-encoder: $BUILD_RKMPI"
+          echo "  fb-status: $BUILD_FB"
+          echo "  h264-streamer: $BUILD_H264"
+
+  # ==========================================================================
+  # Build rkmpi-encoder
+  # ==========================================================================
+  build-rkmpi-encoder:
+    needs: prepare
+    if: needs.prepare.outputs.build_rkmpi_encoder == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download RV1106 toolchain
+        run: |
+          echo "Downloading toolchain from ${{ env.TOOLCHAIN_REPO }}..."
+          git clone --depth 1 https://github.com/${{ env.TOOLCHAIN_REPO }}.git toolchain
+
+      - name: Build rkmpi_enc
+        run: |
+          cd rkmpi-encoder
+
+          # Build with toolchain path override
+          make clean || true
+          make dynamic TOOLCHAIN_PATH=${{ github.workspace }}/toolchain
+
+          # Verify binary
+          file rkmpi_enc
+          ls -la rkmpi_enc
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rkmpi_enc
+          path: rkmpi-encoder/rkmpi_enc
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${{ needs.prepare.outputs.rkmpi_encoder_version }}"
+          TAG="rkmpi-encoder/v${VERSION}"
+
+          # Create tag if it doesn't exist (for release-all)
+          if ! git rev-parse "$TAG" >/dev/null 2>&1; then
+            git tag "$TAG"
+            git push origin "$TAG"
+          fi
+
+          # Create release
+          gh release create "$TAG" \
+            --title "rkmpi-encoder v${VERSION}" \
+            --notes "## rkmpi-encoder v${VERSION}
+
+Hardware H.264/JPEG encoder for RV1106-based Anycubic printers.
+
+### Changes
+See commit history for details.
+
+### Usage
+\`\`\`bash
+# Copy to printer
+scp rkmpi_enc root@<printer-ip>:/tmp/
+
+# Run with library path
+export LD_LIBRARY_PATH=/oem/usr/lib:\$LD_LIBRARY_PATH
+/tmp/rkmpi_enc -h
+\`\`\`
+" \
+            rkmpi-encoder/rkmpi_enc
+
+  # ==========================================================================
+  # Build fb-status
+  # ==========================================================================
+  build-fb-status:
+    needs: prepare
+    if: needs.prepare.outputs.build_fb_status == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download RV1106 toolchain
+        run: |
+          echo "Downloading toolchain from ${{ env.TOOLCHAIN_REPO }}..."
+          git clone --depth 1 https://github.com/${{ env.TOOLCHAIN_REPO }}.git toolchain
+
+      - name: Build fb_status
+        run: |
+          cd fb-status
+
+          # Build with toolchain path override
+          make clean || true
+          make TOOLCHAIN_PATH=${{ github.workspace }}/toolchain
+
+          # Verify binary
+          file fb_status
+          ls -la fb_status
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fb_status
+          path: fb-status/fb_status
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${{ needs.prepare.outputs.fb_status_version }}"
+          TAG="fb-status/v${VERSION}"
+
+          # Create tag if it doesn't exist (for release-all)
+          if ! git rev-parse "$TAG" >/dev/null 2>&1; then
+            git tag "$TAG"
+            git push origin "$TAG"
+          fi
+
+          # Create release
+          gh release create "$TAG" \
+            --title "fb-status v${VERSION}" \
+            --notes "## fb-status v${VERSION}
+
+Framebuffer status display utility for RV1106-based Anycubic printers.
+
+### Changes
+See commit history for details.
+
+### Usage
+\`\`\`bash
+# Copy to printer
+scp fb_status root@<printer-ip>:/tmp/
+
+# Show status message
+/tmp/fb_status show \"Hello World\"
+
+# With colors
+/tmp/fb_status show \"Error!\" -c red
+\`\`\`
+" \
+            fb-status/fb_status
+
+  # ==========================================================================
+  # Build h264-streamer (depends on rkmpi-encoder)
+  # ==========================================================================
+  build-h264-streamer:
+    needs: [prepare, build-rkmpi-encoder]
+    # Run if h264-streamer should be built, even if rkmpi-encoder was skipped (already released)
+    if: |
+      always() &&
+      needs.prepare.outputs.build_h264_streamer == 'true' &&
+      (needs.build-rkmpi-encoder.result == 'success' || needs.build-rkmpi-encoder.result == 'skipped')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download RV1106 toolchain
+        run: |
+          echo "Downloading toolchain from ${{ env.TOOLCHAIN_REPO }}..."
+          git clone --depth 1 https://github.com/${{ env.TOOLCHAIN_REPO }}.git toolchain
+
+      - name: Build rkmpi_enc for h264-streamer
+        run: |
+          cd rkmpi-encoder
+
+          # Build with toolchain path override
+          make clean || true
+          make dynamic TOOLCHAIN_PATH=${{ github.workspace }}/toolchain
+
+          # Copy to h264-streamer directory
+          cp rkmpi_enc ../h264-streamer/29-h264-streamer/
+          chmod +x ../h264-streamer/29-h264-streamer/rkmpi_enc
+
+          # Verify
+          ls -la ../h264-streamer/29-h264-streamer/rkmpi_enc
+
+      - name: Build SWU packages
+        run: |
+          # Create output directory
+          mkdir -p dist
+
+          # Models to build
+          MODELS="K2P K3 K3V2 KS1 KS1M K3M"
+
+          for MODEL in $MODELS; do
+            echo "Building h264-streamer SWU for $MODEL..."
+            WORKSPACE=${{ github.workspace }} ./scripts/build-h264-swu.sh "$MODEL" "./dist"
+            echo "Built: dist/h264-streamer-${MODEL}.swu"
+          done
+
+          ls -la dist/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: h264-streamer-swu
+          path: dist/*.swu
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${{ needs.prepare.outputs.h264_streamer_version }}"
+          RKMPI_VERSION="${{ needs.prepare.outputs.rkmpi_encoder_version }}"
+          TAG="h264-streamer/v${VERSION}"
+
+          # Create tag if it doesn't exist (for release-all)
+          if ! git rev-parse "$TAG" >/dev/null 2>&1; then
+            git tag "$TAG"
+            git push origin "$TAG"
+          fi
+
+          # Create release
+          gh release create "$TAG" \
+            --title "h264-streamer v${VERSION}" \
+            --notes "## h264-streamer v${VERSION}
+
+HTTP streaming server for Anycubic RV1106-based 3D printers.
+
+### Built with
+- rkmpi-encoder v${RKMPI_VERSION}
+
+### Supported Printers
+| File | Printer |
+|------|---------|
+| h264-streamer-K2P.swu | Kobra 2 Pro |
+| h264-streamer-K3.swu | Kobra 3 |
+| h264-streamer-K3V2.swu | Kobra 3 V2 |
+| h264-streamer-KS1.swu | Kobra S1 |
+| h264-streamer-KS1M.swu | Kobra S1 Max |
+| h264-streamer-K3M.swu | Kobra 3 Max |
+
+### Installation
+1. Rename the appropriate SWU file to \`update.swu\`
+2. Copy to \`aGVscF9zb3Nf\` folder on FAT32 USB drive
+3. Insert USB into printer
+
+### Features
+- USB camera MJPEG/H.264 streaming
+- Display capture with touch control
+- Timelapse recording
+- Web control interface
+" \
+            dist/*.swu

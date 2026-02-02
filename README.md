@@ -122,6 +122,33 @@ Protocol documentation:
 
 - [Rinkhals](https://github.com/jbatonnet/Rinkhals) - Custom firmware for Anycubic printers
 
+## Releases
+
+Each component is versioned independently:
+
+| Component | Version File | Release Tag Format |
+|-----------|--------------|-------------------|
+| rkmpi-encoder | `rkmpi-encoder/VERSION` | `rkmpi-encoder/vX.Y.Z` |
+| h264-streamer | `h264-streamer/VERSION` | `h264-streamer/vX.Y.Z` |
+| fb-status | `fb-status/VERSION` | `fb-status/vX.Y.Z` |
+
+### Creating a Release
+
+1. Update the `VERSION` file for the component(s) you want to release
+2. Commit and push
+3. Create and push a tag:
+   ```bash
+   # Single component
+   git tag rkmpi-encoder/v1.0.0
+   git push origin rkmpi-encoder/v1.0.0
+
+   # Or release all unreleased versions
+   git tag release/2024-01-15
+   git push origin release/2024-01-15
+   ```
+
+The GitHub Actions workflow will automatically build and create releases.
+
 ## License
 
 This project is provided as-is for educational and development purposes.
