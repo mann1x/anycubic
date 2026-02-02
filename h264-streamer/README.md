@@ -104,25 +104,48 @@ Settings are stored in `app.json`:
 
 ## Encoder Modes
 
-### rkmpi-yuyv (Default)
+### rkmpi (Recommended)
 
-- YUYV capture from USB camera
-- Hardware JPEG + H.264 encoding
-- Lowest CPU usage (~5-10%)
-- Max ~10 fps at 720p
+MJPEG capture from USB camera with pass-through for MJPEG streaming.
 
-### rkmpi
+| Output | Encoding | CPU Usage |
+|--------|----------|-----------|
+| MJPEG only | Pass-through (no decode) | ~7-8% |
+| MJPEG + H.264 | TurboJPEG decode + VENC | ~15-20% |
 
-- MJPEG capture from USB camera
-- Software JPEG decode, hardware H.264
-- Higher FPS possible (~30 fps)
-- Higher CPU usage (~15-20%)
+- Camera delivers MJPEG frames directly to `/stream` endpoint
+- H.264 encoding requires software JPEG decode (TurboJPEG) to NV12
+- Higher FPS possible (~30 fps depending on camera)
+- Best balance of quality and flexibility
+
+### rkmpi-yuyv
+
+YUYV capture from USB camera with full hardware encoding.
+
+- Both MJPEG and H.264 use hardware VENC encoding
+- Lower CPU usage (~5-10%)
+- **Nominal 10 fps, actual ~4 fps on KS1** (USB bandwidth limited)
+- Best for: Minimum CPU overhead when low FPS is acceptable
 
 ### gkcam
 
-- Uses native gkcam FLV stream
+Uses the native gkcam camera service (no rkmpi_enc).
+
+- Proxies gkcam's FLV stream at `:18088/flv`
+- **H.264 stream runs at ~4 fps on KS1**
+- MJPEG extracted from H.264 keyframes (~1 fps)
 - Lowest resource usage
-- Limited to ~1-2 fps MJPEG
+- Does not kill gkcam (coexists with native firmware)
+
+### Mode Comparison
+
+| Mode | MJPEG FPS | H.264 FPS | CPU Usage | Notes |
+|------|-----------|-----------|-----------|-------|
+| rkmpi | up to 30 | up to 30 | 7-20% | Higher CPU only with H.264 enabled |
+| rkmpi-yuyv | ~4 | ~4 | 5-10% | USB bandwidth limited |
+| gkcam | ~1 | ~4 | <5% | Uses native firmware stream |
+
+*FPS values measured on Kobra S1. Other models may vary.*
 
 ## Process Management
 
