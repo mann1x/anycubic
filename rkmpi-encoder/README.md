@@ -35,21 +35,63 @@ Hardware H.264/JPEG encoder for RV1106-based Anycubic 3D printers.
 
 ## Command-Line Options
 
+### Camera & Capture
+
 | Option | Description | Default |
 |--------|-------------|---------|
-| `-d` | Camera device path | auto-detect |
-| `-w` | Width | 1280 |
-| `-h` | Height | 720 |
-| `-f` | Framerate | 15 |
-| `-s` | Skip ratio (1=no skip) | 1 |
-| `-a` | Enable auto-skip based on CPU | off |
-| `-t` | Target CPU % for auto-skip | 60 |
-| `-n` | Disable H.264 (MJPEG only) | off |
-| `-v` | Verbose output | off |
-| `-S` | Server mode (built-in HTTP) | off |
-| `--yuyv` | Use YUYV capture (lower CPU) | off |
+| `-d, --device <path>` | Camera device path | auto-detect |
+| `-w, --width <n>` | Capture width | 1280 |
+| `-h, --height <n>` | Capture height | 720 |
+| `-f, --fps <n>` | Target output FPS | 15 |
+| `-y, --yuyv` | Use YUYV capture mode (lower CPU) | off |
+
+### H.264 Encoding
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `-o, --h264 <path>` | H.264 output file/pipe | none |
+| `-b, --bitrate <n>` | H.264 bitrate (kbps) | 512 |
+| `-g, --gop <n>` | H.264 GOP size | 30 |
+| `-s, --skip <n>` | Skip ratio (1=all, 2=half) | 2 |
+| `-n, --no-h264` | Start with H.264 disabled | off |
+| `--h264-resolution <WxH>` | H.264 encode resolution | camera res |
+
+### JPEG Encoding
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `-j, --jpeg-quality <n>` | JPEG quality (1-99, YUYV mode) | 85 |
+
+### CPU Management
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `-a, --auto-skip` | Auto-adjust skip based on CPU | off |
+| `-t, --target-cpu <n>` | Target max CPU % (20-90) | 60 |
+
+### Server Mode
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `-S, --server` | Enable HTTP/MQTT/RPC servers | off |
+| `-N, --no-stdout` | Disable stdout (use with -S) | off |
+| `--streaming-port <n>` | MJPEG HTTP port | 8080 |
+| `--mode <mode>` | go-klipper or vanilla-klipper | go-klipper |
+
+### Display Capture
+
+| Option | Description | Default |
+|--------|-------------|---------|
 | `--display` | Enable display capture | off |
-| `--streaming-port` | HTTP server port | 8080 |
+| `--display-fps <n>` | Display capture FPS | 5 |
+
+### General
+
+| Option | Description |
+|--------|-------------|
+| `-v, --verbose` | Verbose output to stderr |
+| `-V, --version` | Show version and exit |
+| `--help` | Show help message |
 
 ### Mode Comparison
 
