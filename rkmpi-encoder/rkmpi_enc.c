@@ -479,6 +479,9 @@ static void read_ctrl_file(void) {
         } else if (sscanf(line, "timelapse_custom_mode:%d", &val) == 1) {
             /* Enable/disable custom timelapse mode (ignores Anycubic RPC timelapse) */
             timelapse_set_custom_mode(val);
+        } else if (strncmp(line, "timelapse_temp_dir:", 19) == 0) {
+            /* Set temp directory for timelapse frames */
+            timelapse_set_temp_dir(line + 19);
         }
     }
     fclose(f);

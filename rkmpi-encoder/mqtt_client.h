@@ -25,7 +25,12 @@
 #define MQTT_PUBACK     0x40
 #define MQTT_SUBSCRIBE  0x82
 #define MQTT_SUBACK     0x90
+#define MQTT_PINGREQ    0xC0
+#define MQTT_PINGRESP   0xD0
 #define MQTT_DISCONNECT 0xE0
+
+/* Keepalive settings (must be less than CONNECT keepalive of 60s) */
+#define MQTT_KEEPALIVE_INTERVAL 45  /* Send PINGREQ if no activity for 45 seconds */
 
 /* Message ID tracking */
 #define MQTT_MAX_MSGIDS  64
@@ -47,6 +52,8 @@ typedef struct {
     char handled_msgids[MQTT_MAX_MSGIDS][40];
     int msgid_count;
     uint64_t msgid_cleanup_time;
+    /* Keepalive tracking */
+    uint64_t last_activity;         /* Last packet send/recv time (ms) */
 } MQTTClient;
 
 /* Global MQTT client instance */

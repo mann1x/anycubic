@@ -14,6 +14,9 @@
 /* Default output directory for timelapse videos */
 #define TIMELAPSE_OUTPUT_DIR    "/useremain/app/gk/Time-lapse-Video/"
 #define TIMELAPSE_TEMP_DIR      "/tmp/timelapse_frames"
+#define TIMELAPSE_FFMPEG_PATH   "/ac_lib/lib/third_bin/ffmpeg"
+#define TIMELAPSE_FFMPEG_LIBS   "/ac_lib/lib/third_lib"
+#define TIMELAPSE_FFMPEG_CMD    "LD_LIBRARY_PATH=" TIMELAPSE_FFMPEG_LIBS ":$LD_LIBRARY_PATH " TIMELAPSE_FFMPEG_PATH
 
 /* Maximum path lengths */
 #define TIMELAPSE_PATH_MAX      512
@@ -31,6 +34,7 @@ typedef struct {
     int flip_x;                     /* Horizontal flip (mirror) */
     int flip_y;                     /* Vertical flip */
     char output_dir[TIMELAPSE_PATH_MAX];  /* Custom output directory */
+    char temp_dir_base[TIMELAPSE_PATH_MAX]; /* Base directory for temp frames */
 } TimelapseConfig;
 
 /* Timelapse state */
@@ -57,6 +61,7 @@ void timelapse_set_variable_fps(int min_fps, int max_fps, int target_length);
 void timelapse_set_duplicate_last(int count);
 void timelapse_set_flip(int flip_x, int flip_y);
 void timelapse_set_output_dir(const char *dir);
+void timelapse_set_temp_dir(const char *dir);
 
 /*
  * Reset configuration to defaults.

@@ -101,6 +101,24 @@ void timelapse_set_output_dir(const char *dir) {
     }
 }
 
+void timelapse_set_temp_dir(const char *dir) {
+    if (dir && strlen(dir) > 0 && strlen(dir) < TIMELAPSE_PATH_MAX) {
+        strncpy(g_timelapse.config.temp_dir_base, dir, TIMELAPSE_PATH_MAX - 1);
+        g_timelapse.config.temp_dir_base[TIMELAPSE_PATH_MAX - 1] = '\0';
+        timelapse_log("Set temp directory base: %s\n", g_timelapse.config.temp_dir_base);
+    }
+}
+
+/*
+ * Get the effective temp directory base.
+ */
+static const char* get_temp_dir_base(void) {
+    if (g_timelapse.config.temp_dir_base[0] != '\0') {
+        return g_timelapse.config.temp_dir_base;
+    }
+    return TIMELAPSE_TEMP_DIR;
+}
+
 /*
  * Get the effective output directory.
  */
@@ -231,7 +249,7 @@ int timelapse_init(const char *gcode_name, const char *output_dir) {
 
     /* Create unique temp directory */
     snprintf(g_timelapse.temp_dir, sizeof(g_timelapse.temp_dir),
-             "%s_%d", TIMELAPSE_TEMP_DIR, getpid());
+             "%s_%d", get_temp_dir_base(), getpid());
 
     if (ensure_directory(g_timelapse.temp_dir) != 0) {
         return -1;
@@ -293,7 +311,7 @@ int timelapse_init_legacy(const char *gcode_filepath) {
 
     /* Create unique temp directory */
     snprintf(g_timelapse.temp_dir, sizeof(g_timelapse.temp_dir),
-             "%s_%d", TIMELAPSE_TEMP_DIR, getpid());
+             "%s_%d", get_temp_dir_base(), getpid());
 
     if (ensure_directory(g_timelapse.temp_dir) != 0) {
         return -1;
@@ -465,11 +483,11 @@ int timelapse_finalize(void) {
     char output_thumb[TIMELAPSE_PATH_MAX];
     char last_frame[TIMELAPSE_PATH_MAX];
 
-    snprintf(output_mp4, sizeof(output_mp4), "%s%s_%02d.mp4",
+    snprintf(output_mp4, sizeof(output_mp4), "%s/%s_%02d.mp4",
              output_dir, g_timelapse.gcode_name,
              g_timelapse.sequence_num);
 
-    snprintf(output_thumb, sizeof(output_thumb), "%s%s_%02d_%d.jpg",
+    snprintf(output_thumb, sizeof(output_thumb), "%s/%s_%02d_%d.jpg",
              output_dir, g_timelapse.gcode_name,
              g_timelapse.sequence_num, g_timelapse.frame_count);
 
@@ -480,44 +498,44 @@ int timelapse_finalize(void) {
     char vf_filter[128];
     build_video_filter(vf_filter, sizeof(vf_filter));
 
-    /* Assemble MP4 using ffmpeg */
+    /* Assemble MP4 using ffmpeg with libx264 (minimal memory settings) */
     char cmd[2048];
+    int crf = (g_timelapse.config.crf > 0) ? g_timelapse.config.crf : 23;
+
     if (vf_filter[0] != '\0') {
         snprintf(cmd, sizeof(cmd),
-                 "ffmpeg -y -framerate %d -i '%s/frame_%%04d.jpg' "
+                 TIMELAPSE_FFMPEG_CMD " -y -framerate %d -i '%s/frame_%%04d.jpg' "
                  "-vf '%s' "
-                 "-c:v libx264 -pix_fmt yuv420p -preset fast "
-                 "-crf %d '%s' >/dev/null 2>&1",
-                 output_fps, g_timelapse.temp_dir, vf_filter,
-                 g_timelapse.config.crf, output_mp4);
+                 "-c:v libx264 -preset ultrafast -tune zerolatency "
+                 "-x264-params keyint=30:min-keyint=10:scenecut=0:bframes=0:ref=1:rc-lookahead=0:threads=1 "
+                 "-crf %d -pix_fmt yuv420p '%s' >/dev/null 2>&1",
+                 output_fps, g_timelapse.temp_dir, vf_filter, crf, output_mp4);
     } else {
         snprintf(cmd, sizeof(cmd),
-                 "ffmpeg -y -framerate %d -i '%s/frame_%%04d.jpg' "
-                 "-c:v libx264 -pix_fmt yuv420p -preset fast "
-                 "-crf %d '%s' >/dev/null 2>&1",
-                 output_fps, g_timelapse.temp_dir,
-                 g_timelapse.config.crf, output_mp4);
+                 TIMELAPSE_FFMPEG_CMD " -y -framerate %d -i '%s/frame_%%04d.jpg' "
+                 "-c:v libx264 -preset ultrafast -tune zerolatency "
+                 "-x264-params keyint=30:min-keyint=10:scenecut=0:bframes=0:ref=1:rc-lookahead=0:threads=1 "
+                 "-crf %d -pix_fmt yuv420p '%s' >/dev/null 2>&1",
+                 output_fps, g_timelapse.temp_dir, crf, output_mp4);
     }
 
-    timelapse_log("Running ffmpeg (fps=%d, crf=%d)...\n", output_fps, g_timelapse.config.crf);
+    timelapse_log("Running ffmpeg (fps=%d, crf=%d)...\n", output_fps, crf);
     int ret = system(cmd);
 
+    /* Fallback to mpeg4 if libx264 fails (e.g., OOM) */
     if (ret != 0) {
-        timelapse_log("ffmpeg failed with code %d\n", ret);
-        /* Try without libx264 (use mpeg4 as fallback) */
+        timelapse_log("libx264 failed (code %d), trying mpeg4...\n", ret);
         if (vf_filter[0] != '\0') {
             snprintf(cmd, sizeof(cmd),
-                     "ffmpeg -y -framerate %d -i '%s/frame_%%04d.jpg' "
-                     "-vf '%s' "
-                     "-c:v mpeg4 -q:v 5 '%s' >/dev/null 2>&1",
+                     TIMELAPSE_FFMPEG_CMD " -y -framerate %d -i '%s/frame_%%04d.jpg' "
+                     "-vf '%s' -c:v mpeg4 -q:v 5 '%s' >/dev/null 2>&1",
                      output_fps, g_timelapse.temp_dir, vf_filter, output_mp4);
         } else {
             snprintf(cmd, sizeof(cmd),
-                     "ffmpeg -y -framerate %d -i '%s/frame_%%04d.jpg' "
+                     TIMELAPSE_FFMPEG_CMD " -y -framerate %d -i '%s/frame_%%04d.jpg' "
                      "-c:v mpeg4 -q:v 5 '%s' >/dev/null 2>&1",
                      output_fps, g_timelapse.temp_dir, output_mp4);
         }
-        timelapse_log("Retrying with mpeg4 codec...\n");
         ret = system(cmd);
     }
 

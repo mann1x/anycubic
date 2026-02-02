@@ -501,6 +501,7 @@ static int mqtt_connect(MQTTClient *client) {
 
     mqtt_log("Connected to broker\n");
     client->connected = 1;
+    client->last_activity = get_time_ms();
     return 0;
 
 error:
@@ -602,7 +603,15 @@ static void *mqtt_thread(void *arg) {
         MQTT_TIMING_END(select_time);
 
         if (sel_ret <= 0) {
-            /* Timeout or error - just continue (this prevents busy-wait) */
+            /* Timeout or error - check if we need to send keepalive */
+            uint64_t now = get_time_ms();
+            if (client->connected && (now - client->last_activity) >= (MQTT_KEEPALIVE_INTERVAL * 1000)) {
+                /* Send PINGREQ to keep connection alive */
+                uint8_t pingreq[] = { MQTT_PINGREQ, 0x00 };
+                if (mqtt_ssl_send(client, pingreq, sizeof(pingreq)) >= 0) {
+                    client->last_activity = now;
+                }
+            }
 #ifdef ENCODER_TIMING
             MQTT_TIMING_END(total_iter);
             g_mqtt_timing.count++;
@@ -617,6 +626,8 @@ static void *mqtt_thread(void *arg) {
         MQTT_TIMING_END(ssl_read_time);
 
         if (n > 0) {
+            /* Update activity timestamp on receive */
+            client->last_activity = get_time_ms();
             /* Process all packets in buffer */
             MQTT_TIMING_START(json_parse_time);
             size_t offset = 0;

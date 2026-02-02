@@ -3573,16 +3573,17 @@ class StreamerApp:
                 return
 
             method = parts[0]
-            path = parts[1].split('?')[0]
+            full_path = parts[1]  # Full path with query string
+            path = full_path.split('?')[0]  # Path without query string
 
             # Parse query params
             query = {}
-            if '?' in parts[1]:
-                qs = parts[1].split('?')[1]
+            if '?' in full_path:
+                qs = full_path.split('?')[1]
                 for param in qs.split('&'):
                     if '=' in param:
                         k, v = param.split('=', 1)
-                        query[k] = v
+                        query[k] = urllib.parse.unquote(v)
 
             # Route
             # Streaming endpoints redirect to streaming_port (rkmpi_enc or gkcam streaming server)
@@ -3635,18 +3636,36 @@ class StreamerApp:
             elif path == '/timelapse':
                 self._serve_timelapse_page(client)
             elif path == '/api/timelapse/list':
-                self._serve_timelapse_list(client)
+                storage = query.get('storage', 'internal')
+                self._serve_timelapse_list(client, storage)
             elif path.startswith('/api/timelapse/thumb/'):
-                name = urllib.parse.unquote(path[21:])  # URL-decode filename
-                self._serve_timelapse_thumb(client, name)
+                # Extract name from path
+                name = urllib.parse.unquote(path[21:])
+                storage = query.get('storage', 'internal')
+                self._serve_timelapse_thumb(client, name, storage)
             elif path.startswith('/api/timelapse/video/'):
-                name = urllib.parse.unquote(path[21:])  # URL-decode filename
-                self._serve_timelapse_video(client, name, request)
+                name = urllib.parse.unquote(path[21:])
+                storage = query.get('storage', 'internal')
+                self._serve_timelapse_video(client, name, request, storage)
             elif path.startswith('/api/timelapse/delete/') and method == 'DELETE':
-                name = urllib.parse.unquote(path[22:])  # URL-decode filename
-                self._handle_timelapse_delete(client, name)
+                name = urllib.parse.unquote(path[22:])
+                storage = query.get('storage', 'internal')
+                self._handle_timelapse_delete(client, name, storage)
             elif path == '/api/timelapse/storage':
                 self._serve_timelapse_storage(client)
+            elif path == '/api/timelapse/browse':
+                browse_path = query.get('path', '/mnt/udisk')
+                self._serve_timelapse_browse(client, browse_path)
+            elif path == '/api/timelapse/mkdir' and method == 'POST':
+                content_length = 0
+                for line in request.split('\r\n'):
+                    if line.lower().startswith('content-length:'):
+                        content_length = int(line.split(':')[1].strip())
+                body = ''
+                if content_length > 0:
+                    body_start = request.find('\r\n\r\n') + 4
+                    body = request[body_start:body_start + content_length]
+                self._handle_timelapse_mkdir(client, body)
             elif path == '/api/timelapse/moonraker':
                 self._serve_timelapse_moonraker_status(client)
             elif path == '/api/timelapse/settings' and method == 'POST':
@@ -4149,7 +4168,7 @@ class StreamerApp:
                     <button onclick="window.open(streamBase + '/snapshot', '_blank')" class="secondary" style="padding:5px 12px;font-size:12px;">Open Snapshot</button>
                     <button onclick="openFlvFullscreen()" class="secondary" style="padding:5px 12px;font-size:12px;">Open FLV</button>
                     <button onclick="window.open(streamBase + '/display', '_blank')" class="secondary" style="padding:5px 12px;font-size:12px;">Open Display</button>
-                    <button onclick="window.open('/timelapse', '_blank', 'width=900,height=700')" class="secondary" style="padding:5px 12px;font-size:12px;">Time Lapse</button>
+                    <button onclick="window.open('/timelapse', 'timelapse_' + location.hostname.replace(/\\./g, '_'), 'width=900,height=700')" class="secondary" style="padding:5px 12px;font-size:12px;">Time Lapse</button>
                 </div>
                 <div style="display:flex;gap:5px;align-items:center;">
                     <span style="color:#888;font-size:12px;margin-right:5px;">LED:</span>
@@ -4410,7 +4429,7 @@ class StreamerApp:
                     <div class="setting-row">
                         <span class="label">Storage Location:</span>
                         <div class="control">
-                            <select name="timelapse_storage" id="timelapse_storage" style="padding:8px;border-radius:4px;border:1px solid #555;background:#333;color:#fff;">
+                            <select name="timelapse_storage" id="timelapse_storage" onchange="updateStorageSettings()" style="padding:8px;border-radius:4px;border:1px solid #555;background:#333;color:#fff;">
                                 <option value="internal" {'selected' if self.timelapse_storage == 'internal' else ''}>Internal Flash</option>
                                 <option value="usb" {'selected' if self.timelapse_storage == 'usb' else ''}>USB Drive</option>
                             </select>
@@ -4422,6 +4441,15 @@ class StreamerApp:
                         <span class="label">USB Status:</span>
                         <div class="control">
                             <span id="usb_status" style="color:#888;">Checking...</span>
+                        </div>
+                    </div>
+                </div>
+                <div class="setting timelapse-setting usb-path-setting" style="{'display:none' if not self.timelapse_enabled or self.timelapse_storage != 'usb' else ''}">
+                    <div class="setting-row">
+                        <span class="label">USB Path:</span>
+                        <div class="control" style="display:flex;gap:5px;">
+                            <input type="text" name="timelapse_usb_path" id="timelapse_usb_path" value="{self.timelapse_usb_path}" readonly style="flex:1;min-width:150px;padding:8px;border-radius:4px;border:1px solid #555;background:#222;color:#aaa;cursor:pointer;" onclick="openFolderPicker()" title="Click to browse">
+                            <button type="button" onclick="openFolderPicker()" style="padding:8px 12px;cursor:pointer;" title="Browse folders">&#128193;</button>
                         </div>
                     </div>
                 </div>
@@ -5074,6 +5102,124 @@ if(flvjs.isSupported()){{
                 }});
         }}
 
+        function updateStorageSettings() {{
+            const storage = document.getElementById('timelapse_storage').value;
+            document.querySelectorAll('.usb-path-setting').forEach(el => {{
+                el.style.display = storage === 'usb' ? '' : 'none';
+            }});
+        }}
+
+        // Folder picker for USB path
+        let folderPickerModal = null;
+        let currentPickerPath = '/mnt/udisk';
+
+        function openFolderPicker() {{
+            if (!folderPickerModal) {{
+                folderPickerModal = document.createElement('div');
+                folderPickerModal.id = 'folder-picker-modal';
+                folderPickerModal.innerHTML = `
+                    <div style="position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.7);z-index:1000;display:flex;align-items:center;justify-content:center;">
+                        <div style="background:#222;border-radius:8px;padding:20px;width:400px;max-width:90%;max-height:80vh;display:flex;flex-direction:column;">
+                            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:15px;">
+                                <h3 style="margin:0;">Select Folder</h3>
+                                <button onclick="closeFolderPicker()" style="background:none;border:none;color:#fff;font-size:20px;cursor:pointer;">&times;</button>
+                            </div>
+                            <div id="picker-path" style="font-family:monospace;background:#333;padding:8px;border-radius:4px;margin-bottom:10px;word-break:break-all;"></div>
+                            <div id="picker-list" style="flex:1;overflow-y:auto;border:1px solid #444;border-radius:4px;min-height:200px;max-height:300px;"></div>
+                            <div style="display:flex;gap:10px;margin-top:15px;">
+                                <button onclick="createNewFolder()" class="secondary" style="flex:1;">New Folder</button>
+                                <button onclick="selectCurrentFolder()" style="flex:1;">Select This Folder</button>
+                            </div>
+                        </div>
+                    </div>
+                `;
+                document.body.appendChild(folderPickerModal);
+            }}
+            folderPickerModal.style.display = 'block';
+            currentPickerPath = '/mnt/udisk';
+            loadFolderContents(currentPickerPath);
+        }}
+
+        function closeFolderPicker() {{
+            if (folderPickerModal) {{
+                folderPickerModal.style.display = 'none';
+            }}
+        }}
+
+        function loadFolderContents(path) {{
+            currentPickerPath = path;
+            document.getElementById('picker-path').textContent = path;
+            document.getElementById('picker-list').innerHTML = '<div style="padding:20px;text-align:center;color:#888;">Loading...</div>';
+
+            fetch('/api/timelapse/browse?path=' + encodeURIComponent(path))
+                .then(r => r.json())
+                .then(data => {{
+                    if (data.error) {{
+                        document.getElementById('picker-list').innerHTML = '<div style="padding:20px;text-align:center;color:#f44;">Error: ' + data.error + '</div>';
+                        return;
+                    }}
+                    const listEl = document.getElementById('picker-list');
+                    listEl.innerHTML = '';
+
+                    // Parent directory link
+                    if (path !== '/mnt/udisk') {{
+                        const parent = path.substring(0, path.lastIndexOf('/')) || '/mnt/udisk';
+                        const parentDiv = document.createElement('div');
+                        parentDiv.style.cssText = 'padding:10px;cursor:pointer;border-bottom:1px solid #333;display:flex;align-items:center;gap:10px;';
+                        parentDiv.innerHTML = '<span>&#128194;</span> <span>..</span>';
+                        parentDiv.onmouseover = function() {{ this.style.background='#333'; }};
+                        parentDiv.onmouseout = function() {{ this.style.background=''; }};
+                        parentDiv.onclick = function() {{ loadFolderContents(parent); }};
+                        listEl.appendChild(parentDiv);
+                    }}
+
+                    // Folder entries
+                    if (data.folders && data.folders.length > 0) {{
+                        data.folders.forEach(function(folder) {{
+                            const fullPath = path + '/' + folder;
+                            const div = document.createElement('div');
+                            div.style.cssText = 'padding:10px;cursor:pointer;border-bottom:1px solid #333;display:flex;align-items:center;gap:10px;';
+                            div.innerHTML = '<span>&#128193;</span> <span>' + folder + '</span>';
+                            div.onmouseover = function() {{ this.style.background='#333'; }};
+                            div.onmouseout = function() {{ this.style.background=''; }};
+                            div.onclick = function() {{ loadFolderContents(fullPath); }};
+                            listEl.appendChild(div);
+                        }});
+                    }}
+
+                    if (listEl.children.length === 0) {{
+                        listEl.innerHTML = '<div style="padding:20px;text-align:center;color:#888;">Empty folder</div>';
+                    }}
+                }})
+                .catch(err => {{
+                    document.getElementById('picker-list').innerHTML = '<div style="padding:20px;text-align:center;color:#f44;">Failed to load</div>';
+                }});
+        }}
+
+        function selectCurrentFolder() {{
+            document.getElementById('timelapse_usb_path').value = currentPickerPath;
+            closeFolderPicker();
+        }}
+
+        function createNewFolder() {{
+            const name = prompt('Enter new folder name:');
+            if (!name) return;
+            fetch('/api/timelapse/mkdir', {{
+                method: 'POST',
+                headers: {{'Content-Type': 'application/json'}},
+                body: JSON.stringify({{path: currentPickerPath + '/' + name}})
+            }})
+            .then(r => r.json())
+            .then(data => {{
+                if (data.success) {{
+                    loadFolderContents(currentPickerPath);
+                }} else {{
+                    alert('Failed to create folder: ' + (data.error || 'Unknown error'));
+                }}
+            }})
+            .catch(() => alert('Failed to create folder'));
+        }}
+
         // Update stats every second
         function updateStats() {{
             fetch('/api/stats')
@@ -5213,6 +5359,7 @@ if(flvjs.isSupported()){{
                 data.append('timelapse_mode', formData.get('timelapse_mode') || 'layer');
                 data.append('timelapse_hyperlapse_interval', formData.get('timelapse_hyperlapse_interval') || '30');
                 data.append('timelapse_storage', formData.get('timelapse_storage') || 'internal');
+                data.append('timelapse_usb_path', formData.get('timelapse_usb_path') || '/mnt/udisk/timelapse');
                 data.append('moonraker_host', formData.get('moonraker_host') || '127.0.0.1');
                 data.append('moonraker_port', formData.get('moonraker_port') || '7125');
                 data.append('timelapse_output_fps', formData.get('timelapse_output_fps') || '30');
@@ -5544,15 +5691,111 @@ if(flvjs.isSupported()){{
         name = name.replace('\x00', '').replace('..', '')
         return name
 
-    def _get_timelapse_recordings(self):
+    def _get_query_param(self, path: str, param: str, default: str = '') -> str:
+        """Extract a query parameter from URL path"""
+        if '?' not in path:
+            return default
+        query = path.split('?', 1)[1]
+        for part in query.split('&'):
+            if '=' in part:
+                key, value = part.split('=', 1)
+                if key == param:
+                    return urllib.parse.unquote(value)
+        return default
+
+    def _get_timelapse_dir(self, storage: str) -> str:
+        """Get timelapse directory for given storage type"""
+        if storage == 'usb' and os.path.ismount('/mnt/udisk'):
+            return self.timelapse_usb_path
+        return TIMELAPSE_DIR
+
+    def _generate_timelapse_thumbnail(self, mp4_path: str, timelapse_dir: str, base_name: str):
+        """
+        Generate thumbnail for a timelapse video using ffprobe/ffmpeg.
+        Returns (thumbnail_filename, frame_count, duration) or (None, 0, 0) on error.
+        """
+        FFPROBE = "/ac_lib/lib/third_bin/ffprobe"
+        FFMPEG = "/ac_lib/lib/third_bin/ffmpeg"
+        FFMPEG_LIBS = "/ac_lib/lib/third_lib"
+
+        # Check if ffprobe exists
+        if not os.path.exists(FFPROBE):
+            return None, 0, 0
+
+        try:
+            # Get video info using ffprobe
+            env = os.environ.copy()
+            env['LD_LIBRARY_PATH'] = FFMPEG_LIBS + ':' + env.get('LD_LIBRARY_PATH', '')
+
+            result = subprocess.run(
+                [FFPROBE, '-v', 'error', '-select_streams', 'v:0',
+                 '-show_entries', 'stream=nb_frames,duration',
+                 '-of', 'csv=p=0', mp4_path],
+                capture_output=True, text=True, timeout=30, env=env
+            )
+
+            if result.returncode != 0:
+                return None, 0, 0
+
+            # Parse output: "frames,duration" or just "frames" or "duration"
+            parts = result.stdout.strip().split(',')
+            frames = 0
+            duration = 0.0
+
+            for part in parts:
+                part = part.strip()
+                if not part or part == 'N/A':
+                    continue
+                try:
+                    if '.' in part:
+                        duration = float(part)
+                    else:
+                        frames = int(part)
+                except ValueError:
+                    continue
+
+            # If we got duration but not frames, estimate frames from duration
+            if frames == 0 and duration > 0:
+                frames = int(duration * TIMELAPSE_FPS)
+            # If we got frames but not duration, calculate duration
+            elif duration == 0 and frames > 0:
+                duration = frames / TIMELAPSE_FPS
+
+            if frames == 0:
+                return None, 0, 0
+
+            # Generate thumbnail from last frame
+            thumbnail_name = f"{base_name}_{frames}.jpg"
+            thumbnail_path = os.path.join(timelapse_dir, thumbnail_name)
+
+            # Extract last frame as thumbnail (seek to near end, get first frame from there)
+            seek_time = max(0, duration - 0.5) if duration > 0 else 0
+
+            result = subprocess.run(
+                [FFMPEG, '-y', '-ss', str(seek_time), '-i', mp4_path,
+                 '-vframes', '1', '-q:v', '2', thumbnail_path],
+                capture_output=True, timeout=30, env=env
+            )
+
+            if result.returncode == 0 and os.path.exists(thumbnail_path):
+                return thumbnail_name, frames, round(duration, 1)
+            else:
+                return None, frames, round(duration, 1)
+
+        except (subprocess.TimeoutExpired, OSError, Exception) as e:
+            print(f"Thumbnail generation failed for {mp4_path}: {e}", flush=True)
+            return None, 0, 0
+
+    def _get_timelapse_recordings(self, storage: str = 'internal'):
         """Scan timelapse directory and return list of recordings with metadata"""
         recordings = []
+        timelapse_dir = self._get_timelapse_dir(storage)
 
-        if not os.path.isdir(TIMELAPSE_DIR):
+        if not os.path.isdir(timelapse_dir):
             return recordings
 
         try:
-            files = os.listdir(TIMELAPSE_DIR)
+            files = os.listdir(timelapse_dir)
         except OSError:
             return recordings
 
@@ -5560,7 +5803,7 @@ if(flvjs.isSupported()){{
         mp4_files = [f for f in files if f.lower().endswith('.mp4')]
 
         for mp4 in mp4_files:
-            mp4_path = os.path.join(TIMELAPSE_DIR, mp4)
+            mp4_path = os.path.join(timelapse_dir, mp4)
             try:
                 stat_info = os.stat(mp4_path)
                 size = stat_info.st_size
@@ -5574,6 +5817,7 @@ if(flvjs.isSupported()){{
             # Find matching thumbnail (pattern: {base_name}_{frame_count}.jpg)
             thumbnail = None
             frames = 0
+            duration = 0
             for f in files:
                 if f.startswith(base_name + '_') and f.lower().endswith('.jpg'):
                     # Extract frame count from filename
@@ -5581,12 +5825,16 @@ if(flvjs.isSupported()){{
                         frame_part = f[len(base_name)+1:-4]  # e.g., "126" from "name_126.jpg"
                         frames = int(frame_part)
                         thumbnail = f
+                        duration = frames / TIMELAPSE_FPS
                         break
                     except ValueError:
                         continue
 
-            # Calculate duration (frames / FPS)
-            duration = frames / TIMELAPSE_FPS if frames > 0 else 0
+            # If no thumbnail found, generate one using ffprobe/ffmpeg
+            if thumbnail is None:
+                thumbnail, frames, duration = self._generate_timelapse_thumbnail(
+                    mp4_path, timelapse_dir, base_name
+                )
 
             recordings.append({
                 'name': base_name,
@@ -5654,6 +5902,10 @@ if(flvjs.isSupported()){{
         <div class="header">
             <h1>Time Lapse Recordings</h1>
             <div class="controls">
+                <select id="storage-select" onchange="changeStorage()">
+                    <option value="internal">Internal Storage</option>
+                    <option value="usb">USB Drive</option>
+                </select>
                 <select id="sort-select" onchange="sortRecordings()">
                     <option value="date-desc">Newest first</option>
                     <option value="date-asc">Oldest first</option>
@@ -5680,6 +5932,43 @@ if(flvjs.isSupported()){{
 
     <script>
         let recordings = [];
+        let currentStorage = 'internal';
+        let usbMounted = false;
+
+        // Initialize with server settings
+        function initPage() {
+            // Check USB status and set default storage
+            fetch('/api/timelapse/storage')
+                .then(r => r.json())
+                .then(data => {
+                    usbMounted = data.usb_mounted;
+                    const usbConfigured = data.current === 'usb';
+                    currentStorage = data.current || 'internal';
+
+                    const storageSelect = document.getElementById('storage-select');
+
+                    // Only show storage selector if USB is configured AND mounted
+                    if (usbConfigured && usbMounted) {
+                        storageSelect.style.display = '';
+                        storageSelect.value = currentStorage;
+                    } else {
+                        // Hide selector, always use internal
+                        storageSelect.style.display = 'none';
+                        currentStorage = 'internal';
+                    }
+                    loadRecordings();
+                })
+                .catch(() => loadRecordings());
+        }
+
+        function changeStorage() {
+            currentStorage = document.getElementById('storage-select').value;
+            loadRecordings();
+        }
+
+        function getStorageParam() {
+            return currentStorage === 'usb' ? '?storage=usb' : '';
+        }
 
         function formatSize(bytes) {
             if (bytes < 1024) return bytes + ' B';
@@ -5693,13 +5982,33 @@ if(flvjs.isSupported()){{
             return mins + ':' + secs.toString().padStart(2, '0');
         }
 
+        function formatDate(timestamp) {
+            const d = new Date(timestamp * 1000);
+            const year = d.getFullYear();
+            const month = (d.getMonth() + 1).toString().padStart(2, '0');
+            const day = d.getDate().toString().padStart(2, '0');
+            const hour = d.getHours().toString().padStart(2, '0');
+            const min = d.getMinutes().toString().padStart(2, '0');
+            return year + '-' + month + '-' + day + ' ' + hour + ':' + min;
+        }
+
         function loadRecordings() {
-            fetch('/api/timelapse/list')
+            const storageLabel = currentStorage === 'usb' ? 'USB' : 'Internal';
+            document.getElementById('summary').textContent = 'Loading ' + storageLabel + '...';
+            fetch('/api/timelapse/list' + getStorageParam())
                 .then(r => r.json())
                 .then(data => {
+                    // Check for storage error (e.g., USB not mounted)
+                    if (data.error) {
+                        recordings = [];
+                        document.getElementById('summary').textContent = storageLabel + ': Error';
+                        document.getElementById('recordings-list').innerHTML =
+                            '<div class="empty"><div class="empty-icon">&#9888;</div>' + escapeHtml(data.error) + '</div>';
+                        return;
+                    }
                     recordings = data.recordings || [];
                     document.getElementById('summary').textContent =
-                        recordings.length + ' recording' + (recordings.length !== 1 ? 's' : '') +
+                        storageLabel + ': ' + recordings.length + ' recording' + (recordings.length !== 1 ? 's' : '') +
                         ', ' + formatSize(data.total_size || 0);
                     sortRecordings();
                 })
@@ -5740,18 +6049,21 @@ if(flvjs.isSupported()){{
                 return;
             }
 
+            const sp = getStorageParam();
+            const spAmp = sp ? sp + '&' : '?';
             container.innerHTML = list.map(rec => `
                 <div class="recording" data-name="${escapeHtml(rec.name)}">
                     ${rec.thumbnail
-                        ? `<img class="thumbnail" src="/api/timelapse/thumb/${encodeURIComponent(rec.thumbnail)}" alt="Thumbnail" onclick="previewVideo('${escapeJs(rec.mp4)}', '${escapeJs(rec.name)}')">`
+                        ? `<img class="thumbnail" src="/api/timelapse/thumb/${encodeURIComponent(rec.thumbnail)}${sp}" alt="Thumbnail" onclick="previewVideo('${escapeJs(rec.mp4)}', '${escapeJs(rec.name)}')">`
                         : '<div class="thumbnail-placeholder">No thumbnail</div>'
                     }
                     <div class="info">
                         <div class="filename">${escapeHtml(rec.mp4)}</div>
                         <div class="meta">
-                            <span>Duration: ${formatDuration(rec.duration)}</span>
+                            <span>${formatDate(rec.mtime)}</span>
+                            <span>Duration: ${rec.frames > 0 ? formatDuration(rec.duration) : '-'}</span>
                             <span>Size: ${formatSize(rec.size)}</span>
-                            <span>Frames: ${rec.frames}</span>
+                            <span>Frames: ${rec.frames > 0 ? rec.frames : '-'}</span>
                         </div>
                         <div class="actions">
                             <button onclick="previewVideo('${escapeJs(rec.mp4)}', '${escapeJs(rec.name)}')">&#9658; Preview</button>
@@ -5777,7 +6089,7 @@ if(flvjs.isSupported()){{
             const title = document.getElementById('preview-title');
 
             title.textContent = mp4;
-            video.src = '/api/timelapse/video/' + encodeURIComponent(mp4);
+            video.src = '/api/timelapse/video/' + encodeURIComponent(mp4) + getStorageParam();
             modal.classList.add('active');
             video.play();
         }
@@ -5793,7 +6105,7 @@ if(flvjs.isSupported()){{
 
         function downloadVideo(mp4) {
             const a = document.createElement('a');
-            a.href = '/api/timelapse/video/' + encodeURIComponent(mp4);
+            a.href = '/api/timelapse/video/' + encodeURIComponent(mp4) + getStorageParam();
             a.download = mp4;
             document.body.appendChild(a);
             a.click();
@@ -5805,7 +6117,7 @@ if(flvjs.isSupported()){{
                 return;
             }
 
-            fetch('/api/timelapse/delete/' + encodeURIComponent(name), {
+            fetch('/api/timelapse/delete/' + encodeURIComponent(name) + getStorageParam(), {
                 method: 'DELETE'
             })
             .then(r => r.json())
@@ -5829,7 +6141,7 @@ if(flvjs.isSupported()){{
         });
 
         // Load recordings on page load
-        loadRecordings();
+        initPage();
     </script>
 </body>
 </html>'''
@@ -5843,15 +6155,35 @@ if(flvjs.isSupported()){{
         ) + html
         client.sendall(response.encode())
 
-    def _serve_timelapse_list(self, client):
+    def _serve_timelapse_list(self, client, storage: str = 'internal'):
         """Return JSON list of timelapse recordings"""
-        recordings = self._get_timelapse_recordings()
-        total_size = sum(r['size'] for r in recordings)
+        # Check if USB is requested but not available
+        error = None
+        if storage == 'usb':
+            if not os.path.ismount('/mnt/udisk'):
+                error = 'USB drive not mounted'
+            elif not self.timelapse_usb_path:
+                error = 'USB path not configured'
+            elif not os.path.isdir(self.timelapse_usb_path):
+                # Try to create the directory
+                try:
+                    os.makedirs(self.timelapse_usb_path, exist_ok=True)
+                except OSError:
+                    error = f'Cannot access USB path: {self.timelapse_usb_path}'
+
+        if error:
+            recordings = []
+            total_size = 0
+        else:
+            recordings = self._get_timelapse_recordings(storage)
+            total_size = sum(r['size'] for r in recordings)
 
         data = {
             'recordings': recordings,
             'total_size': total_size,
-            'count': len(recordings)
+            'count': len(recordings),
+            'storage': storage,
+            'error': error
         }
 
         body = json.dumps(data)
@@ -5864,7 +6196,7 @@ if(flvjs.isSupported()){{
         ) + body
         client.sendall(response.encode())
 
-    def _serve_timelapse_thumb(self, client, name: str):
+    def _serve_timelapse_thumb(self, client, name: str, storage: str = 'internal'):
         """Serve thumbnail image"""
         # Sanitize filename
         name = self._sanitize_filename(name)
@@ -5872,12 +6204,13 @@ if(flvjs.isSupported()){{
             self._serve_404(client)
             return
 
-        file_path = os.path.join(TIMELAPSE_DIR, name)
+        timelapse_dir = self._get_timelapse_dir(storage)
+        file_path = os.path.join(timelapse_dir, name)
 
-        # Security: ensure path is within TIMELAPSE_DIR
+        # Security: ensure path is within timelapse_dir
         try:
             real_path = os.path.realpath(file_path)
-            real_timelapse_dir = os.path.realpath(TIMELAPSE_DIR)
+            real_timelapse_dir = os.path.realpath(timelapse_dir)
             if not real_path.startswith(real_timelapse_dir + os.sep):
                 self._serve_404(client)
                 return
@@ -5905,7 +6238,7 @@ if(flvjs.isSupported()){{
         except OSError:
             self._serve_404(client)
 
-    def _serve_timelapse_video(self, client, name: str, request: str):
+    def _serve_timelapse_video(self, client, name: str, request: str, storage: str = 'internal'):
         """Serve MP4 video with range request support"""
         # Sanitize filename
         name = self._sanitize_filename(name)
@@ -5913,12 +6246,13 @@ if(flvjs.isSupported()){{
             self._serve_404(client)
             return
 
-        file_path = os.path.join(TIMELAPSE_DIR, name)
+        timelapse_dir = self._get_timelapse_dir(storage)
+        file_path = os.path.join(timelapse_dir, name)
 
-        # Security: ensure path is within TIMELAPSE_DIR
+        # Security: ensure path is within timelapse_dir
         try:
             real_path = os.path.realpath(file_path)
-            real_timelapse_dir = os.path.realpath(TIMELAPSE_DIR)
+            real_timelapse_dir = os.path.realpath(timelapse_dir)
             if not real_path.startswith(real_timelapse_dir + os.sep):
                 self._serve_404(client)
                 return
@@ -5988,7 +6322,7 @@ if(flvjs.isSupported()){{
         except OSError:
             self._serve_404(client)
 
-    def _handle_timelapse_delete(self, client, name: str):
+    def _handle_timelapse_delete(self, client, name: str, storage: str = 'internal'):
         """Delete timelapse recording (MP4 and thumbnail)"""
         # Sanitize filename
         name = self._sanitize_filename(name)
@@ -6004,11 +6338,13 @@ if(flvjs.isSupported()){{
             client.sendall(response.encode())
             return
 
+        timelapse_dir = self._get_timelapse_dir(storage)
+
         # Security check
-        mp4_path = os.path.join(TIMELAPSE_DIR, name + '.mp4')
+        mp4_path = os.path.join(timelapse_dir, name + '.mp4')
         try:
             real_path = os.path.realpath(mp4_path)
-            real_timelapse_dir = os.path.realpath(TIMELAPSE_DIR)
+            real_timelapse_dir = os.path.realpath(timelapse_dir)
             if not real_path.startswith(real_timelapse_dir + os.sep):
                 body = json.dumps({'success': False, 'error': 'Invalid path'})
                 response = (
@@ -6036,9 +6372,9 @@ if(flvjs.isSupported()){{
 
         # Find and delete thumbnail (pattern: {name}_{frames}.jpg)
         try:
-            for f in os.listdir(TIMELAPSE_DIR):
+            for f in os.listdir(timelapse_dir):
                 if f.startswith(name + '_') and f.lower().endswith('.jpg'):
-                    thumb_path = os.path.join(TIMELAPSE_DIR, f)
+                    thumb_path = os.path.join(timelapse_dir, f)
                     try:
                         os.unlink(thumb_path)
                         deleted_files.append(f)
@@ -6113,6 +6449,78 @@ if(flvjs.isSupported()){{
         ) + body
         client.sendall(response.encode())
 
+    def _serve_timelapse_browse(self, client, path):
+        """Browse folders on USB drive for folder picker"""
+        # Security: restrict to /mnt/udisk
+        if not path.startswith('/mnt/udisk'):
+            path = '/mnt/udisk'
+
+        # Normalize path to prevent traversal
+        path = os.path.normpath(path)
+        if not path.startswith('/mnt/udisk'):
+            path = '/mnt/udisk'
+
+        if not os.path.ismount('/mnt/udisk'):
+            data = {'error': 'USB drive not mounted'}
+        elif not os.path.isdir(path):
+            data = {'error': 'Directory not found'}
+        else:
+            try:
+                folders = []
+                for entry in os.listdir(path):
+                    full_path = os.path.join(path, entry)
+                    if os.path.isdir(full_path) and not entry.startswith('.'):
+                        folders.append(entry)
+                folders.sort()
+                data = {'path': path, 'folders': folders}
+            except OSError as e:
+                data = {'error': str(e)}
+
+        body = json.dumps(data)
+        response = (
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        ) + body
+        client.sendall(response.encode())
+
+    def _handle_timelapse_mkdir(self, client, body):
+        """Create new folder on USB drive"""
+        try:
+            data = json.loads(body)
+            path = data.get('path', '')
+        except:
+            path = ''
+
+        # Security: restrict to /mnt/udisk
+        if not path.startswith('/mnt/udisk/'):
+            result = {'success': False, 'error': 'Invalid path'}
+        else:
+            # Normalize and verify path
+            path = os.path.normpath(path)
+            if not path.startswith('/mnt/udisk/'):
+                result = {'success': False, 'error': 'Invalid path'}
+            elif not os.path.ismount('/mnt/udisk'):
+                result = {'success': False, 'error': 'USB drive not mounted'}
+            else:
+                try:
+                    os.makedirs(path, exist_ok=True)
+                    result = {'success': True, 'path': path}
+                except OSError as e:
+                    result = {'success': False, 'error': str(e)}
+
+        body_resp = json.dumps(result)
+        response = (
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json\r\n"
+            f"Content-Length: {len(body_resp)}\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        ) + body_resp
+        client.sendall(response.encode())
+
     def _serve_timelapse_moonraker_status(self, client):
         """Return Moonraker connection status"""
         connected = False
@@ -6170,6 +6578,11 @@ if(flvjs.isSupported()){{
         self.timelapse_storage = params.get('timelapse_storage', 'internal')
         if self.timelapse_storage not in ('internal', 'usb'):
             self.timelapse_storage = 'internal'
+
+        # USB path - must start with /mnt/udisk for security
+        usb_path = params.get('timelapse_usb_path', self.timelapse_usb_path)
+        if usb_path and usb_path.startswith('/mnt/udisk'):
+            self.timelapse_usb_path = usb_path
 
         self.moonraker_host = params.get('moonraker_host', '127.0.0.1')
 
@@ -6245,6 +6658,10 @@ if(flvjs.isSupported()){{
 
         # Enable custom timelapse mode in rkmpi_enc to ignore Anycubic RPC timelapse
         self._send_timelapse_command("timelapse_custom_mode:1")
+
+        # Set temp directory to app folder (avoids /tmp space issues on long prints)
+        app_dir = os.path.dirname(os.path.abspath(__file__))
+        self._send_timelapse_command(f"timelapse_temp_dir:{app_dir}/timelapse_frames")
 
         self.moonraker_client = MoonrakerClient(self.moonraker_host, self.moonraker_port)
 
@@ -6364,18 +6781,18 @@ if(flvjs.isSupported()){{
         self._send_timelapse_command("timelapse_finalize")
 
     def _on_print_cancel(self, filename, reason):
-        """Callback when print is cancelled"""
+        """Callback when print is cancelled - still save the timelapse"""
         if not self.timelapse_active:
             return
 
-        print(f"Timelapse: Print cancelled - {filename}, reason: {reason}", flush=True)
+        print(f"Timelapse: Print cancelled - {filename}, reason: {reason}, saving {self.timelapse_frames} frames", flush=True)
 
         # Stop hyperlapse timer first
         self.timelapse_active = False
         self._stop_hyperlapse_timer()
 
-        self._send_timelapse_command("timelapse_cancel")
-        self.timelapse_frames = 0
+        # Save the timelapse even on cancel - failed prints are often the most interesting
+        self._send_timelapse_command("timelapse_finalize")
 
     def _get_timelapse_output_path(self):
         """Get the timelapse output directory based on current storage setting"""
