@@ -86,6 +86,106 @@ def load_model_id():
         return None
 
 
+# ============================================================================
+# Display Orientation and Touch Coordinate Transformation
+# ============================================================================
+
+# Model IDs from api.cfg
+MODEL_ID_K2P = "20021"
+MODEL_ID_K3 = "20024"
+MODEL_ID_KS1 = "20025"
+MODEL_ID_K3M = "20026"
+MODEL_ID_K3V2 = "20027"
+MODEL_ID_KS1M = "20029"
+
+# Display orientations
+DISPLAY_ORIENT_NORMAL = 0
+DISPLAY_ORIENT_FLIP_180 = 1     # KS1, KS1M
+DISPLAY_ORIENT_ROTATE_90 = 2    # K3, K2P, K3V2
+DISPLAY_ORIENT_ROTATE_270 = 3   # K3M
+
+# Framebuffer native resolution
+FB_WIDTH = 800
+FB_HEIGHT = 480
+
+
+def get_display_orientation(model_id: str) -> int:
+    """Get display orientation based on printer model ID"""
+    if model_id in (MODEL_ID_KS1, MODEL_ID_KS1M):
+        return DISPLAY_ORIENT_FLIP_180
+    elif model_id == MODEL_ID_K3M:
+        return DISPLAY_ORIENT_ROTATE_270
+    elif model_id in (MODEL_ID_K3, MODEL_ID_K2P, MODEL_ID_K3V2):
+        return DISPLAY_ORIENT_ROTATE_90
+    return DISPLAY_ORIENT_NORMAL
+
+
+def get_display_dimensions(orientation: int) -> tuple:
+    """Get display dimensions after rotation (width, height)"""
+    if orientation in (DISPLAY_ORIENT_ROTATE_90, DISPLAY_ORIENT_ROTATE_270):
+        return (FB_HEIGHT, FB_WIDTH)  # Swapped: 480x800
+    return (FB_WIDTH, FB_HEIGHT)  # Normal: 800x480
+
+
+def transform_touch_coordinates(x: int, y: int, orientation: int) -> tuple:
+    """Transform web display coordinates to touch panel coordinates.
+
+    The touch panel is aligned with the native framebuffer (800x480).
+    The web display shows a rotated/flipped version of the framebuffer.
+    We need to reverse the transformation to get touch panel coordinates.
+
+    Args:
+        x, y: Coordinates on the web display (after rotation/flip)
+        orientation: Display orientation applied to the framebuffer
+
+    Returns:
+        (touch_x, touch_y): Coordinates for the touch panel
+    """
+    if orientation == DISPLAY_ORIENT_FLIP_180:
+        # Web shows 180° flipped image (800x480)
+        # Reverse: touch = (800-x, 480-y)
+        return (FB_WIDTH - x, FB_HEIGHT - y)
+
+    elif orientation == DISPLAY_ORIENT_ROTATE_90:
+        # Web shows 90° CW rotated image (480x800)
+        # Original fb(fx,fy) -> web(fy, 480-fx)
+        # Reverse: touch_x = 480-y, touch_y = x
+        # But web coords are 0-480 for x, 0-800 for y
+        # touch_x (0-800) = y * 800/800 = y (scale from web_y 0-800)
+        # touch_y (0-480) = (480 - x) where x is 0-480
+        return (y, FB_HEIGHT - x)
+
+    elif orientation == DISPLAY_ORIENT_ROTATE_270:
+        # Web shows 270° CW (90° CCW) rotated image (480x800)
+        # Original fb(fx,fy) -> web(480-fy, fx)
+        # Reverse: touch_x = 800-y, touch_y = x
+        return (FB_WIDTH - y, x)
+
+    else:
+        # No transformation needed
+        return (x, y)
+
+
+# Global display orientation (set during startup)
+g_display_orientation = DISPLAY_ORIENT_NORMAL
+g_display_width = FB_WIDTH
+g_display_height = FB_HEIGHT
+
+
+def init_display_orientation():
+    """Initialize display orientation from model ID"""
+    global g_display_orientation, g_display_width, g_display_height
+    model_id = load_model_id()
+    if model_id:
+        g_display_orientation = get_display_orientation(model_id)
+        g_display_width, g_display_height = get_display_dimensions(g_display_orientation)
+        orient_names = {0: "NORMAL", 1: "FLIP_180", 2: "ROTATE_90", 3: "ROTATE_270"}
+        print(f"Display orientation: {orient_names.get(g_display_orientation, 'UNKNOWN')} "
+              f"(model={model_id}, display={g_display_width}x{g_display_height})", flush=True)
+    else:
+        print("Could not detect model ID, using default display orientation", flush=True)
+
+
 def mqtt_encode_string(s):
     """Encode a string for MQTT protocol (length-prefixed UTF-8)"""
     encoded = s.encode('utf-8')
@@ -646,6 +746,79 @@ def mqtt_decode_remaining_length(data, offset):
         if (byte & 0x80) == 0:
             break
     return value, i
+
+
+# ============================================================================
+# Touch Panel Control
+# ============================================================================
+
+TOUCH_DEVICE = "/dev/input/event0"
+
+# Linux input event types and codes
+EV_SYN = 0x00
+EV_KEY = 0x01
+EV_ABS = 0x03
+SYN_REPORT = 0x00
+BTN_TOUCH = 0x14a
+ABS_MT_SLOT = 0x2f
+ABS_MT_TRACKING_ID = 0x39
+ABS_MT_POSITION_X = 0x35
+ABS_MT_POSITION_Y = 0x36
+ABS_MT_TOUCH_MAJOR = 0x30
+ABS_MT_PRESSURE = 0x3a
+
+def inject_touch(x: int, y: int, duration_ms: int = 100) -> bool:
+    """Inject a touch event at the specified coordinates.
+
+    Args:
+        x: X coordinate (0-800 typically)
+        y: Y coordinate (0-480 typically)
+        duration_ms: Touch duration in milliseconds
+
+    Returns:
+        True if successful, False otherwise
+    """
+    print(f"inject_touch: x={x}, y={y}, duration={duration_ms}", flush=True)
+    try:
+        fd = os.open(TOUCH_DEVICE, os.O_WRONLY)
+        print(f"inject_touch: opened fd={fd}", flush=True)
+    except OSError as e:
+        print(f"Failed to open touch device: {e}", flush=True)
+        return False
+
+    try:
+        def emit(event_type, code, value):
+            # struct input_event: time (16 bytes on 32-bit), type (u16), code (u16), value (s32)
+            # On 32-bit ARM: struct timeval is 8 bytes (tv_sec + tv_usec as 32-bit)
+            tv_sec = int(time.time())
+            tv_usec = int((time.time() % 1) * 1000000)
+            event = struct.pack('IIHHi', tv_sec, tv_usec, event_type, code, value)
+            os.write(fd, event)
+
+        # Touch down - MT Protocol B
+        emit(EV_ABS, ABS_MT_SLOT, 0)
+        emit(EV_ABS, ABS_MT_TRACKING_ID, 1)
+        emit(EV_ABS, ABS_MT_POSITION_X, x)
+        emit(EV_ABS, ABS_MT_POSITION_Y, y)
+        emit(EV_ABS, ABS_MT_TOUCH_MAJOR, 50)
+        emit(EV_ABS, ABS_MT_PRESSURE, 100)
+        emit(EV_KEY, BTN_TOUCH, 1)
+        emit(EV_SYN, SYN_REPORT, 0)
+
+        time.sleep(duration_ms / 1000.0)
+
+        # Touch up
+        emit(EV_ABS, ABS_MT_TRACKING_ID, -1)
+        emit(EV_KEY, BTN_TOUCH, 0)
+        emit(EV_SYN, SYN_REPORT, 0)
+
+        print(f"inject_touch: completed successfully", flush=True)
+        return True
+    except Exception as e:
+        print(f"inject_touch: failed: {e}", flush=True)
+        return False
+    finally:
+        os.close(fd)
 
 
 # ============================================================================
@@ -2991,6 +3164,18 @@ class StreamerApp:
                 self._handle_led_control(client, True)
             elif path == '/api/led/off':
                 self._handle_led_control(client, False)
+            elif path == '/api/touch' and method == 'POST':
+                # Parse POST body for touch coordinates
+                content_length = 0
+                for line in request.split('\r\n'):
+                    if line.lower().startswith('content-length:'):
+                        content_length = int(line.split(':')[1].strip())
+                body = ''
+                if content_length > 0:
+                    body_start = request.find('\r\n\r\n')
+                    if body_start != -1:
+                        body = request[body_start+4:body_start+4+content_length]
+                self._handle_touch(client, body)
             else:
                 self._serve_404(client)
         except Exception:
@@ -3471,7 +3656,7 @@ class StreamerApp:
                 </div>
                 <div id="tab-display" class="tab-content">
                     <img id="display-stream" style="display:none">
-                    <p style="color:#888;font-size:12px">Printer LCD framebuffer</p>
+                    <p style="color:#888;font-size:12px">Printer LCD framebuffer - Click to touch</p>
                 </div>
             </div>
             <div style="margin-top:10px;display:flex;justify-content:space-between;align-items:center;">
@@ -3929,10 +4114,14 @@ class StreamerApp:
 
         // Display stream (printer LCD framebuffer)
         let displayActive = false;
+        const DISPLAY_WIDTH = {g_display_width};
+        const DISPLAY_HEIGHT = {g_display_height};
+
         function startDisplayStream() {{
             const img = document.getElementById('display-stream');
             img.src = streamBase + '/display';
             img.style.display = 'block';
+            img.style.cursor = 'crosshair';
             displayActive = true;
         }}
         function stopDisplayStream() {{
@@ -3941,6 +4130,40 @@ class StreamerApp:
             img.style.display = 'none';
             displayActive = false;
         }}
+
+        // Touch control for display stream
+        function handleDisplayClick(event) {{
+            const img = event.target;
+            const rect = img.getBoundingClientRect();
+
+            // Calculate click position relative to image (0-1)
+            const relX = (event.clientX - rect.left) / rect.width;
+            const relY = (event.clientY - rect.top) / rect.height;
+
+            // Scale to display coordinates
+            const x = Math.round(relX * DISPLAY_WIDTH);
+            const y = Math.round(relY * DISPLAY_HEIGHT);
+
+            // Send touch command
+            fetch('/api/touch', {{
+                method: 'POST',
+                headers: {{'Content-Type': 'application/json'}},
+                body: JSON.stringify({{x: x, y: y, duration: 100}})
+            }})
+            .then(r => r.json())
+            .then(data => {{
+                console.log('Touch:', data);
+            }})
+            .catch(e => console.error('Touch error:', e));
+        }}
+
+        // Initialize display click handler
+        document.addEventListener('DOMContentLoaded', function() {{
+            const displayImg = document.getElementById('display-stream');
+            if (displayImg) {{
+                displayImg.addEventListener('click', handleDisplayClick);
+            }}
+        }});
 
         // LED control
         function controlLed(on) {{
@@ -4455,6 +4678,41 @@ if(flvjs.isSupported()){{
         """Handle LED control request - send MQTT command"""
         success = mqtt_send_led_control(on)
         body = json.dumps({'status': 'ok' if success else 'failed', 'led': 'on' if on else 'off'})
+        response = (
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        ) + body
+        client.sendall(response.encode())
+
+    def _handle_touch(self, client, body: str):
+        """Handle touch injection request"""
+        try:
+            data = json.loads(body) if body else {}
+            x = int(data.get('x', 0))
+            y = int(data.get('y', 0))
+            duration = int(data.get('duration', 100))
+
+            # Clamp coordinates to valid display range (depends on orientation)
+            x = max(0, min(g_display_width, x))
+            y = max(0, min(g_display_height, y))
+            duration = max(10, min(1000, duration))  # 10ms to 1s
+
+            # Transform display coordinates to touch panel coordinates
+            touch_x, touch_y = transform_touch_coordinates(x, y, g_display_orientation)
+
+            # Clamp touch coordinates to panel range (always 800x480)
+            touch_x = max(0, min(FB_WIDTH, touch_x))
+            touch_y = max(0, min(FB_HEIGHT, touch_y))
+
+            success = inject_touch(touch_x, touch_y, duration)
+            result = {'status': 'ok' if success else 'failed', 'x': x, 'y': y, 'touch_x': touch_x, 'touch_y': touch_y, 'duration': duration}
+        except Exception as e:
+            result = {'status': 'error', 'message': str(e)}
+
+        body = json.dumps(result)
         response = (
             "HTTP/1.1 200 OK\r\n"
             "Content-Type: application/json\r\n"
@@ -5141,6 +5399,9 @@ def main():
                         help='H.264 encoding resolution for rkmpi mode (default: 1280x720)')
 
     args = parser.parse_args()
+
+    # Initialize display orientation (needed for touch coordinate transformation)
+    init_display_orientation()
 
     # If running as RPC responder subprocess, just do that
     if args.rpc_responder:

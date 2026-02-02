@@ -551,6 +551,66 @@ Captures the printer's LCD framebuffer (/dev/fb0) and streams it as MJPEG for re
 
 ---
 
+## Touch Control
+
+**Status:** ✅ **Fully supported** - Click on the display stream to inject touch events.
+
+Remote touch control allows interacting with the printer's touchscreen through the web interface. Click anywhere on the display stream image to send a touch event to the printer.
+
+### How It Works
+1. User clicks on the display stream image in the web browser
+2. Browser calculates click position relative to display dimensions
+3. POST request sent to `/api/touch` with coordinates
+4. Server transforms coordinates based on printer model orientation
+5. Touch event injected to `/dev/input/event0` (Linux input subsystem)
+6. Printer UI responds to the touch
+
+### API Endpoint
+
+**POST `/api/touch`**
+```json
+{
+  "x": 400,
+  "y": 240,
+  "duration": 100
+}
+```
+
+Response:
+```json
+{
+  "status": "ok",
+  "x": 400,
+  "y": 240,
+  "touch_x": 400,
+  "touch_y": 240,
+  "duration": 100
+}
+```
+
+### Coordinate Transformation
+
+The touch panel is aligned with the native framebuffer (800×480), but the web display shows a rotated/flipped image depending on the printer model. The server automatically detects the model and applies the correct inverse transformation.
+
+| Model | Model ID | Display Size | Touch Transform |
+|-------|----------|--------------|-----------------|
+| KS1, KS1M | 20025, 20029 | 800×480 | `touch = (800-x, 480-y)` |
+| K3, K2P, K3V2 | 20024, 20021, 20027 | 480×800 | `touch = (y, 480-x)` |
+| K3M | 20026 | 480×800 | `touch = (800-y, x)` |
+
+### Touch Input Device
+- **Device:** `/dev/input/event0`
+- **Driver:** `hyn_ts` (Hynitron touch controller)
+- **Resolution:** 800×480 (native panel)
+- **Protocol:** Multi-touch Type B (Linux input subsystem)
+
+### Implementation
+- Touch injection: `inject_touch()` in `h264_server.py`
+- Coordinate transform: `transform_touch_coordinates()` in `h264_server.py`
+- Model detection: Reads `modelId` from `/userdata/app/gk/config/api.cfg`
+
+---
+
 ## Timelapse Recording
 
 **Status:** ✅ **Fully supported** in rkmpi/rkmpi-yuyv modes. The native `rkmpi_enc` encoder includes a built-in RPC client that handles timelapse commands.

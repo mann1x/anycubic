@@ -20,6 +20,7 @@ This repository contains development tools for working with the RV1106 SoC found
 - Hardware H.264 encoding via RV1106 VENC
 - MJPEG and FLV HTTP streaming
 - **Display capture** for remote LCD viewing (full hardware acceleration)
+- **Touch control** - click on display stream to interact with printer UI
 - Web-based control interface
 - Moonraker webcam integration
 
