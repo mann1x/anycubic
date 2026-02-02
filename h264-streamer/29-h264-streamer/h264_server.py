@@ -2614,7 +2614,7 @@ class StreamerApp:
             )
             self.encoder_pid = self.encoder_process.pid
             print(f"Encoder started in server mode (PID {self.encoder_pid})", flush=True)
-            print(f"  Streaming on port {self.STREAMING_PORT} (/stream, /snapshot)", flush=True)
+            print(f"  Streaming on port {self.streaming_port} (/stream, /snapshot)", flush=True)
             print(f"  FLV on port {self.FLV_PORT} (/flv)", flush=True)
             if self.mode == 'vanilla-klipper':
                 print(f"  MQTT/RPC responders: disabled (vanilla-klipper mode)", flush=True)
@@ -3474,12 +3474,12 @@ class StreamerApp:
                     <p style="color:#888;font-size:12px">Printer LCD framebuffer</p>
                 </div>
             </div>
-            <div class="links" style="margin-top:10px;display:flex;justify-content:space-between;align-items:center;">
-                <div>
-                    <a href="/stream" target="_blank">Open MJPEG</a>
-                    <a href="/snapshot" target="_blank">Open Snapshot</a>
-                    <a href="#" onclick="openFlvFullscreen();return false;">Open FLV</a>
-                    <a href="/display" target="_blank">Open Display</a>
+            <div style="margin-top:10px;display:flex;justify-content:space-between;align-items:center;">
+                <div style="display:flex;gap:5px;">
+                    <button onclick="window.open(streamBase + '/stream', '_blank')" class="secondary" style="padding:5px 12px;font-size:12px;">Open MJPEG</button>
+                    <button onclick="window.open(streamBase + '/snapshot', '_blank')" class="secondary" style="padding:5px 12px;font-size:12px;">Open Snapshot</button>
+                    <button onclick="openFlvFullscreen()" class="secondary" style="padding:5px 12px;font-size:12px;">Open FLV</button>
+                    <button onclick="window.open(streamBase + '/display', '_blank')" class="secondary" style="padding:5px 12px;font-size:12px;">Open Display</button>
                 </div>
                 <div style="display:flex;gap:5px;align-items:center;">
                     <span style="color:#888;font-size:12px;margin-right:5px;">LED:</span>

@@ -1804,10 +1804,6 @@ int main(int argc, char *argv[]) {
     if (cfg.mjpeg_stdout) {
         log_info("  MJPEG: stdout (multipart)\n");
     }
-    if (cfg.server_mode) {
-        log_info("  MJPEG: http://0.0.0.0:8080/stream\n");
-        log_info("  FLV: http://0.0.0.0:18088/flv\n");
-    }
     if (h264_available) {
         log_info("  H.264: %s (skip=%d, %s)\n", cfg.h264_output, g_ctrl.skip_ratio,
                  g_ctrl.h264_enabled ? "enabled" : "disabled");
