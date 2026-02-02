@@ -9,9 +9,10 @@ HTTP streaming server with web UI for Rinkhals custom firmware on Anycubic print
 - **Display Capture** - Stream the printer's LCD screen remotely
 - **Touch Control** - Click on display stream to interact with printer UI
 - **Web Control Panel** - Live preview, settings, and monitoring
+- **Timelapse Management** - Browse, preview, download, and delete recordings
 - **Moonraker Integration** - Compatible webcam endpoints
 - **Auto Frame Skipping** - Dynamic frame rate based on CPU load
-- **Timelapse Support** - Layer-by-layer recording to MP4
+- **Timelapse Recording** - Layer-by-layer recording to MP4
 
 ## Installation
 
@@ -49,8 +50,13 @@ Download the SWU package for your printer model from [Releases](https://github.c
 | Endpoint | Description |
 |----------|-------------|
 | `/control` | Web UI with settings and preview |
+| `/timelapse` | Timelapse management page |
 | `/api/stats` | JSON stats (FPS, CPU, settings) |
 | `/api/touch` | POST touch events to printer |
+| `/api/timelapse/list` | JSON list of recordings |
+| `/api/timelapse/thumb/<name>` | Thumbnail image |
+| `/api/timelapse/video/<name>` | MP4 video (supports range requests) |
+| `/api/timelapse/delete/<name>` | DELETE to remove recording |
 
 ### FLV (Port 18088)
 
@@ -87,12 +93,34 @@ The server automatically transforms coordinates based on printer model orientati
 | K3, K2P, K3V2 | 480x800 | `(y, 480-x)` |
 | K3M | 480x800 | `(800-y, x)` |
 
+## Timelapse Management
+
+Access at `http://<printer-ip>:8081/timelapse` or via the "Time Lapse" button on the control page.
+
+### Features
+
+- **Browse Recordings** - View all timelapse videos with thumbnails
+- **Preview** - Play videos directly in the browser
+- **Download** - Download MP4 files to your computer
+- **Delete** - Remove recordings to free up space
+- **Sorting** - Sort by date, name, or file size
+
+### Storage Location
+
+Recordings are stored at `/useremain/app/gk/Time-lapse-Video/` on the printer.
+
+| File Type | Naming Pattern |
+|-----------|----------------|
+| Video | `{gcode_name}_{sequence}.mp4` |
+| Thumbnail | `{gcode_name}_{sequence}_{frames}.jpg` |
+
 ## Configuration
 
 Settings are stored in `app.json`:
 
 | Property | Default | Description |
 |----------|---------|-------------|
+| `mode` | go-klipper | Operating mode (see below) |
 | `encoder_type` | rkmpi-yuyv | Encoder: gkcam, rkmpi, rkmpi-yuyv |
 | `autolanmode` | true | Auto-enable LAN mode on start |
 | `auto_skip` | false | Auto frame skip based on CPU |
@@ -101,6 +129,32 @@ Settings are stored in `app.json`:
 | `mjpeg_fps` | 10 | MJPEG framerate |
 | `port` | 8080 | Main HTTP server port |
 | `logging` | false | Enable debug logging |
+
+## Operating Modes
+
+### go-klipper (default)
+
+For Anycubic printers with **Rinkhals custom firmware**.
+
+- Manages LAN mode via local binary API (port 18086)
+- Kills/restarts gkcam to control camera access
+- Enables MQTT/RPC responders for timelapse support
+- Full integration with Anycubic firmware services
+
+### vanilla-klipper
+
+For **external Klipper** setups (e.g., Raspberry Pi) or testing without firmware.
+
+- No firmware integration (skips LAN mode, gkcam, MQTT/RPC)
+- Pure camera streaming only
+- No timelapse support
+
+| Feature | go-klipper | vanilla-klipper |
+|---------|------------|-----------------|
+| LAN mode management | ✅ | ❌ |
+| Timelapse recording | ✅ | ❌ |
+| Anycubic slicer | ✅ | ❌ |
+| External Klipper | ❌ | ✅ |
 
 ## Encoder Modes
 

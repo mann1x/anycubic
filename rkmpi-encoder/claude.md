@@ -286,6 +286,60 @@ if not h264_enabled:
 
 The encoder auto-detects USB cameras by scanning `/dev/v4l/by-id/` for symlinks. It's not tied to a specific camera model and works with any USB camera supporting MJPEG output.
 
+## Operating Modes
+
+The `--mode` flag controls firmware integration behavior.
+
+### go-klipper (default)
+
+For Anycubic printers running **Rinkhals custom firmware**.
+
+**Features:**
+- **MQTT Client** - Connects to printer's MQTT broker (port 9883) for camera commands
+- **RPC Client** - Connects to local binary API (port 18086) for timelapse commands
+- **Timelapse Recording** - Handles openDelayCamera, startLanCapture, stopLanCapture RPC commands
+- **Full Firmware Integration** - Works alongside gkapi and other Anycubic services
+
+**Use when:**
+- Running on an Anycubic printer with Rinkhals
+- You need timelapse recording support
+- The camera needs to respond to firmware commands
+
+### vanilla-klipper
+
+For **external Klipper** setups or testing without Anycubic firmware.
+
+**Features:**
+- **No MQTT/RPC** - Skips all firmware communication
+- **Pure Encoding** - Just captures from camera and serves HTTP streams
+- **No Timelapse** - Timelapse commands are not processed
+
+**Use when:**
+- Using an external Raspberry Pi with Klipper
+- Testing the encoder in isolation
+- The printer's native firmware is not involved
+
+### Mode Comparison
+
+| Feature | go-klipper | vanilla-klipper |
+|---------|------------|-----------------|
+| MQTT client | ✅ | ❌ |
+| RPC client | ✅ | ❌ |
+| Timelapse recording | ✅ | ❌ |
+| Works without firmware | ❌ | ✅ |
+
+### Setting the Mode
+
+```bash
+# Default (go-klipper)
+./rkmpi_enc -S -v
+
+# External Klipper
+./rkmpi_enc -S -v --mode vanilla-klipper
+```
+
+---
+
 ## Environment
 
 On the printer, set LD_LIBRARY_PATH before running:

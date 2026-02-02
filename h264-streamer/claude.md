@@ -181,11 +181,77 @@ The `/control` endpoint (on port 8081) provides a web UI with:
 }
 ```
 
+## Operating Modes
+
+The `--mode` flag controls how h264-streamer integrates with the printer's firmware.
+
+### go-klipper (default)
+
+For Anycubic printers running **Rinkhals custom firmware**. This is the standard configuration.
+
+**Features:**
+- **LAN Mode Management** - Queries and auto-enables LAN mode via local binary API (port 18086)
+- **gkcam Integration** - Kills gkcam to free the USB camera, restarts it on shutdown
+- **MQTT/RPC Responders** - Handles timelapse commands from gkapi (openDelayCamera, startLanCapture, etc.)
+- **Camera Stream Control** - Sends startCapture/stopCapture via MQTT to manage gkcam state
+- **Full Firmware Integration** - Works alongside Anycubic's native services
+
+**Use when:**
+- Running on an Anycubic printer with Rinkhals
+- You need timelapse recording support
+- You want the camera to work with the Anycubic slicer
+
+### vanilla-klipper
+
+For setups using **external Klipper** (e.g., on a Raspberry Pi) connected to the printer via USB, or for testing without Anycubic firmware dependencies.
+
+**Features:**
+- **No Firmware Integration** - Skips all Anycubic-specific initialization
+- **No LAN Mode** - Does not query or enable LAN mode
+- **No gkcam Management** - Does not kill or restart gkcam
+- **No MQTT/RPC** - Disables MQTT client and RPC responders
+- **Pure Camera Streaming** - Just captures from USB camera and serves HTTP streams
+
+**Use when:**
+- Using an external Raspberry Pi running Klipper
+- The printer's native firmware is not involved
+- You only need basic camera streaming without timelapse
+- Testing the encoder in isolation
+
+### Mode Comparison
+
+| Feature | go-klipper | vanilla-klipper |
+|---------|------------|-----------------|
+| LAN mode management | ✅ | ❌ |
+| gkcam kill/restart | ✅ | ❌ |
+| MQTT/RPC responders | ✅ | ❌ |
+| Timelapse recording | ✅ | ❌ |
+| Anycubic slicer support | ✅ | ❌ |
+| Works without firmware | ❌ | ✅ |
+| External Klipper | ❌ | ✅ |
+
+### Setting the Mode
+
+**Via app.json property:**
+```json
+{
+    "mode": "vanilla-klipper"
+}
+```
+
+**Via command line:**
+```bash
+python h264_server.py --mode vanilla-klipper
+```
+
+---
+
 ## Properties (app.json)
 
+- `mode` (string, default: "go-klipper") - Operating mode: "go-klipper" or "vanilla-klipper"
 - `encoder_type` (string, default: "rkmpi-yuyv") - Encoder mode: "gkcam", "rkmpi", or "rkmpi-yuyv"
 - `gkcam_all_frames` (bool, default: false) - In gkcam mode, decode all frames (true) or keyframes only (false)
-- `autolanmode` (bool, default: true) - Automatically enable LAN mode on startup
+- `autolanmode` (bool, default: true) - Automatically enable LAN mode on startup (go-klipper only)
 - `auto_skip` (bool, default: false) - Enable automatic skip ratio based on CPU usage (rkmpi only)
 - `target_cpu` (int, default: 60) - Target max CPU usage % for auto-skip (30-90, rkmpi only)
 - `bitrate` (int, default: 512) - H.264 bitrate in kbps (100-4000, rkmpi only)
@@ -655,3 +721,89 @@ The RPC client monitors `print_stats.state` in status updates:
 
 - Protocol doc: `/shared/dev/anycubic/knowledge/TIMELAPSE_PROTOCOL.md`
 - Timelapse captures: `/shared/dev/Rinkhals/docs/timelapse-captures/`
+
+---
+
+## Timelapse Management UI
+
+**Status:** ✅ **Fully supported** - Web interface for browsing, previewing, downloading, and deleting timelapse recordings.
+
+### Access
+
+- **URL:** `http://<printer-ip>:8081/timelapse`
+- **Control Page:** Click "Time Lapse" button on `/control` page
+
+### Features
+
+- **Recording List** - Shows all MP4 recordings with thumbnails
+- **Metadata Display** - Duration, file size, frame count for each recording
+- **Video Preview** - Play videos in browser modal (HTML5 video player)
+- **Download** - Download MP4 files directly
+- **Delete** - Remove recordings with confirmation dialog
+- **Sorting** - Sort by date (newest/oldest), name, or size
+- **Summary** - Total recording count and storage used
+
+### API Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/timelapse` | GET | Timelapse manager HTML page |
+| `/api/timelapse/list` | GET | JSON list of recordings with metadata |
+| `/api/timelapse/thumb/<name>` | GET | Serve thumbnail JPEG |
+| `/api/timelapse/video/<name>` | GET | Serve MP4 video (supports HTTP Range) |
+| `/api/timelapse/delete/<name>` | DELETE | Delete recording and thumbnail |
+
+### List API Response
+
+**GET `/api/timelapse/list`**
+```json
+{
+  "recordings": [
+    {
+      "name": "Benchy_PLA_0.2_1h_01",
+      "mp4": "Benchy_PLA_0.2_1h_01.mp4",
+      "thumbnail": "Benchy_PLA_0.2_1h_01_126.jpg",
+      "size": 2200000,
+      "frames": 126,
+      "duration": 12.6,
+      "mtime": 1706889600
+    }
+  ],
+  "total_size": 12900000,
+  "count": 5
+}
+```
+
+### Delete API Response
+
+**DELETE `/api/timelapse/delete/<name>`**
+```json
+{
+  "success": true,
+  "deleted": ["Benchy_PLA_0.2_1h_01.mp4", "Benchy_PLA_0.2_1h_01_126.jpg"]
+}
+```
+
+### File Storage
+
+| Item | Path |
+|------|------|
+| Directory | `/useremain/app/gk/Time-lapse-Video/` |
+| Video | `{gcode_name}_{sequence}.mp4` |
+| Thumbnail | `{gcode_name}_{sequence}_{frames}.jpg` |
+
+### Security
+
+- **Path Traversal Protection** - Filenames are sanitized to prevent `../` attacks
+- **Directory Restriction** - Only files within `TIMELAPSE_DIR` can be accessed
+- **Extension Validation** - Only `.mp4` and `.jpg` files are served
+
+### Implementation
+
+- **Constants:** `TIMELAPSE_DIR`, `TIMELAPSE_FPS` (10 fps for duration calculation)
+- **Methods:**
+  - `_serve_timelapse_page()` - Serves HTML/CSS/JS page
+  - `_serve_timelapse_list()` - Scans directory, returns JSON
+  - `_serve_timelapse_thumb()` - Serves JPEG thumbnails
+  - `_serve_timelapse_video()` - Serves MP4 with Range support for seeking
+  - `_handle_timelapse_delete()` - Deletes MP4 and matching thumbnail

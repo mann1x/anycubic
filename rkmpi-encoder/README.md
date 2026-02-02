@@ -76,7 +76,32 @@ Hardware H.264/JPEG encoder for RV1106-based Anycubic 3D printers.
 | `-S, --server` | Enable HTTP/MQTT/RPC servers | off |
 | `-N, --no-stdout` | Disable stdout (use with -S) | off |
 | `--streaming-port <n>` | MJPEG HTTP port | 8080 |
-| `--mode <mode>` | go-klipper or vanilla-klipper | go-klipper |
+| `--mode <mode>` | Operating mode (see below) | go-klipper |
+
+## Operating Modes
+
+### go-klipper (default)
+
+For Anycubic printers with **Rinkhals custom firmware**.
+
+- Enables MQTT client for camera commands (port 9883)
+- Enables RPC client for timelapse commands (port 18086)
+- Handles timelapse recording (openDelayCamera, startLanCapture, etc.)
+- Full integration with Anycubic firmware services
+
+### vanilla-klipper
+
+For **external Klipper** setups (e.g., Raspberry Pi) or testing.
+
+- Disables MQTT/RPC clients
+- Pure camera capture and HTTP streaming only
+- No timelapse support
+
+| Feature | go-klipper | vanilla-klipper |
+|---------|------------|-----------------|
+| MQTT/RPC clients | ✅ | ❌ |
+| Timelapse recording | ✅ | ❌ |
+| Works without firmware | ❌ | ✅ |
 
 ### Display Capture
 

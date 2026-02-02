@@ -30,6 +30,7 @@ import sys
 import threading
 import time
 import struct
+import urllib.parse
 import urllib.request
 import uuid
 from collections import deque
@@ -55,6 +56,10 @@ MQTT_DISCONNECT = 0xE0
 # Config paths
 DEVICE_ACCOUNT_PATH = '/userdata/app/gk/config/device_account.json'
 API_CONFIG_PATH = '/userdata/app/gk/config/api.cfg'
+
+# Timelapse directory
+TIMELAPSE_DIR = '/useremain/app/gk/Time-lapse-Video/'
+TIMELAPSE_FPS = 10  # FPS used for duration calculation
 
 # MQTT packet type for PUBACK
 MQTT_PUBACK = 0x40
@@ -3176,6 +3181,20 @@ class StreamerApp:
                     if body_start != -1:
                         body = request[body_start+4:body_start+4+content_length]
                 self._handle_touch(client, body)
+            # Timelapse management
+            elif path == '/timelapse':
+                self._serve_timelapse_page(client)
+            elif path == '/api/timelapse/list':
+                self._serve_timelapse_list(client)
+            elif path.startswith('/api/timelapse/thumb/'):
+                name = urllib.parse.unquote(path[21:])  # URL-decode filename
+                self._serve_timelapse_thumb(client, name)
+            elif path.startswith('/api/timelapse/video/'):
+                name = urllib.parse.unquote(path[21:])  # URL-decode filename
+                self._serve_timelapse_video(client, name, request)
+            elif path.startswith('/api/timelapse/delete/') and method == 'DELETE':
+                name = urllib.parse.unquote(path[22:])  # URL-decode filename
+                self._handle_timelapse_delete(client, name)
             else:
                 self._serve_404(client)
         except Exception:
@@ -3665,6 +3684,7 @@ class StreamerApp:
                     <button onclick="window.open(streamBase + '/snapshot', '_blank')" class="secondary" style="padding:5px 12px;font-size:12px;">Open Snapshot</button>
                     <button onclick="openFlvFullscreen()" class="secondary" style="padding:5px 12px;font-size:12px;">Open FLV</button>
                     <button onclick="window.open(streamBase + '/display', '_blank')" class="secondary" style="padding:5px 12px;font-size:12px;">Open Display</button>
+                    <button onclick="window.open('/timelapse', '_blank', 'width=900,height=700')" class="secondary" style="padding:5px 12px;font-size:12px;">Time Lapse</button>
                 </div>
                 <div style="display:flex;gap:5px;align-items:center;">
                     <span style="color:#888;font-size:12px;margin-right:5px;">LED:</span>
@@ -4746,6 +4766,542 @@ if(flvjs.isSupported()){{
             "Connection: close\r\n"
             "\r\n"
         ) + body
+        client.sendall(response.encode())
+
+    # ========================================================================
+    # Timelapse Management
+    # ========================================================================
+
+    def _sanitize_filename(self, name: str) -> str:
+        """Sanitize filename to prevent path traversal attacks"""
+        # Remove any path components
+        name = os.path.basename(name)
+        # Remove any null bytes or other dangerous characters
+        name = name.replace('\x00', '').replace('..', '')
+        return name
+
+    def _get_timelapse_recordings(self):
+        """Scan timelapse directory and return list of recordings with metadata"""
+        recordings = []
+
+        if not os.path.isdir(TIMELAPSE_DIR):
+            return recordings
+
+        try:
+            files = os.listdir(TIMELAPSE_DIR)
+        except OSError:
+            return recordings
+
+        # Find all MP4 files
+        mp4_files = [f for f in files if f.lower().endswith('.mp4')]
+
+        for mp4 in mp4_files:
+            mp4_path = os.path.join(TIMELAPSE_DIR, mp4)
+            try:
+                stat_info = os.stat(mp4_path)
+                size = stat_info.st_size
+                mtime = stat_info.st_mtime
+            except OSError:
+                continue
+
+            # Extract base name (without .mp4)
+            base_name = mp4[:-4]
+
+            # Find matching thumbnail (pattern: {base_name}_{frame_count}.jpg)
+            thumbnail = None
+            frames = 0
+            for f in files:
+                if f.startswith(base_name + '_') and f.lower().endswith('.jpg'):
+                    # Extract frame count from filename
+                    try:
+                        frame_part = f[len(base_name)+1:-4]  # e.g., "126" from "name_126.jpg"
+                        frames = int(frame_part)
+                        thumbnail = f
+                        break
+                    except ValueError:
+                        continue
+
+            # Calculate duration (frames / FPS)
+            duration = frames / TIMELAPSE_FPS if frames > 0 else 0
+
+            recordings.append({
+                'name': base_name,
+                'mp4': mp4,
+                'thumbnail': thumbnail,
+                'size': size,
+                'frames': frames,
+                'duration': round(duration, 1),
+                'mtime': int(mtime)
+            })
+
+        return recordings
+
+    def _serve_timelapse_page(self, client):
+        """Serve the timelapse manager HTML page"""
+        html = '''<!DOCTYPE html>
+<html>
+<head>
+    <title>Time Lapse Recordings</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        * { box-sizing: border-box; }
+        body { font-family: sans-serif; margin: 0; padding: 20px; background: #1a1a1a; color: #fff; }
+        .container { max-width: 900px; margin: 0 auto; }
+        h1 { color: #4CAF50; margin-bottom: 20px; }
+        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; flex-wrap: wrap; gap: 10px; }
+        .header h1 { margin: 0; }
+        .controls { display: flex; gap: 10px; align-items: center; }
+        .summary { background: #2d2d2d; padding: 12px 15px; border-radius: 8px; margin-bottom: 15px; color: #888; }
+        .recording { background: #2d2d2d; padding: 15px; margin-bottom: 10px; border-radius: 8px; display: flex; gap: 15px; align-items: flex-start; }
+        .thumbnail { width: 160px; height: 90px; background: #111; border-radius: 4px; flex-shrink: 0; object-fit: cover; cursor: pointer; }
+        .thumbnail-placeholder { width: 160px; height: 90px; background: #333; border-radius: 4px; flex-shrink: 0; display: flex; align-items: center; justify-content: center; color: #666; font-size: 12px; }
+        .info { flex: 1; min-width: 0; }
+        .filename { font-weight: bold; color: #fff; margin-bottom: 8px; word-break: break-all; }
+        .meta { color: #888; font-size: 13px; margin-bottom: 10px; }
+        .meta span { margin-right: 15px; }
+        .actions { display: flex; gap: 8px; flex-wrap: wrap; }
+        button { background: #4CAF50; color: white; border: none; padding: 8px 16px; border-radius: 4px; cursor: pointer; font-size: 13px; display: inline-flex; align-items: center; gap: 5px; }
+        button:hover { background: #45a049; }
+        button.secondary { background: #555; }
+        button.secondary:hover { background: #666; }
+        button.danger { background: #f44336; }
+        button.danger:hover { background: #da190b; }
+        select { padding: 8px 12px; border-radius: 4px; border: 1px solid #555; background: #333; color: #fff; cursor: pointer; }
+        .empty { text-align: center; padding: 60px 20px; color: #666; }
+        .empty-icon { font-size: 48px; margin-bottom: 15px; }
+        .loading { text-align: center; padding: 60px 20px; color: #888; }
+        /* Modal */
+        .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.9); z-index: 1000; justify-content: center; align-items: center; }
+        .modal.active { display: flex; }
+        .modal-content { position: relative; max-width: 90%; max-height: 90%; }
+        .modal video { max-width: 100%; max-height: 80vh; border-radius: 8px; }
+        .modal-close { position: absolute; top: -40px; right: 0; background: none; border: none; color: #fff; font-size: 30px; cursor: pointer; padding: 5px 10px; }
+        .modal-close:hover { color: #f44; }
+        .modal-title { color: #fff; margin-bottom: 10px; font-size: 14px; text-align: center; word-break: break-all; }
+        /* Responsive */
+        @media (max-width: 600px) {
+            .recording { flex-direction: column; }
+            .thumbnail, .thumbnail-placeholder { width: 100%; height: auto; aspect-ratio: 16/9; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>Time Lapse Recordings</h1>
+            <div class="controls">
+                <select id="sort-select" onchange="sortRecordings()">
+                    <option value="date-desc">Newest first</option>
+                    <option value="date-asc">Oldest first</option>
+                    <option value="name-asc">Name (A-Z)</option>
+                    <option value="size-desc">Largest first</option>
+                </select>
+                <button onclick="loadRecordings()" class="secondary">Refresh</button>
+            </div>
+        </div>
+        <div class="summary" id="summary">Loading...</div>
+        <div id="recordings-list">
+            <div class="loading">Loading recordings...</div>
+        </div>
+    </div>
+
+    <!-- Video Preview Modal -->
+    <div class="modal" id="preview-modal" onclick="closePreview(event)">
+        <div class="modal-content" onclick="event.stopPropagation()">
+            <button class="modal-close" onclick="closePreview()">&times;</button>
+            <div class="modal-title" id="preview-title"></div>
+            <video id="preview-video" controls autoplay></video>
+        </div>
+    </div>
+
+    <script>
+        let recordings = [];
+
+        function formatSize(bytes) {
+            if (bytes < 1024) return bytes + ' B';
+            if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+            return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+        }
+
+        function formatDuration(seconds) {
+            const mins = Math.floor(seconds / 60);
+            const secs = Math.floor(seconds % 60);
+            return mins + ':' + secs.toString().padStart(2, '0');
+        }
+
+        function loadRecordings() {
+            fetch('/api/timelapse/list')
+                .then(r => r.json())
+                .then(data => {
+                    recordings = data.recordings || [];
+                    document.getElementById('summary').textContent =
+                        recordings.length + ' recording' + (recordings.length !== 1 ? 's' : '') +
+                        ', ' + formatSize(data.total_size || 0);
+                    sortRecordings();
+                })
+                .catch(err => {
+                    document.getElementById('summary').textContent = 'Error loading recordings';
+                    document.getElementById('recordings-list').innerHTML =
+                        '<div class="empty"><div class="empty-icon">&#9888;</div>Failed to load recordings</div>';
+                });
+        }
+
+        function sortRecordings() {
+            const sort = document.getElementById('sort-select').value;
+            const sorted = [...recordings];
+
+            switch (sort) {
+                case 'date-desc':
+                    sorted.sort((a, b) => b.mtime - a.mtime);
+                    break;
+                case 'date-asc':
+                    sorted.sort((a, b) => a.mtime - b.mtime);
+                    break;
+                case 'name-asc':
+                    sorted.sort((a, b) => a.name.localeCompare(b.name));
+                    break;
+                case 'size-desc':
+                    sorted.sort((a, b) => b.size - a.size);
+                    break;
+            }
+
+            renderRecordings(sorted);
+        }
+
+        function renderRecordings(list) {
+            const container = document.getElementById('recordings-list');
+
+            if (list.length === 0) {
+                container.innerHTML = '<div class="empty"><div class="empty-icon">&#128249;</div>No recordings found</div>';
+                return;
+            }
+
+            container.innerHTML = list.map(rec => `
+                <div class="recording" data-name="${escapeHtml(rec.name)}">
+                    ${rec.thumbnail
+                        ? `<img class="thumbnail" src="/api/timelapse/thumb/${encodeURIComponent(rec.thumbnail)}" alt="Thumbnail" onclick="previewVideo('${escapeJs(rec.mp4)}', '${escapeJs(rec.name)}')">`
+                        : '<div class="thumbnail-placeholder">No thumbnail</div>'
+                    }
+                    <div class="info">
+                        <div class="filename">${escapeHtml(rec.mp4)}</div>
+                        <div class="meta">
+                            <span>Duration: ${formatDuration(rec.duration)}</span>
+                            <span>Size: ${formatSize(rec.size)}</span>
+                            <span>Frames: ${rec.frames}</span>
+                        </div>
+                        <div class="actions">
+                            <button onclick="previewVideo('${escapeJs(rec.mp4)}', '${escapeJs(rec.name)}')">&#9658; Preview</button>
+                            <button class="secondary" onclick="downloadVideo('${escapeJs(rec.mp4)}')">&#11123; Download</button>
+                            <button class="danger" onclick="deleteRecording('${escapeJs(rec.name)}', '${escapeJs(rec.mp4)}')">&#128465; Delete</button>
+                        </div>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        function escapeHtml(str) {
+            return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+        }
+
+        function escapeJs(str) {
+            return str.replace(/\\\\/g, '\\\\\\\\').replace(/'/g, "\\\\'");
+        }
+
+        function previewVideo(mp4, name) {
+            const modal = document.getElementById('preview-modal');
+            const video = document.getElementById('preview-video');
+            const title = document.getElementById('preview-title');
+
+            title.textContent = mp4;
+            video.src = '/api/timelapse/video/' + encodeURIComponent(mp4);
+            modal.classList.add('active');
+            video.play();
+        }
+
+        function closePreview(event) {
+            if (event && event.target !== event.currentTarget) return;
+            const modal = document.getElementById('preview-modal');
+            const video = document.getElementById('preview-video');
+            video.pause();
+            video.src = '';
+            modal.classList.remove('active');
+        }
+
+        function downloadVideo(mp4) {
+            const a = document.createElement('a');
+            a.href = '/api/timelapse/video/' + encodeURIComponent(mp4);
+            a.download = mp4;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+        }
+
+        function deleteRecording(name, mp4) {
+            if (!confirm('Delete "' + mp4 + '"?\\n\\nThis cannot be undone.')) {
+                return;
+            }
+
+            fetch('/api/timelapse/delete/' + encodeURIComponent(name), {
+                method: 'DELETE'
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (data.success) {
+                    loadRecordings();
+                } else {
+                    alert('Delete failed: ' + (data.error || 'Unknown error'));
+                }
+            })
+            .catch(err => {
+                alert('Delete failed: ' + err.message);
+            });
+        }
+
+        // Handle Escape key to close modal
+        document.addEventListener('keydown', function(e) {
+            if (e.key === 'Escape') {
+                closePreview();
+            }
+        });
+
+        // Load recordings on page load
+        loadRecordings();
+    </script>
+</body>
+</html>'''
+
+        response = (
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/html\r\n"
+            f"Content-Length: {len(html)}\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        ) + html
+        client.sendall(response.encode())
+
+    def _serve_timelapse_list(self, client):
+        """Return JSON list of timelapse recordings"""
+        recordings = self._get_timelapse_recordings()
+        total_size = sum(r['size'] for r in recordings)
+
+        data = {
+            'recordings': recordings,
+            'total_size': total_size,
+            'count': len(recordings)
+        }
+
+        body = json.dumps(data)
+        response = (
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        ) + body
+        client.sendall(response.encode())
+
+    def _serve_timelapse_thumb(self, client, name: str):
+        """Serve thumbnail image"""
+        # Sanitize filename
+        name = self._sanitize_filename(name)
+        if not name or not name.lower().endswith('.jpg'):
+            self._serve_404(client)
+            return
+
+        file_path = os.path.join(TIMELAPSE_DIR, name)
+
+        # Security: ensure path is within TIMELAPSE_DIR
+        try:
+            real_path = os.path.realpath(file_path)
+            real_timelapse_dir = os.path.realpath(TIMELAPSE_DIR)
+            if not real_path.startswith(real_timelapse_dir + os.sep):
+                self._serve_404(client)
+                return
+        except OSError:
+            self._serve_404(client)
+            return
+
+        if not os.path.isfile(file_path):
+            self._serve_404(client)
+            return
+
+        try:
+            with open(file_path, 'rb') as f:
+                data = f.read()
+
+            response = (
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: image/jpeg\r\n"
+                f"Content-Length: {len(data)}\r\n"
+                "Cache-Control: max-age=3600\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+            )
+            client.sendall(response.encode() + data)
+        except OSError:
+            self._serve_404(client)
+
+    def _serve_timelapse_video(self, client, name: str, request: str):
+        """Serve MP4 video with range request support"""
+        # Sanitize filename
+        name = self._sanitize_filename(name)
+        if not name or not name.lower().endswith('.mp4'):
+            self._serve_404(client)
+            return
+
+        file_path = os.path.join(TIMELAPSE_DIR, name)
+
+        # Security: ensure path is within TIMELAPSE_DIR
+        try:
+            real_path = os.path.realpath(file_path)
+            real_timelapse_dir = os.path.realpath(TIMELAPSE_DIR)
+            if not real_path.startswith(real_timelapse_dir + os.sep):
+                self._serve_404(client)
+                return
+        except OSError:
+            self._serve_404(client)
+            return
+
+        if not os.path.isfile(file_path):
+            self._serve_404(client)
+            return
+
+        try:
+            file_size = os.path.getsize(file_path)
+        except OSError:
+            self._serve_404(client)
+            return
+
+        # Parse Range header for seeking support
+        range_start = 0
+        range_end = file_size - 1
+        is_range_request = False
+
+        for line in request.split('\r\n'):
+            if line.lower().startswith('range:'):
+                is_range_request = True
+                range_spec = line.split(':', 1)[1].strip()
+                if range_spec.startswith('bytes='):
+                    range_spec = range_spec[6:]
+                    parts = range_spec.split('-')
+                    if parts[0]:
+                        range_start = int(parts[0])
+                    if len(parts) > 1 and parts[1]:
+                        range_end = int(parts[1])
+                break
+
+        # Clamp range
+        range_start = max(0, min(range_start, file_size - 1))
+        range_end = max(range_start, min(range_end, file_size - 1))
+        content_length = range_end - range_start + 1
+
+        try:
+            with open(file_path, 'rb') as f:
+                if is_range_request:
+                    f.seek(range_start)
+                    data = f.read(content_length)
+                    response = (
+                        "HTTP/1.1 206 Partial Content\r\n"
+                        "Content-Type: video/mp4\r\n"
+                        f"Content-Length: {content_length}\r\n"
+                        f"Content-Range: bytes {range_start}-{range_end}/{file_size}\r\n"
+                        "Accept-Ranges: bytes\r\n"
+                        "Connection: close\r\n"
+                        "\r\n"
+                    )
+                else:
+                    data = f.read()
+                    response = (
+                        "HTTP/1.1 200 OK\r\n"
+                        "Content-Type: video/mp4\r\n"
+                        f"Content-Length: {file_size}\r\n"
+                        "Accept-Ranges: bytes\r\n"
+                        "Connection: close\r\n"
+                        "\r\n"
+                    )
+
+            client.sendall(response.encode() + data)
+        except OSError:
+            self._serve_404(client)
+
+    def _handle_timelapse_delete(self, client, name: str):
+        """Delete timelapse recording (MP4 and thumbnail)"""
+        # Sanitize filename
+        name = self._sanitize_filename(name)
+        if not name:
+            body = json.dumps({'success': False, 'error': 'Invalid filename'})
+            response = (
+                "HTTP/1.1 400 Bad Request\r\n"
+                "Content-Type: application/json\r\n"
+                f"Content-Length: {len(body)}\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+            ) + body
+            client.sendall(response.encode())
+            return
+
+        # Security check
+        mp4_path = os.path.join(TIMELAPSE_DIR, name + '.mp4')
+        try:
+            real_path = os.path.realpath(mp4_path)
+            real_timelapse_dir = os.path.realpath(TIMELAPSE_DIR)
+            if not real_path.startswith(real_timelapse_dir + os.sep):
+                body = json.dumps({'success': False, 'error': 'Invalid path'})
+                response = (
+                    "HTTP/1.1 403 Forbidden\r\n"
+                    "Content-Type: application/json\r\n"
+                    f"Content-Length: {len(body)}\r\n"
+                    "Connection: close\r\n"
+                    "\r\n"
+                ) + body
+                client.sendall(response.encode())
+                return
+        except OSError:
+            pass
+
+        deleted_files = []
+        errors = []
+
+        # Delete MP4
+        if os.path.isfile(mp4_path):
+            try:
+                os.unlink(mp4_path)
+                deleted_files.append(name + '.mp4')
+            except OSError as e:
+                errors.append(f"Failed to delete {name}.mp4: {e}")
+
+        # Find and delete thumbnail (pattern: {name}_{frames}.jpg)
+        try:
+            for f in os.listdir(TIMELAPSE_DIR):
+                if f.startswith(name + '_') and f.lower().endswith('.jpg'):
+                    thumb_path = os.path.join(TIMELAPSE_DIR, f)
+                    try:
+                        os.unlink(thumb_path)
+                        deleted_files.append(f)
+                    except OSError as e:
+                        errors.append(f"Failed to delete {f}: {e}")
+        except OSError:
+            pass
+
+        if deleted_files:
+            body = json.dumps({'success': True, 'deleted': deleted_files})
+            response = (
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: application/json\r\n"
+                f"Content-Length: {len(body)}\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+            ) + body
+        else:
+            body = json.dumps({'success': False, 'error': 'File not found'})
+            response = (
+                "HTTP/1.1 404 Not Found\r\n"
+                "Content-Type: application/json\r\n"
+                f"Content-Length: {len(body)}\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+            ) + body
+
         client.sendall(response.encode())
 
     def _redirect_to_streaming(self, client, path, port=None):
