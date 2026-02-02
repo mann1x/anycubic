@@ -143,7 +143,7 @@ void __stack_chk_fail(void) {
 #define VENC_CHN_JPEG      1       /* JPEG encoding channel (YUYV mode only) */
 #define VENC_CHN_ID        VENC_CHN_H264  /* Backward compatibility */
 
-#define V4L2_BUFFER_COUNT  4
+#define V4L2_BUFFER_COUNT  5       /* 5 buffers for smoother USB delivery */
 
 /* Control file for runtime configuration */
 #define CTRL_FILE          "/tmp/h264_ctrl"
