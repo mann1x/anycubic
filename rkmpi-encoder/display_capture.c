@@ -243,6 +243,77 @@ static int rga_convert_bgrx_to_nv12(void *src_bgrx, void *dst_nv12,
 }
 
 /*
+ * Flip 180° using RGA hardware (BGRX to BGRX)
+ */
+static int rga_flip_180(void *src_bgrx, void *dst_bgrx, int width, int height) {
+    rga_buffer_t src_buf, dst_buf;
+    IM_STATUS status;
+
+    src_buf = wrapbuffer_virtualaddr(src_bgrx, width, height, RK_FORMAT_BGRX_8888);
+    if (src_buf.width == 0) return -1;
+
+    dst_buf = wrapbuffer_virtualaddr(dst_bgrx, width, height, RK_FORMAT_BGRX_8888);
+    if (dst_buf.width == 0) return -1;
+
+    /* Flip horizontal + vertical = 180° rotation */
+    status = imflip(src_buf, dst_buf, IM_HAL_TRANSFORM_FLIP_H_V, 1);
+    if (status != IM_STATUS_SUCCESS) {
+        log_error("RGA flip failed: %s\n", imStrError(status));
+        return -1;
+    }
+
+    return 0;
+}
+
+/*
+ * Rotate 90° CW using RGA hardware (BGRX to BGRX)
+ * Output dimensions are swapped (height x width)
+ */
+static int rga_rotate_90(void *src_bgrx, void *dst_bgrx, int width, int height) {
+    rga_buffer_t src_buf, dst_buf;
+    IM_STATUS status;
+
+    src_buf = wrapbuffer_virtualaddr(src_bgrx, width, height, RK_FORMAT_BGRX_8888);
+    if (src_buf.width == 0) return -1;
+
+    /* Output is rotated: width becomes height */
+    dst_buf = wrapbuffer_virtualaddr(dst_bgrx, height, width, RK_FORMAT_BGRX_8888);
+    if (dst_buf.width == 0) return -1;
+
+    status = imrotate(src_buf, dst_buf, IM_HAL_TRANSFORM_ROT_90, 1);
+    if (status != IM_STATUS_SUCCESS) {
+        log_error("RGA rotate 90 failed: %s\n", imStrError(status));
+        return -1;
+    }
+
+    return 0;
+}
+
+/*
+ * Rotate 270° CW using RGA hardware (BGRX to BGRX)
+ * Output dimensions are swapped (height x width)
+ */
+static int rga_rotate_270(void *src_bgrx, void *dst_bgrx, int width, int height) {
+    rga_buffer_t src_buf, dst_buf;
+    IM_STATUS status;
+
+    src_buf = wrapbuffer_virtualaddr(src_bgrx, width, height, RK_FORMAT_BGRX_8888);
+    if (src_buf.width == 0) return -1;
+
+    /* Output is rotated: width becomes height */
+    dst_buf = wrapbuffer_virtualaddr(dst_bgrx, height, width, RK_FORMAT_BGRX_8888);
+    if (dst_buf.width == 0) return -1;
+
+    status = imrotate(src_buf, dst_buf, IM_HAL_TRANSFORM_ROT_270, 1);
+    if (status != IM_STATUS_SUCCESS) {
+        log_error("RGA rotate 270 failed: %s\n", imStrError(status));
+        return -1;
+    }
+
+    return 0;
+}
+
+/*
  * Initialize VENC for display JPEG encoding
  */
 static int init_display_venc(int width, int height, int fps, int quality) {
@@ -457,39 +528,55 @@ size_t display_capture_frame(DisplayCapture *ctx, uint8_t *jpeg_buf, size_t jpeg
     /* Copy framebuffer to cached DMA buffer first (fb mmap is slow/uncached) */
     memcpy(g_display_src_vaddr, ctx->fb_pixels, ctx->fb_size);
 
-    /* Apply CPU rotation if needed, reading from cached source buffer */
+    /* Flush source buffer cache so RGA can see it */
+    RK_MPI_MMZ_FlushCacheStart(g_display_src_mb, 0, ctx->fb_size, RK_MMZ_SYNC_WRITEONLY);
+    RK_MPI_MMZ_FlushCacheEnd(g_display_src_mb, 0, ctx->fb_size, RK_MMZ_SYNC_WRITEONLY);
+
+    /* Apply rotation using RGA hardware, with CPU fallback */
     if (ctx->orientation == DISPLAY_ORIENT_FLIP_180) {
-        rotate_bgrx_180((uint32_t *)g_display_src_vaddr, (uint32_t *)g_display_rot_vaddr, ctx->fb_width, ctx->fb_height);
-        rga_src = g_display_rot_vaddr;
         rga_width = ctx->fb_width;
         rga_height = ctx->fb_height;
-        /* Flush rotation buffer cache so RGA can see it */
-        RK_MPI_MMZ_FlushCacheStart(g_display_rot_mb, 0, ctx->fb_size, RK_MMZ_SYNC_WRITEONLY);
-        RK_MPI_MMZ_FlushCacheEnd(g_display_rot_mb, 0, ctx->fb_size, RK_MMZ_SYNC_WRITEONLY);
+        /* Try RGA flip first */
+        if (rga_flip_180(g_display_src_vaddr, g_display_rot_vaddr, ctx->fb_width, ctx->fb_height) == 0) {
+            rga_src = g_display_rot_vaddr;
+        } else {
+            /* CPU fallback */
+            rotate_bgrx_180((uint32_t *)g_display_src_vaddr, (uint32_t *)g_display_rot_vaddr, ctx->fb_width, ctx->fb_height);
+            rga_src = g_display_rot_vaddr;
+            RK_MPI_MMZ_FlushCacheStart(g_display_rot_mb, 0, ctx->fb_size, RK_MMZ_SYNC_WRITEONLY);
+            RK_MPI_MMZ_FlushCacheEnd(g_display_rot_mb, 0, ctx->fb_size, RK_MMZ_SYNC_WRITEONLY);
+        }
     } else if (ctx->orientation == DISPLAY_ORIENT_ROTATE_90) {
-        rotate_bgrx_90((uint32_t *)g_display_src_vaddr, (uint32_t *)g_display_rot_vaddr, ctx->fb_width, ctx->fb_height);
-        rga_src = g_display_rot_vaddr;
         rga_width = ctx->fb_height;  /* Swapped */
         rga_height = ctx->fb_width;
-        /* Flush rotation buffer cache so RGA can see it */
-        RK_MPI_MMZ_FlushCacheStart(g_display_rot_mb, 0, ctx->fb_size, RK_MMZ_SYNC_WRITEONLY);
-        RK_MPI_MMZ_FlushCacheEnd(g_display_rot_mb, 0, ctx->fb_size, RK_MMZ_SYNC_WRITEONLY);
+        /* Try RGA rotate first */
+        if (rga_rotate_90(g_display_src_vaddr, g_display_rot_vaddr, ctx->fb_width, ctx->fb_height) == 0) {
+            rga_src = g_display_rot_vaddr;
+        } else {
+            /* CPU fallback */
+            rotate_bgrx_90((uint32_t *)g_display_src_vaddr, (uint32_t *)g_display_rot_vaddr, ctx->fb_width, ctx->fb_height);
+            rga_src = g_display_rot_vaddr;
+            RK_MPI_MMZ_FlushCacheStart(g_display_rot_mb, 0, ctx->fb_size, RK_MMZ_SYNC_WRITEONLY);
+            RK_MPI_MMZ_FlushCacheEnd(g_display_rot_mb, 0, ctx->fb_size, RK_MMZ_SYNC_WRITEONLY);
+        }
     } else if (ctx->orientation == DISPLAY_ORIENT_ROTATE_270) {
-        rotate_bgrx_270((uint32_t *)g_display_src_vaddr, (uint32_t *)g_display_rot_vaddr, ctx->fb_width, ctx->fb_height);
-        rga_src = g_display_rot_vaddr;
         rga_width = ctx->fb_height;  /* Swapped */
         rga_height = ctx->fb_width;
-        /* Flush rotation buffer cache so RGA can see it */
-        RK_MPI_MMZ_FlushCacheStart(g_display_rot_mb, 0, ctx->fb_size, RK_MMZ_SYNC_WRITEONLY);
-        RK_MPI_MMZ_FlushCacheEnd(g_display_rot_mb, 0, ctx->fb_size, RK_MMZ_SYNC_WRITEONLY);
+        /* Try RGA rotate first */
+        if (rga_rotate_270(g_display_src_vaddr, g_display_rot_vaddr, ctx->fb_width, ctx->fb_height) == 0) {
+            rga_src = g_display_rot_vaddr;
+        } else {
+            /* CPU fallback */
+            rotate_bgrx_270((uint32_t *)g_display_src_vaddr, (uint32_t *)g_display_rot_vaddr, ctx->fb_width, ctx->fb_height);
+            rga_src = g_display_rot_vaddr;
+            RK_MPI_MMZ_FlushCacheStart(g_display_rot_mb, 0, ctx->fb_size, RK_MMZ_SYNC_WRITEONLY);
+            RK_MPI_MMZ_FlushCacheEnd(g_display_rot_mb, 0, ctx->fb_size, RK_MMZ_SYNC_WRITEONLY);
+        }
     } else {
         /* No rotation needed, use source buffer directly */
         rga_src = g_display_src_vaddr;
         rga_width = ctx->fb_width;
         rga_height = ctx->fb_height;
-        /* Flush source buffer cache so RGA can see it */
-        RK_MPI_MMZ_FlushCacheStart(g_display_src_mb, 0, ctx->fb_size, RK_MMZ_SYNC_WRITEONLY);
-        RK_MPI_MMZ_FlushCacheEnd(g_display_src_mb, 0, ctx->fb_size, RK_MMZ_SYNC_WRITEONLY);
     }
 
     /* RGA color conversion (BGRX to NV12) */
