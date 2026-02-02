@@ -114,6 +114,61 @@ Recordings are stored at `/useremain/app/gk/Time-lapse-Video/` on the printer.
 | Video | `{gcode_name}_{sequence}.mp4` |
 | Thumbnail | `{gcode_name}_{sequence}_{frames}.jpg` |
 
+## Advanced Timelapse
+
+Independent timelapse recording via Moonraker integration, inspired by [moonraker-timelapse](https://github.com/mainsail-crew/moonraker-timelapse).
+
+### Features
+
+- **Independent Recording** - Records regardless of slicer timelapse settings
+- **Layer Mode** - Capture frame on each layer change
+- **Hyperlapse Mode** - Capture frames at fixed time intervals
+- **Moonraker Integration** - Monitors print status via WebSocket
+- **USB Storage** - Optional storage to USB drive
+- **Configurable Output** - FPS, quality, variable FPS, flip options
+
+### Configuration
+
+Enable in the Timelapse Settings panel on the control page:
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `timelapse_enabled` | false | Enable advanced timelapse |
+| `timelapse_mode` | layer | `layer` or `hyperlapse` |
+| `timelapse_hyperlapse_interval` | 30 | Seconds between captures (hyperlapse) |
+| `timelapse_storage` | internal | `internal` or `usb` |
+| `moonraker_host` | 127.0.0.1 | Moonraker server IP |
+| `moonraker_port` | 7125 | Moonraker server port |
+| `timelapse_output_fps` | 30 | Video playback framerate |
+| `timelapse_variable_fps` | false | Auto-adjust FPS for target length |
+| `timelapse_target_length` | 10 | Target video length (seconds) |
+| `timelapse_crf` | 23 | H.264 quality (0=best, 51=worst) |
+| `timelapse_flip_x` | false | Horizontal flip |
+| `timelapse_flip_y` | false | Vertical flip |
+
+### API Endpoints
+
+| Endpoint | Description |
+|----------|-------------|
+| `/api/timelapse/settings` | POST to save timelapse settings |
+| `/api/timelapse/storage` | GET USB/internal storage status |
+| `/api/timelapse/moonraker` | GET Moonraker connection status |
+
+### How It Works
+
+1. Enable timelapse in control panel settings
+2. Start a print - timelapse automatically begins
+3. In layer mode: captures on each `print_stats.info.current_layer` change
+4. In hyperlapse mode: captures at configured interval
+5. On print complete: assembles frames into MP4 with thumbnail
+6. On print cancel: discards temporary frames
+
+### Notes
+
+- When advanced timelapse is enabled, Anycubic slicer timelapse commands are ignored
+- USB storage requires a mounted USB drive at `/mnt/udisk`
+- Requires rkmpi encoder mode (not gkcam)
+
 ## Configuration
 
 Settings are stored in `app.json`:

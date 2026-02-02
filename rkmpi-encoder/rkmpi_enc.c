@@ -410,9 +410,12 @@ static void read_ctrl_file(void) {
     FILE *f = fopen(CTRL_FILE, "r");
     if (!f) return;
 
-    char line[64];
+    char line[512];  /* Larger buffer for timelapse commands with paths */
     while (fgets(line, sizeof(line), f)) {
         int val;
+        /* Remove trailing newline */
+        line[strcspn(line, "\n")] = 0;
+
         if (sscanf(line, "h264=%d", &val) == 1) {
             if (val != g_ctrl.h264_enabled) {
                 g_ctrl.h264_enabled = val;
@@ -437,6 +440,45 @@ static void read_ctrl_file(void) {
             display_set_enabled(val);
         } else if (sscanf(line, "display_fps=%d", &val) == 1) {
             display_set_fps(val);
+        }
+        /* Timelapse commands */
+        else if (strncmp(line, "timelapse_init:", 15) == 0) {
+            /* Format: timelapse_init:<gcode_name>:<output_path> */
+            char *args = line + 15;
+            char *colon = strchr(args, ':');
+            if (colon) {
+                *colon = '\0';
+                const char *gcode_name = args;
+                const char *output_path = colon + 1;
+                timelapse_init(gcode_name, output_path);
+            }
+        } else if (strcmp(line, "timelapse_capture") == 0) {
+            timelapse_capture_frame();
+        } else if (strcmp(line, "timelapse_finalize") == 0) {
+            timelapse_finalize();
+        } else if (strcmp(line, "timelapse_cancel") == 0) {
+            timelapse_cancel();
+        } else if (sscanf(line, "timelapse_fps:%d", &val) == 1) {
+            timelapse_set_fps(val);
+        } else if (sscanf(line, "timelapse_crf:%d", &val) == 1) {
+            timelapse_set_crf(val);
+        } else if (strncmp(line, "timelapse_variable_fps:", 23) == 0) {
+            /* Format: timelapse_variable_fps:<min>:<max>:<target_length> */
+            int min_fps, max_fps, target_len;
+            if (sscanf(line + 23, "%d:%d:%d", &min_fps, &max_fps, &target_len) == 3) {
+                timelapse_set_variable_fps(min_fps, max_fps, target_len);
+            }
+        } else if (sscanf(line, "timelapse_duplicate_last:%d", &val) == 1) {
+            timelapse_set_duplicate_last(val);
+        } else if (strncmp(line, "timelapse_flip:", 15) == 0) {
+            /* Format: timelapse_flip:<x>:<y> */
+            int flip_x, flip_y;
+            if (sscanf(line + 15, "%d:%d", &flip_x, &flip_y) == 2) {
+                timelapse_set_flip(flip_x, flip_y);
+            }
+        } else if (sscanf(line, "timelapse_custom_mode:%d", &val) == 1) {
+            /* Enable/disable custom timelapse mode (ignores Anycubic RPC timelapse) */
+            timelapse_set_custom_mode(val);
         }
     }
     fclose(f);

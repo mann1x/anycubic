@@ -724,6 +724,102 @@ The RPC client monitors `print_stats.state` in status updates:
 
 ---
 
+## Advanced Timelapse (Moonraker Integration)
+
+**Status:** ✅ **Fully supported** - Independent timelapse recording via Moonraker WebSocket API, inspired by [moonraker-timelapse](https://github.com/mainsail-crew/moonraker-timelapse).
+
+### Overview
+
+When enabled, this mode captures timelapse frames independently of the Anycubic slicer's timelapse settings. It monitors print progress via Moonraker's WebSocket API and captures frames on layer changes or at fixed time intervals.
+
+### Features
+
+- **Layer Mode** - Capture frame on each layer change (`print_stats.info.current_layer`)
+- **Hyperlapse Mode** - Capture frames at configurable time intervals
+- **Variable FPS** - Auto-calculate output FPS based on frame count and target video length
+- **USB Storage** - Optional storage to USB drive at `/mnt/udisk`
+- **Custom Mode Override** - When enabled, Anycubic RPC timelapse commands are ignored
+
+### Configuration Settings
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `timelapse_enabled` | false | Enable advanced timelapse |
+| `timelapse_mode` | layer | `layer` or `hyperlapse` |
+| `timelapse_hyperlapse_interval` | 30 | Seconds between captures (hyperlapse mode) |
+| `timelapse_storage` | internal | `internal` or `usb` |
+| `moonraker_host` | 127.0.0.1 | Moonraker server IP |
+| `moonraker_port` | 7125 | Moonraker WebSocket port |
+| `timelapse_output_fps` | 30 | Video playback framerate |
+| `timelapse_variable_fps` | false | Auto-adjust FPS for target length |
+| `timelapse_target_length` | 10 | Target video length in seconds |
+| `timelapse_crf` | 23 | H.264 quality (0=best, 51=worst) |
+| `timelapse_flip_x` | false | Horizontal flip |
+| `timelapse_flip_y` | false | Vertical flip |
+
+### API Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/timelapse/settings` | POST | Save timelapse configuration |
+| `/api/timelapse/storage` | GET | Check USB/internal storage status |
+| `/api/timelapse/moonraker` | GET | Check Moonraker connection status |
+
+### How It Works
+
+1. **Enable** timelapse in control panel settings
+2. **Print start**: MoonrakerClient detects `print_stats.state == "printing"`
+3. **Frame capture**:
+   - Layer mode: On `print_stats.info.current_layer` change
+   - Hyperlapse: At configured interval (timer thread)
+4. **Print complete**: Sends `timelapse_finalize` command to encoder
+5. **Video assembly**: ffmpeg assembles frames with configured FPS, CRF, and flip settings
+6. **Print cancel**: Sends `timelapse_cancel` to discard temporary frames
+
+### MoonrakerClient Implementation
+
+The `MoonrakerClient` class (`h264_server.py`) provides:
+- **WebSocket connection** to Moonraker (pure Python, no external dependencies)
+- **JSON-RPC 2.0** message handling
+- **Subscription** to `print_stats` object for state monitoring
+- **Automatic reconnection** on connection loss
+
+### Control File Commands
+
+h264_server.py communicates with rkmpi_enc via the control file:
+
+| Command | Description |
+|---------|-------------|
+| `timelapse_init:<gcode>:<output_dir>` | Initialize custom timelapse |
+| `timelapse_capture` | Capture single frame |
+| `timelapse_finalize` | Assemble video from frames |
+| `timelapse_cancel` | Discard frames, cleanup |
+| `timelapse_fps:<n>` | Set output FPS |
+| `timelapse_crf:<n>` | Set H.264 quality |
+| `timelapse_variable_fps:<0\|1>:<min>:<max>:<target>:<dup>` | Configure variable FPS |
+| `timelapse_flip:<flip_x>:<flip_y>` | Set flip options |
+| `timelapse_output_dir:<path>` | Set output directory |
+| `timelapse_custom_mode:<0\|1>` | Enable/disable custom mode (ignores RPC commands) |
+
+### Custom Mode Flag
+
+When `timelapse_custom_mode:1` is sent to the encoder:
+- `openDelayCamera` RPC commands are acknowledged but ignored
+- `startLanCapture` RPC commands are acknowledged but do not capture frames
+- Print completion detection via RPC is disabled
+- h264_server.py handles all timelapse logic via Moonraker
+
+This allows the advanced timelapse to operate independently without interference from the Anycubic slicer's built-in timelapse commands.
+
+### Notes
+
+- Requires rkmpi encoder mode (not gkcam) for frame capture
+- USB storage requires a mounted USB drive at `/mnt/udisk`
+- Variable FPS calculates: `fps = max(min_fps, min(max_fps, frames / target_length))`
+- Flip options use ffmpeg video filters: `hflip`, `vflip`, or `hflip,vflip`
+
+---
+
 ## Timelapse Management UI
 
 **Status:** ✅ **Fully supported** - Web interface for browsing, previewing, downloading, and deleting timelapse recordings.

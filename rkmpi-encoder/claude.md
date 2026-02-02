@@ -361,6 +361,100 @@ export LD_LIBRARY_PATH=/oem/usr/lib:$LD_LIBRARY_PATH
 - This directory: `/shared/dev/anycubic/rkmpi-encoder/`
 - Cross-toolchain: `/shared/dev/rv1106-toolchain/`
 
+## Timelapse Recording
+
+The encoder includes built-in timelapse recording with frame capture and MP4 assembly.
+
+### Timelapse Modes
+
+**RPC Mode (Legacy)**
+- Triggered by Anycubic firmware RPC commands
+- `openDelayCamera` initializes timelapse with gcode filepath
+- `startLanCapture` captures each frame
+- Print completion detected via `print_stats.state` in RPC status
+
+**Custom Mode (Advanced)**
+- Triggered by h264_server.py via Moonraker integration
+- Timelapse commands received via control file
+- Ignores Anycubic RPC timelapse commands when active
+- Supports configurable FPS, CRF, variable FPS, and flip options
+
+### Control File Commands
+
+The encoder reads commands from a control file (default: `/tmp/rkmpi.ctrl`):
+
+| Command | Description |
+|---------|-------------|
+| `timelapse_init:<gcode>:<output_dir>` | Initialize custom timelapse |
+| `timelapse_capture` | Capture single JPEG frame |
+| `timelapse_finalize` | Assemble frames into MP4 |
+| `timelapse_cancel` | Discard frames and cleanup |
+| `timelapse_fps:<n>` | Set output FPS (1-60) |
+| `timelapse_crf:<n>` | Set H.264 quality (0-51) |
+| `timelapse_variable_fps:<0\|1>:<min>:<max>:<target>:<dup>` | Configure variable FPS |
+| `timelapse_flip:<flip_x>:<flip_y>` | Set flip options (0 or 1) |
+| `timelapse_output_dir:<path>` | Set output directory |
+| `timelapse_custom_mode:<0\|1>` | Enable/disable custom mode |
+
+### Timelapse Configuration (timelapse.h)
+
+```c
+typedef struct {
+    int output_fps;           // Video playback FPS (default: 10)
+    int crf;                  // H.264 quality 0-51 (default: 23)
+    int variable_fps;         // Auto-calculate FPS (default: 0)
+    int target_length;        // Target video length in seconds
+    int variable_fps_min;     // Minimum FPS for variable mode
+    int variable_fps_max;     // Maximum FPS for variable mode
+    int duplicate_last_frame; // Duplicate count for last frame
+    int flip_x;               // Horizontal flip (default: 0)
+    int flip_y;               // Vertical flip (default: 0)
+    char output_dir[256];     // Output directory path
+} TimelapseConfig;
+```
+
+### Variable FPS Calculation
+
+When `variable_fps` is enabled, output FPS is calculated as:
+```
+fps = max(min_fps, min(max_fps, frame_count / target_length))
+```
+
+This ensures short prints don't have overly long videos and long prints don't exceed frame rate limits.
+
+### Video Assembly (ffmpeg)
+
+The `timelapse_finalize()` function assembles frames using ffmpeg:
+
+```bash
+ffmpeg -y -framerate <fps> -i frames/%06d.jpg \
+    [-vf "hflip,vflip"] \
+    -c:v libx264 -crf <crf> -pix_fmt yuv420p \
+    output.mp4
+```
+
+Flip filters are applied based on configuration:
+- `flip_x=1, flip_y=0` → `-vf hflip`
+- `flip_x=0, flip_y=1` → `-vf vflip`
+- `flip_x=1, flip_y=1` → `-vf hflip,vflip`
+
+### Output Files
+
+- **Frames**: `/tmp/timelapse-{gcode}/frames/000001.jpg`, etc.
+- **Video**: `{output_dir}/{gcode}_NN.mp4`
+- **Thumbnail**: `{output_dir}/{gcode}_NN_{frames}.jpg` (last frame)
+
+Default output directory: `/useremain/app/gk/Time-lapse-Video/`
+
+### Implementation Files
+
+- `timelapse.h` - Configuration struct and function prototypes
+- `timelapse.c` - Frame capture, finalization, variable FPS calculation
+- `rpc_client.c` - RPC command handlers (legacy mode)
+- `rkmpi_enc.c` - Control file parsing for custom mode
+
+---
+
 ## Troubleshooting
 
 ### "cannot open shared object file"

@@ -1522,6 +1522,407 @@ class CPUMonitor:
 
 
 # ============================================================================
+# Moonraker WebSocket Client for Timelapse
+# ============================================================================
+
+class MoonrakerClient:
+    """WebSocket client for Moonraker to monitor print status and trigger timelapse.
+
+    Connects to Moonraker's WebSocket API and subscribes to print_stats to detect:
+    - Print start (state: printing)
+    - Layer changes (print_stats.info.current_layer)
+    - Print complete (state: complete)
+    - Print cancel (state: cancelled/error)
+
+    Uses a simple WebSocket implementation with standard library to avoid
+    dependencies that may not be available on the printer.
+    """
+
+    def __init__(self, host='127.0.0.1', port=7125):
+        self.host = host
+        self.port = port
+        self.sock = None
+        self.connected = False
+        self.running = False
+        self.thread = None
+        self.lock = threading.Lock()
+
+        # Print state tracking
+        self.print_state = 'standby'  # standby, printing, paused, complete, cancelled, error
+        self.current_layer = 0
+        self.total_layers = 0
+        self.filename = None
+        self.print_duration = 0
+
+        # JSON-RPC request ID counter
+        self.request_id = 1
+
+        # Callbacks
+        self.on_print_start = None      # callback(filename)
+        self.on_layer_change = None     # callback(layer, total_layers)
+        self.on_print_complete = None   # callback(filename)
+        self.on_print_cancel = None     # callback(filename, reason)
+        self.on_connect = None          # callback()
+        self.on_disconnect = None       # callback(reason)
+
+        # Reconnect settings
+        self.reconnect_delay = 5  # seconds between reconnect attempts
+        self.max_reconnect_attempts = 0  # 0 = unlimited
+
+    def _ws_handshake(self):
+        """Perform WebSocket handshake"""
+        import hashlib
+        import base64
+
+        # Generate random key
+        key = base64.b64encode(os.urandom(16)).decode('utf-8')
+
+        # Send HTTP upgrade request
+        request = (
+            f"GET /websocket HTTP/1.1\r\n"
+            f"Host: {self.host}:{self.port}\r\n"
+            f"Upgrade: websocket\r\n"
+            f"Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\n"
+            f"Sec-WebSocket-Version: 13\r\n"
+            f"\r\n"
+        )
+        self.sock.sendall(request.encode('utf-8'))
+
+        # Read response
+        response = b''
+        while b'\r\n\r\n' not in response:
+            chunk = self.sock.recv(1024)
+            if not chunk:
+                raise ConnectionError("Connection closed during handshake")
+            response += chunk
+
+        # Verify response
+        response_str = response.decode('utf-8', errors='ignore')
+        if '101' not in response_str:
+            raise ConnectionError(f"WebSocket handshake failed: {response_str[:100]}")
+
+        return True
+
+    def _ws_send(self, data):
+        """Send a WebSocket text frame"""
+        payload = data.encode('utf-8')
+        length = len(payload)
+
+        # Build frame header
+        frame = bytearray()
+        frame.append(0x81)  # Text frame, FIN=1
+
+        # Mask bit must be set for client-to-server frames
+        if length < 126:
+            frame.append(0x80 | length)
+        elif length < 65536:
+            frame.append(0x80 | 126)
+            frame.extend(struct.pack('>H', length))
+        else:
+            frame.append(0x80 | 127)
+            frame.extend(struct.pack('>Q', length))
+
+        # Generate masking key and mask payload
+        mask = os.urandom(4)
+        frame.extend(mask)
+
+        masked = bytearray(length)
+        for i in range(length):
+            masked[i] = payload[i] ^ mask[i % 4]
+        frame.extend(masked)
+
+        self.sock.sendall(bytes(frame))
+
+    def _ws_recv(self, timeout=None):
+        """Receive a WebSocket frame, returns (opcode, payload) or (None, None) on timeout"""
+        if timeout:
+            self.sock.settimeout(timeout)
+        else:
+            self.sock.settimeout(None)
+
+        try:
+            # Read frame header
+            header = self.sock.recv(2)
+            if len(header) < 2:
+                return (None, None)
+
+            opcode = header[0] & 0x0F
+            masked = (header[1] & 0x80) != 0
+            length = header[1] & 0x7F
+
+            # Extended length
+            if length == 126:
+                ext = self.sock.recv(2)
+                length = struct.unpack('>H', ext)[0]
+            elif length == 127:
+                ext = self.sock.recv(8)
+                length = struct.unpack('>Q', ext)[0]
+
+            # Masking key (server frames typically not masked, but handle it)
+            mask = None
+            if masked:
+                mask = self.sock.recv(4)
+
+            # Read payload
+            payload = b''
+            while len(payload) < length:
+                chunk = self.sock.recv(min(4096, length - len(payload)))
+                if not chunk:
+                    break
+                payload += chunk
+
+            # Unmask if needed
+            if mask:
+                unmasked = bytearray(len(payload))
+                for i in range(len(payload)):
+                    unmasked[i] = payload[i] ^ mask[i % 4]
+                payload = bytes(unmasked)
+
+            return (opcode, payload)
+
+        except socket.timeout:
+            return (None, None)
+
+    def _send_jsonrpc(self, method, params=None):
+        """Send a JSON-RPC 2.0 request"""
+        with self.lock:
+            req_id = self.request_id
+            self.request_id += 1
+
+        request = {
+            "jsonrpc": "2.0",
+            "method": method,
+            "id": req_id
+        }
+        if params is not None:
+            request["params"] = params
+
+        self._ws_send(json.dumps(request))
+        return req_id
+
+    def _subscribe_print_stats(self):
+        """Subscribe to print_stats object updates"""
+        # Subscribe to print_stats with all fields
+        self._send_jsonrpc("printer.objects.subscribe", {
+            "objects": {
+                "print_stats": None  # None = all fields
+            }
+        })
+
+    def _handle_status_update(self, data):
+        """Handle notify_status_update notifications from Moonraker"""
+        if 'print_stats' not in data:
+            return
+
+        stats = data['print_stats']
+        old_state = self.print_state
+        old_layer = self.current_layer
+
+        # Update state
+        if 'state' in stats:
+            self.print_state = stats['state']
+
+        if 'filename' in stats:
+            self.filename = stats['filename']
+
+        if 'print_duration' in stats:
+            self.print_duration = stats['print_duration']
+
+        # Layer info is nested in 'info' dict
+        if 'info' in stats and stats['info']:
+            info = stats['info']
+            if 'current_layer' in info:
+                self.current_layer = info['current_layer'] or 0
+            if 'total_layer' in info:
+                self.total_layers = info['total_layer'] or 0
+
+        # Trigger callbacks based on state changes
+        if old_state != 'printing' and self.print_state == 'printing':
+            # Print started
+            if self.on_print_start:
+                try:
+                    self.on_print_start(self.filename)
+                except Exception as e:
+                    print(f"MoonrakerClient: on_print_start callback error: {e}", flush=True)
+
+        elif self.print_state == 'printing' and self.current_layer != old_layer:
+            # Layer changed
+            if self.on_layer_change:
+                try:
+                    self.on_layer_change(self.current_layer, self.total_layers)
+                except Exception as e:
+                    print(f"MoonrakerClient: on_layer_change callback error: {e}", flush=True)
+
+        elif old_state == 'printing' and self.print_state == 'complete':
+            # Print completed
+            if self.on_print_complete:
+                try:
+                    self.on_print_complete(self.filename)
+                except Exception as e:
+                    print(f"MoonrakerClient: on_print_complete callback error: {e}", flush=True)
+
+        elif old_state == 'printing' and self.print_state in ('cancelled', 'error'):
+            # Print cancelled or errored
+            if self.on_print_cancel:
+                try:
+                    self.on_print_cancel(self.filename, self.print_state)
+                except Exception as e:
+                    print(f"MoonrakerClient: on_print_cancel callback error: {e}", flush=True)
+
+    def _run_loop(self):
+        """Main WebSocket receive loop"""
+        reconnect_attempts = 0
+
+        while self.running:
+            try:
+                # Connect
+                self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self.sock.settimeout(10)
+                self.sock.connect((self.host, self.port))
+
+                # WebSocket handshake
+                self._ws_handshake()
+                self.connected = True
+                reconnect_attempts = 0
+                print(f"MoonrakerClient: Connected to ws://{self.host}:{self.port}/websocket", flush=True)
+
+                if self.on_connect:
+                    try:
+                        self.on_connect()
+                    except Exception:
+                        pass
+
+                # Subscribe to print_stats
+                self._subscribe_print_stats()
+
+                # Receive loop
+                while self.running and self.connected:
+                    opcode, payload = self._ws_recv(timeout=30)
+
+                    if opcode is None:
+                        # Timeout - send ping
+                        continue
+
+                    if opcode == 0x08:
+                        # Close frame
+                        print("MoonrakerClient: Server closed connection", flush=True)
+                        break
+
+                    if opcode == 0x09:
+                        # Ping - send pong
+                        self._ws_send_pong(payload)
+                        continue
+
+                    if opcode == 0x01:
+                        # Text frame
+                        try:
+                            msg = json.loads(payload.decode('utf-8'))
+
+                            # Handle JSON-RPC notifications
+                            if msg.get('method') == 'notify_status_update':
+                                params = msg.get('params', [])
+                                if params:
+                                    self._handle_status_update(params[0])
+
+                            # Handle subscription response with initial state
+                            elif 'result' in msg and 'status' in msg.get('result', {}):
+                                status = msg['result']['status']
+                                self._handle_status_update(status)
+
+                        except json.JSONDecodeError:
+                            pass
+
+            except Exception as e:
+                print(f"MoonrakerClient: Connection error: {e}", flush=True)
+
+            finally:
+                self.connected = False
+                if self.sock:
+                    try:
+                        self.sock.close()
+                    except Exception:
+                        pass
+                    self.sock = None
+
+                if self.on_disconnect:
+                    try:
+                        self.on_disconnect(str(e) if 'e' in dir() else "Unknown")
+                    except Exception:
+                        pass
+
+            # Reconnect if still running
+            if self.running:
+                reconnect_attempts += 1
+                if self.max_reconnect_attempts > 0 and reconnect_attempts >= self.max_reconnect_attempts:
+                    print(f"MoonrakerClient: Max reconnect attempts reached, stopping", flush=True)
+                    break
+
+                print(f"MoonrakerClient: Reconnecting in {self.reconnect_delay}s (attempt {reconnect_attempts})...", flush=True)
+                time.sleep(self.reconnect_delay)
+
+    def _ws_send_pong(self, payload):
+        """Send a WebSocket pong frame"""
+        length = len(payload)
+        frame = bytearray()
+        frame.append(0x8A)  # Pong frame, FIN=1
+
+        if length < 126:
+            frame.append(0x80 | length)
+        else:
+            frame.append(0x80 | 126)
+            frame.extend(struct.pack('>H', length))
+
+        mask = os.urandom(4)
+        frame.extend(mask)
+
+        masked = bytearray(length)
+        for i in range(length):
+            masked[i] = payload[i] ^ mask[i % 4]
+        frame.extend(masked)
+
+        self.sock.sendall(bytes(frame))
+
+    def start(self):
+        """Start the WebSocket client in a background thread"""
+        if self.running:
+            return
+
+        self.running = True
+        self.thread = threading.Thread(target=self._run_loop, daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        """Stop the WebSocket client"""
+        self.running = False
+        self.connected = False
+
+        if self.sock:
+            try:
+                self.sock.close()
+            except Exception:
+                pass
+
+        if self.thread:
+            self.thread.join(timeout=2)
+            self.thread = None
+
+    def is_connected(self):
+        """Check if connected to Moonraker"""
+        return self.connected
+
+    def get_print_state(self):
+        """Get current print state info"""
+        return {
+            'state': self.print_state,
+            'filename': self.filename,
+            'current_layer': self.current_layer,
+            'total_layers': self.total_layers,
+            'print_duration': self.print_duration
+        }
+
+
+# ============================================================================
 # FLV Muxer for H.264 stream
 # ============================================================================
 
@@ -2371,6 +2772,32 @@ class StreamerApp:
         self.display_enabled = getattr(args, 'display_enabled', False)
         self.display_fps = getattr(args, 'display_fps', 5)
 
+        # Advanced timelapse settings (Moonraker integration)
+        self.timelapse_enabled = getattr(args, 'timelapse_enabled', False)
+        self.timelapse_mode = getattr(args, 'timelapse_mode', 'layer')  # 'layer' or 'hyperlapse'
+        self.timelapse_hyperlapse_interval = getattr(args, 'timelapse_hyperlapse_interval', 30)
+        self.timelapse_storage = getattr(args, 'timelapse_storage', 'internal')  # 'internal' or 'usb'
+        self.timelapse_usb_path = getattr(args, 'timelapse_usb_path', '/mnt/udisk/timelapse')
+        self.moonraker_host = getattr(args, 'moonraker_host', '127.0.0.1')
+        self.moonraker_port = getattr(args, 'moonraker_port', 7125)
+        self.timelapse_output_fps = getattr(args, 'timelapse_output_fps', 30)
+        self.timelapse_variable_fps = getattr(args, 'timelapse_variable_fps', False)
+        self.timelapse_target_length = getattr(args, 'timelapse_target_length', 10)
+        self.timelapse_variable_fps_min = getattr(args, 'timelapse_variable_fps_min', 5)
+        self.timelapse_variable_fps_max = getattr(args, 'timelapse_variable_fps_max', 60)
+        self.timelapse_crf = getattr(args, 'timelapse_crf', 23)
+        self.timelapse_duplicate_last_frame = getattr(args, 'timelapse_duplicate_last_frame', 0)
+        self.timelapse_stream_delay = getattr(args, 'timelapse_stream_delay', 0.05)
+        self.timelapse_flip_x = getattr(args, 'timelapse_flip_x', False)
+        self.timelapse_flip_y = getattr(args, 'timelapse_flip_y', False)
+
+        # Moonraker client (for timelapse integration)
+        self.moonraker_client = None
+        self.timelapse_active = False  # True when timelapse recording is in progress
+        self.timelapse_frames = 0  # Frame counter for current timelapse
+        self.timelapse_filename = None  # Current print filename
+        self.hyperlapse_timer = None  # Timer for hyperlapse mode
+
         # MJPEG frame buffer (for rkmpi mode)
         self.current_frame = None
         self.frame_lock = threading.Lock()
@@ -2532,6 +2959,25 @@ class StreamerApp:
             config['display_enabled'] = 'true' if self.display_enabled else 'false'
             config['display_fps'] = str(self.display_fps)
 
+            # Advanced timelapse settings
+            config['timelapse_enabled'] = 'true' if self.timelapse_enabled else 'false'
+            config['timelapse_mode'] = self.timelapse_mode
+            config['timelapse_hyperlapse_interval'] = str(self.timelapse_hyperlapse_interval)
+            config['timelapse_storage'] = self.timelapse_storage
+            config['timelapse_usb_path'] = self.timelapse_usb_path
+            config['moonraker_host'] = self.moonraker_host
+            config['moonraker_port'] = str(self.moonraker_port)
+            config['timelapse_output_fps'] = str(self.timelapse_output_fps)
+            config['timelapse_variable_fps'] = 'true' if self.timelapse_variable_fps else 'false'
+            config['timelapse_target_length'] = str(self.timelapse_target_length)
+            config['timelapse_variable_fps_min'] = str(self.timelapse_variable_fps_min)
+            config['timelapse_variable_fps_max'] = str(self.timelapse_variable_fps_max)
+            config['timelapse_crf'] = str(self.timelapse_crf)
+            config['timelapse_duplicate_last_frame'] = str(self.timelapse_duplicate_last_frame)
+            config['timelapse_stream_delay'] = str(self.timelapse_stream_delay)
+            config['timelapse_flip_x'] = 'true' if self.timelapse_flip_x else 'false'
+            config['timelapse_flip_y'] = 'true' if self.timelapse_flip_y else 'false'
+
             # Write back with explicit flush and sync
             with open(config_path, 'w') as f:
                 json.dump(config, f, indent=2)
@@ -2594,6 +3040,10 @@ class StreamerApp:
 
         # Start IP monitor thread
         threading.Thread(target=self._ip_monitor_loop, daemon=True).start()
+
+        # Start Moonraker client if timelapse is enabled (rkmpi mode only)
+        if self.is_rkmpi_mode() and self.timelapse_enabled:
+            self._start_moonraker_client()
 
         print(f"Streamer started:", flush=True)
         print(f"  Streaming:", flush=True)
@@ -3195,6 +3645,21 @@ class StreamerApp:
             elif path.startswith('/api/timelapse/delete/') and method == 'DELETE':
                 name = urllib.parse.unquote(path[22:])  # URL-decode filename
                 self._handle_timelapse_delete(client, name)
+            elif path == '/api/timelapse/storage':
+                self._serve_timelapse_storage(client)
+            elif path == '/api/timelapse/moonraker':
+                self._serve_timelapse_moonraker_status(client)
+            elif path == '/api/timelapse/settings' and method == 'POST':
+                content_length = 0
+                for line in request.split('\r\n'):
+                    if line.lower().startswith('content-length:'):
+                        content_length = int(line.split(':')[1].strip())
+                body = ''
+                if content_length > 0:
+                    body_start = request.find('\r\n\r\n')
+                    if body_start != -1:
+                        body = request[body_start+4:body_start+4+content_length]
+                self._handle_timelapse_settings(client, body)
             else:
                 self._serve_404(client)
         except Exception:
@@ -3905,6 +4370,183 @@ class StreamerApp:
             </form>
         </div>
 
+        <div class="section rkmpi-only" style="{'display:none' if not self.is_rkmpi_mode() else ''}">
+            <h2>Timelapse Settings</h2>
+            <p style="color:#888;font-size:12px;margin-bottom:15px;">Independent timelapse recording via Moonraker integration. Records regardless of slicer settings.</p>
+            <form id="timelapse-form">
+                <div class="setting">
+                    <div class="setting-row">
+                        <span class="label">Enable Timelapse:</span>
+                        <div class="control">
+                            <label class="toggle">
+                                <input type="checkbox" name="timelapse_enabled" id="timelapse_enabled" {'checked' if self.timelapse_enabled else ''} onchange="updateTimelapseSettings()">
+                                <span class="slider"></span>
+                            </label>
+                        </div>
+                    </div>
+                    <div class="setting-note">Auto-record timelapse for all prints via Moonraker</div>
+                </div>
+                <div class="setting timelapse-setting" style="{'display:none' if not self.timelapse_enabled else ''}">
+                    <div class="setting-row">
+                        <span class="label">Mode:</span>
+                        <div class="control">
+                            <select name="timelapse_mode" id="timelapse_mode" onchange="updateTimelapseModeSettings()" style="padding:8px;border-radius:4px;border:1px solid #555;background:#333;color:#fff;">
+                                <option value="layer" {'selected' if self.timelapse_mode == 'layer' else ''}>Layer-based</option>
+                                <option value="hyperlapse" {'selected' if self.timelapse_mode == 'hyperlapse' else ''}>Hyperlapse (time-based)</option>
+                            </select>
+                        </div>
+                    </div>
+                </div>
+                <div class="setting timelapse-setting hyperlapse-only" style="{'display:none' if not self.timelapse_enabled or self.timelapse_mode != 'hyperlapse' else ''}">
+                    <div class="setting-row">
+                        <span class="label">Hyperlapse Interval:</span>
+                        <div class="control">
+                            <input type="number" name="timelapse_hyperlapse_interval" value="{self.timelapse_hyperlapse_interval}" min="5" max="300" style="width:60px;">
+                            <span style="margin-left:5px;">seconds</span>
+                        </div>
+                    </div>
+                </div>
+                <div class="setting timelapse-setting" style="{'display:none' if not self.timelapse_enabled else ''}; border-top: 1px solid #444; padding-top: 15px; margin-top: 15px;">
+                    <div class="setting-row">
+                        <span class="label">Storage Location:</span>
+                        <div class="control">
+                            <select name="timelapse_storage" id="timelapse_storage" style="padding:8px;border-radius:4px;border:1px solid #555;background:#333;color:#fff;">
+                                <option value="internal" {'selected' if self.timelapse_storage == 'internal' else ''}>Internal Flash</option>
+                                <option value="usb" {'selected' if self.timelapse_storage == 'usb' else ''}>USB Drive</option>
+                            </select>
+                        </div>
+                    </div>
+                </div>
+                <div class="setting timelapse-setting" style="{'display:none' if not self.timelapse_enabled else ''}">
+                    <div class="setting-row">
+                        <span class="label">USB Status:</span>
+                        <div class="control">
+                            <span id="usb_status" style="color:#888;">Checking...</span>
+                        </div>
+                    </div>
+                </div>
+                <div class="setting timelapse-setting" style="{'display:none' if not self.timelapse_enabled else ''}; border-top: 1px solid #444; padding-top: 15px; margin-top: 15px;">
+                    <div class="setting-row">
+                        <span class="label">Moonraker Host:</span>
+                        <div class="control">
+                            <input type="text" name="moonraker_host" value="{self.moonraker_host}" style="width:120px;padding:8px;border-radius:4px;border:1px solid #555;background:#333;color:#fff;">
+                        </div>
+                    </div>
+                </div>
+                <div class="setting timelapse-setting" style="{'display:none' if not self.timelapse_enabled else ''}">
+                    <div class="setting-row">
+                        <span class="label">Moonraker Port:</span>
+                        <div class="control">
+                            <input type="number" name="moonraker_port" value="{self.moonraker_port}" min="1" max="65535" style="width:80px;">
+                        </div>
+                    </div>
+                </div>
+                <div class="setting timelapse-setting" style="{'display:none' if not self.timelapse_enabled else ''}">
+                    <div class="setting-row">
+                        <span class="label">Connection Status:</span>
+                        <div class="control">
+                            <span id="moonraker_status" style="color:#888;">Not connected</span>
+                        </div>
+                    </div>
+                </div>
+                <div class="setting timelapse-setting" style="{'display:none' if not self.timelapse_enabled else ''}; border-top: 1px solid #444; padding-top: 15px; margin-top: 15px;">
+                    <div class="setting-row">
+                        <span class="label">Output FPS:</span>
+                        <div class="control">
+                            <input type="number" name="timelapse_output_fps" value="{self.timelapse_output_fps}" min="1" max="120" style="width:60px;">
+                        </div>
+                    </div>
+                    <div class="setting-note">Video playback framerate</div>
+                </div>
+                <div class="setting timelapse-setting" style="{'display:none' if not self.timelapse_enabled else ''}">
+                    <div class="setting-row">
+                        <span class="label">Variable FPS:</span>
+                        <div class="control">
+                            <label class="toggle">
+                                <input type="checkbox" name="timelapse_variable_fps" id="timelapse_variable_fps" {'checked' if self.timelapse_variable_fps else ''} onchange="updateVariableFpsSettings()">
+                                <span class="slider"></span>
+                            </label>
+                        </div>
+                    </div>
+                    <div class="setting-note">Auto-adjust FPS to reach target video length</div>
+                </div>
+                <div class="setting timelapse-setting variable-fps-setting" style="{'display:none' if not self.timelapse_enabled or not self.timelapse_variable_fps else ''}">
+                    <div class="setting-row">
+                        <span class="label">Target Length:</span>
+                        <div class="control">
+                            <input type="number" name="timelapse_target_length" value="{self.timelapse_target_length}" min="1" max="300" style="width:60px;">
+                            <span style="margin-left:5px;">seconds</span>
+                        </div>
+                    </div>
+                </div>
+                <div class="setting timelapse-setting variable-fps-setting" style="{'display:none' if not self.timelapse_enabled or not self.timelapse_variable_fps else ''}">
+                    <div class="setting-row">
+                        <span class="label">Min/Max FPS:</span>
+                        <div class="control">
+                            <input type="number" name="timelapse_variable_fps_min" value="{self.timelapse_variable_fps_min}" min="1" max="60" style="width:50px;">
+                            <span style="margin:0 5px;">/</span>
+                            <input type="number" name="timelapse_variable_fps_max" value="{self.timelapse_variable_fps_max}" min="1" max="120" style="width:50px;">
+                        </div>
+                    </div>
+                </div>
+                <div class="setting timelapse-setting" style="{'display:none' if not self.timelapse_enabled else ''}">
+                    <div class="setting-row">
+                        <span class="label">Quality (CRF):</span>
+                        <div class="control">
+                            <input type="number" name="timelapse_crf" value="{self.timelapse_crf}" min="0" max="51" style="width:60px;">
+                        </div>
+                    </div>
+                    <div class="setting-note">0=lossless, 23=default, 51=worst</div>
+                </div>
+                <div class="setting timelapse-setting" style="{'display:none' if not self.timelapse_enabled else ''}">
+                    <div class="setting-row">
+                        <span class="label">Duplicate Last Frame:</span>
+                        <div class="control">
+                            <input type="number" name="timelapse_duplicate_last_frame" value="{self.timelapse_duplicate_last_frame}" min="0" max="60" style="width:60px;">
+                        </div>
+                    </div>
+                    <div class="setting-note">Repeat final frame N times</div>
+                </div>
+                <div class="setting timelapse-setting" style="{'display:none' if not self.timelapse_enabled else ''}; border-top: 1px solid #444; padding-top: 15px; margin-top: 15px;">
+                    <div class="setting-row">
+                        <span class="label">Stream Delay:</span>
+                        <div class="control">
+                            <input type="number" name="timelapse_stream_delay" value="{self.timelapse_stream_delay}" min="0" max="5" step="0.01" style="width:60px;">
+                            <span style="margin-left:5px;">seconds</span>
+                        </div>
+                    </div>
+                    <div class="setting-note">Delay before capture to compensate for stream latency</div>
+                </div>
+                <div class="setting timelapse-setting" style="{'display:none' if not self.timelapse_enabled else ''}">
+                    <div class="setting-row">
+                        <span class="label">Flip Horizontal:</span>
+                        <div class="control">
+                            <label class="toggle">
+                                <input type="checkbox" name="timelapse_flip_x" {'checked' if self.timelapse_flip_x else ''}>
+                                <span class="slider"></span>
+                            </label>
+                        </div>
+                    </div>
+                </div>
+                <div class="setting timelapse-setting" style="{'display:none' if not self.timelapse_enabled else ''}">
+                    <div class="setting-row">
+                        <span class="label">Flip Vertical:</span>
+                        <div class="control">
+                            <label class="toggle">
+                                <input type="checkbox" name="timelapse_flip_y" {'checked' if self.timelapse_flip_y else ''}>
+                                <span class="slider"></span>
+                            </label>
+                        </div>
+                    </div>
+                </div>
+                <div class="setting timelapse-setting" style="{'display:none' if not self.timelapse_enabled else ''}; margin-top: 15px;">
+                    <div class="setting-row">
+                        <button type="submit">Apply Timelapse Settings</button>
+                    </div>
+                </div>
+            </form>
+        </div>
+
         <div class="section">
             <h2>Status</h2>
             <div class="row">
@@ -4361,6 +5003,77 @@ if(flvjs.isSupported()){{
             document.getElementById('display_fps_select').disabled = !enabled;
         }}
 
+        // Timelapse settings UI functions
+        function updateTimelapseSettings() {{
+            const enabled = document.getElementById('timelapse_enabled').checked;
+            document.querySelectorAll('.timelapse-setting').forEach(el => {{
+                el.style.display = enabled ? '' : 'none';
+            }});
+            if (enabled) {{
+                updateTimelapseModeSettings();
+                updateVariableFpsSettings();
+                checkUsbStatus();
+                checkMoonrakerStatus();
+            }}
+        }}
+
+        function updateTimelapseModeSettings() {{
+            const mode = document.getElementById('timelapse_mode').value;
+            document.querySelectorAll('.hyperlapse-only').forEach(el => {{
+                el.style.display = mode === 'hyperlapse' ? '' : 'none';
+            }});
+        }}
+
+        function updateVariableFpsSettings() {{
+            const enabled = document.getElementById('timelapse_variable_fps')?.checked || false;
+            document.querySelectorAll('.variable-fps-setting').forEach(el => {{
+                el.style.display = enabled ? '' : 'none';
+            }});
+        }}
+
+        function checkUsbStatus() {{
+            fetch('/api/timelapse/storage')
+                .then(r => r.json())
+                .then(data => {{
+                    const statusEl = document.getElementById('usb_status');
+                    if (data.usb_mounted) {{
+                        statusEl.textContent = '● Mounted';
+                        statusEl.style.color = '#4CAF50';
+                    }} else {{
+                        statusEl.textContent = '○ Not detected';
+                        statusEl.style.color = '#888';
+                    }}
+                }})
+                .catch(() => {{
+                    const statusEl = document.getElementById('usb_status');
+                    statusEl.textContent = '? Unknown';
+                    statusEl.style.color = '#f90';
+                }});
+        }}
+
+        function checkMoonrakerStatus() {{
+            fetch('/api/timelapse/moonraker')
+                .then(r => r.json())
+                .then(data => {{
+                    const statusEl = document.getElementById('moonraker_status');
+                    if (data.connected) {{
+                        statusEl.textContent = '● Connected';
+                        statusEl.style.color = '#4CAF50';
+                        if (data.print_state && data.print_state !== 'standby') {{
+                            statusEl.textContent += ' (' + data.print_state + ')';
+                        }}
+                    }} else {{
+                        statusEl.textContent = '○ Disconnected';
+                        statusEl.style.color = '#888';
+                    }}
+                }})
+                .catch(() => {{
+                    const statusEl = document.getElementById('moonraker_status');
+                    statusEl.textContent = '? Unknown';
+                    statusEl.style.color = '#f90';
+                }});
+        }}
+
         // Update stats every second
         function updateStats() {{
             fetch('/api/stats')
@@ -4480,6 +5193,57 @@ if(flvjs.isSupported()){{
                     body: data
                 }}).then(() => location.reload());
             }}
+        }});
+
+        // Timelapse form submission
+        const timelapseForm = document.getElementById('timelapse-form');
+        if (timelapseForm) {{
+            timelapseForm.addEventListener('submit', function(e) {{
+                e.preventDefault();
+                const formData = new FormData(this);
+                const data = new URLSearchParams();
+
+                // Boolean settings
+                data.append('timelapse_enabled', formData.has('timelapse_enabled') ? '1' : '0');
+                data.append('timelapse_variable_fps', formData.has('timelapse_variable_fps') ? '1' : '0');
+                data.append('timelapse_flip_x', formData.has('timelapse_flip_x') ? '1' : '0');
+                data.append('timelapse_flip_y', formData.has('timelapse_flip_y') ? '1' : '0');
+
+                // String/number settings
+                data.append('timelapse_mode', formData.get('timelapse_mode') || 'layer');
+                data.append('timelapse_hyperlapse_interval', formData.get('timelapse_hyperlapse_interval') || '30');
+                data.append('timelapse_storage', formData.get('timelapse_storage') || 'internal');
+                data.append('moonraker_host', formData.get('moonraker_host') || '127.0.0.1');
+                data.append('moonraker_port', formData.get('moonraker_port') || '7125');
+                data.append('timelapse_output_fps', formData.get('timelapse_output_fps') || '30');
+                data.append('timelapse_target_length', formData.get('timelapse_target_length') || '10');
+                data.append('timelapse_variable_fps_min', formData.get('timelapse_variable_fps_min') || '5');
+                data.append('timelapse_variable_fps_max', formData.get('timelapse_variable_fps_max') || '60');
+                data.append('timelapse_crf', formData.get('timelapse_crf') || '23');
+                data.append('timelapse_duplicate_last_frame', formData.get('timelapse_duplicate_last_frame') || '0');
+                data.append('timelapse_stream_delay', formData.get('timelapse_stream_delay') || '0.05');
+
+                fetch('/api/timelapse/settings', {{
+                    method: 'POST',
+                    body: data
+                }}).then(r => r.json())
+                .then(data => {{
+                    if (data.status === 'ok') {{
+                        // Refresh status indicators
+                        checkUsbStatus();
+                        checkMoonrakerStatus();
+                        alert('Timelapse settings saved');
+                    }} else {{
+                        alert('Error saving settings: ' + (data.message || 'Unknown error'));
+                    }}
+                }})
+                .catch(err => alert('Error: ' + err));
+            }});
+        }}
+
+        // Initialize timelapse UI on page load
+        document.addEventListener('DOMContentLoaded', function() {{
+            updateTimelapseSettings();
         }});
 
         // Snapshot preview is static - click image to refresh (reduces CPU usage)
@@ -5304,6 +6068,335 @@ if(flvjs.isSupported()){{
 
         client.sendall(response.encode())
 
+    def _serve_timelapse_storage(self, client):
+        """Return timelapse storage info including USB mount status"""
+        usb_mounted = os.path.ismount('/mnt/udisk')
+
+        # Calculate sizes if directories exist
+        internal_size = 0
+        usb_size = 0
+
+        if os.path.isdir(TIMELAPSE_DIR):
+            try:
+                for f in os.listdir(TIMELAPSE_DIR):
+                    fpath = os.path.join(TIMELAPSE_DIR, f)
+                    if os.path.isfile(fpath):
+                        internal_size += os.path.getsize(fpath)
+            except OSError:
+                pass
+
+        if usb_mounted and os.path.isdir(self.timelapse_usb_path):
+            try:
+                for f in os.listdir(self.timelapse_usb_path):
+                    fpath = os.path.join(self.timelapse_usb_path, f)
+                    if os.path.isfile(fpath):
+                        usb_size += os.path.getsize(fpath)
+            except OSError:
+                pass
+
+        data = {
+            'current': self.timelapse_storage,
+            'usb_mounted': usb_mounted,
+            'usb_path': self.timelapse_usb_path,
+            'internal_path': TIMELAPSE_DIR,
+            'internal_size': internal_size,
+            'usb_size': usb_size
+        }
+
+        body = json.dumps(data)
+        response = (
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        ) + body
+        client.sendall(response.encode())
+
+    def _serve_timelapse_moonraker_status(self, client):
+        """Return Moonraker connection status"""
+        connected = False
+        print_state = 'standby'
+        current_layer = 0
+        total_layers = 0
+
+        if self.moonraker_client:
+            connected = self.moonraker_client.is_connected()
+            state = self.moonraker_client.get_print_state()
+            print_state = state.get('state', 'standby')
+            current_layer = state.get('current_layer', 0)
+            total_layers = state.get('total_layers', 0)
+
+        data = {
+            'connected': connected,
+            'print_state': print_state,
+            'current_layer': current_layer,
+            'total_layers': total_layers,
+            'timelapse_enabled': self.timelapse_enabled,
+            'timelapse_active': self.timelapse_active,
+            'timelapse_frames': self.timelapse_frames
+        }
+
+        body = json.dumps(data)
+        response = (
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        ) + body
+        client.sendall(response.encode())
+
+    def _handle_timelapse_settings(self, client, body: str):
+        """Handle timelapse settings POST"""
+        params = {}
+        for param in body.split('&'):
+            if '=' in param:
+                k, v = param.split('=', 1)
+                params[k] = urllib.parse.unquote(v)
+
+        # Parse boolean settings
+        old_enabled = self.timelapse_enabled
+        self.timelapse_enabled = params.get('timelapse_enabled', '0') == '1'
+        self.timelapse_variable_fps = params.get('timelapse_variable_fps', '0') == '1'
+        self.timelapse_flip_x = params.get('timelapse_flip_x', '0') == '1'
+        self.timelapse_flip_y = params.get('timelapse_flip_y', '0') == '1'
+
+        # Parse string settings
+        self.timelapse_mode = params.get('timelapse_mode', 'layer')
+        if self.timelapse_mode not in ('layer', 'hyperlapse'):
+            self.timelapse_mode = 'layer'
+
+        self.timelapse_storage = params.get('timelapse_storage', 'internal')
+        if self.timelapse_storage not in ('internal', 'usb'):
+            self.timelapse_storage = 'internal'
+
+        self.moonraker_host = params.get('moonraker_host', '127.0.0.1')
+
+        # Parse numeric settings with validation
+        try:
+            self.timelapse_hyperlapse_interval = max(5, min(300, int(params.get('timelapse_hyperlapse_interval', 30))))
+        except ValueError:
+            pass
+        try:
+            self.moonraker_port = max(1, min(65535, int(params.get('moonraker_port', 7125))))
+        except ValueError:
+            pass
+        try:
+            self.timelapse_output_fps = max(1, min(120, int(params.get('timelapse_output_fps', 30))))
+        except ValueError:
+            pass
+        try:
+            self.timelapse_target_length = max(1, min(300, int(params.get('timelapse_target_length', 10))))
+        except ValueError:
+            pass
+        try:
+            self.timelapse_variable_fps_min = max(1, min(60, int(params.get('timelapse_variable_fps_min', 5))))
+        except ValueError:
+            pass
+        try:
+            self.timelapse_variable_fps_max = max(1, min(120, int(params.get('timelapse_variable_fps_max', 60))))
+        except ValueError:
+            pass
+        try:
+            self.timelapse_crf = max(0, min(51, int(params.get('timelapse_crf', 23))))
+        except ValueError:
+            pass
+        try:
+            self.timelapse_duplicate_last_frame = max(0, min(60, int(params.get('timelapse_duplicate_last_frame', 0))))
+        except ValueError:
+            pass
+        try:
+            self.timelapse_stream_delay = max(0, min(5, float(params.get('timelapse_stream_delay', 0.05))))
+        except ValueError:
+            pass
+
+        # Save config
+        self.save_config()
+
+        # Manage Moonraker client based on timelapse_enabled
+        if self.timelapse_enabled and not old_enabled:
+            # Start Moonraker client
+            self._start_moonraker_client()
+        elif not self.timelapse_enabled and old_enabled:
+            # Stop Moonraker client
+            self._stop_moonraker_client()
+        elif self.timelapse_enabled and self.moonraker_client:
+            # Settings changed, restart client if host/port changed
+            if self.moonraker_client.host != self.moonraker_host or self.moonraker_client.port != self.moonraker_port:
+                self._stop_moonraker_client()
+                self._start_moonraker_client()
+
+        # Send response
+        body_resp = json.dumps({'status': 'ok'})
+        response = (
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json\r\n"
+            f"Content-Length: {len(body_resp)}\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        ) + body_resp
+        client.sendall(response.encode())
+
+    def _start_moonraker_client(self):
+        """Start Moonraker WebSocket client"""
+        if self.moonraker_client:
+            return  # Already running
+
+        # Enable custom timelapse mode in rkmpi_enc to ignore Anycubic RPC timelapse
+        self._send_timelapse_command("timelapse_custom_mode:1")
+
+        self.moonraker_client = MoonrakerClient(self.moonraker_host, self.moonraker_port)
+
+        # Set up callbacks for timelapse
+        self.moonraker_client.on_print_start = self._on_print_start
+        self.moonraker_client.on_layer_change = self._on_layer_change
+        self.moonraker_client.on_print_complete = self._on_print_complete
+        self.moonraker_client.on_print_cancel = self._on_print_cancel
+
+        self.moonraker_client.start()
+        print(f"Moonraker client started for {self.moonraker_host}:{self.moonraker_port}", flush=True)
+
+    def _stop_moonraker_client(self):
+        """Stop Moonraker WebSocket client"""
+        if not self.moonraker_client:
+            return
+
+        self.moonraker_client.stop()
+        self.moonraker_client = None
+
+        # Disable custom timelapse mode to allow Anycubic RPC timelapse
+        self._send_timelapse_command("timelapse_custom_mode:0")
+
+        print("Moonraker client stopped", flush=True)
+
+    def _on_print_start(self, filename):
+        """Callback when print starts"""
+        if not self.timelapse_enabled:
+            return
+
+        print(f"Timelapse: Print started - {filename}", flush=True)
+        self.timelapse_active = True
+        self.timelapse_frames = 0
+        self.timelapse_filename = filename
+
+        # Determine output path
+        output_path = self._get_timelapse_output_path()
+
+        # Strip .gcode extension from filename
+        base_name = filename
+        if base_name.lower().endswith('.gcode'):
+            base_name = base_name[:-6]
+
+        # Send timelapse init command to rkmpi_enc
+        self._send_timelapse_command(f"timelapse_init:{base_name}:{output_path}")
+        self._send_timelapse_command(f"timelapse_fps:{self.timelapse_output_fps}")
+        self._send_timelapse_command(f"timelapse_crf:{self.timelapse_crf}")
+        if self.timelapse_variable_fps:
+            self._send_timelapse_command(f"timelapse_variable_fps:{self.timelapse_variable_fps_min}:{self.timelapse_variable_fps_max}:{self.timelapse_target_length}")
+        if self.timelapse_duplicate_last_frame > 0:
+            self._send_timelapse_command(f"timelapse_duplicate_last:{self.timelapse_duplicate_last_frame}")
+        self._send_timelapse_command(f"timelapse_flip:{1 if self.timelapse_flip_x else 0}:{1 if self.timelapse_flip_y else 0}")
+
+        # Start hyperlapse timer if in hyperlapse mode
+        if self.timelapse_mode == 'hyperlapse':
+            self._start_hyperlapse_timer()
+
+    def _start_hyperlapse_timer(self):
+        """Start the hyperlapse capture timer"""
+        if self.hyperlapse_timer:
+            return  # Already running
+
+        def capture_loop():
+            while self.timelapse_active and self.timelapse_mode == 'hyperlapse':
+                # Wait for stream delay
+                if self.timelapse_stream_delay > 0:
+                    time.sleep(self.timelapse_stream_delay)
+
+                # Capture frame
+                if self.timelapse_active:  # Check again after delay
+                    self._send_timelapse_command("timelapse_capture")
+                    self.timelapse_frames += 1
+                    print(f"Timelapse: Hyperlapse frame {self.timelapse_frames}", flush=True)
+
+                # Wait for interval
+                time.sleep(self.timelapse_hyperlapse_interval)
+
+        self.hyperlapse_timer = threading.Thread(target=capture_loop, daemon=True)
+        self.hyperlapse_timer.start()
+        print(f"Timelapse: Hyperlapse timer started ({self.timelapse_hyperlapse_interval}s interval)", flush=True)
+
+    def _stop_hyperlapse_timer(self):
+        """Stop the hyperlapse capture timer"""
+        # Timer will stop naturally when timelapse_active becomes False
+        self.hyperlapse_timer = None
+
+    def _on_layer_change(self, layer, total_layers):
+        """Callback when layer changes"""
+        if not self.timelapse_enabled or not self.timelapse_active:
+            return
+
+        # Only capture in layer mode
+        if self.timelapse_mode != 'layer':
+            return
+
+        print(f"Timelapse: Layer {layer}/{total_layers}", flush=True)
+
+        # Wait for stream delay
+        if self.timelapse_stream_delay > 0:
+            time.sleep(self.timelapse_stream_delay)
+
+        # Send capture command
+        self._send_timelapse_command("timelapse_capture")
+        self.timelapse_frames += 1
+
+    def _on_print_complete(self, filename):
+        """Callback when print completes"""
+        if not self.timelapse_active:
+            return
+
+        print(f"Timelapse: Print complete - {filename}, {self.timelapse_frames} frames", flush=True)
+
+        # Stop hyperlapse timer first (sets timelapse_active = False in loop check)
+        self.timelapse_active = False
+        self._stop_hyperlapse_timer()
+
+        self._send_timelapse_command("timelapse_finalize")
+
+    def _on_print_cancel(self, filename, reason):
+        """Callback when print is cancelled"""
+        if not self.timelapse_active:
+            return
+
+        print(f"Timelapse: Print cancelled - {filename}, reason: {reason}", flush=True)
+
+        # Stop hyperlapse timer first
+        self.timelapse_active = False
+        self._stop_hyperlapse_timer()
+
+        self._send_timelapse_command("timelapse_cancel")
+        self.timelapse_frames = 0
+
+    def _get_timelapse_output_path(self):
+        """Get the timelapse output directory based on current storage setting"""
+        if self.timelapse_storage == 'usb' and os.path.ismount('/mnt/udisk'):
+            # Create USB timelapse directory if needed
+            try:
+                os.makedirs(self.timelapse_usb_path, exist_ok=True)
+                return self.timelapse_usb_path
+            except OSError:
+                print(f"Failed to create USB timelapse directory, falling back to internal", flush=True)
+
+        return TIMELAPSE_DIR
+
+    def _send_timelapse_command(self, command):
+        """Send a timelapse command to rkmpi_enc via control file"""
+        try:
+            with open(self.ctrl_file, 'a') as f:
+                f.write(f"{command}\n")
+        except Exception as e:
+            print(f"Error sending timelapse command: {e}", flush=True)
+
     def _redirect_to_streaming(self, client, path, port=None):
         """Redirect to streaming server (rkmpi_enc handles streaming on a different port)"""
         if port is None:
@@ -5374,6 +6467,9 @@ if(flvjs.isSupported()){{
                 except:
                     pass
             self.mqtt_subprocess = None
+
+        # Stop Moonraker client
+        self._stop_moonraker_client()
 
         # Stop camera stream (go-klipper mode only)
         if self.mode != 'vanilla-klipper':
@@ -6014,6 +7110,25 @@ def main():
     # Display capture settings (disabled by default)
     args.display_enabled = saved_config.get('display_enabled', 'false') == 'true'
     args.display_fps = max(1, min(10, int(saved_config.get('display_fps', 5))))
+
+    # Advanced timelapse settings (Moonraker integration)
+    args.timelapse_enabled = saved_config.get('timelapse_enabled', 'false') == 'true'
+    args.timelapse_mode = saved_config.get('timelapse_mode', 'layer')
+    args.timelapse_hyperlapse_interval = max(5, min(300, int(saved_config.get('timelapse_hyperlapse_interval', 30))))
+    args.timelapse_storage = saved_config.get('timelapse_storage', 'internal')
+    args.timelapse_usb_path = saved_config.get('timelapse_usb_path', '/mnt/udisk/timelapse')
+    args.moonraker_host = saved_config.get('moonraker_host', '127.0.0.1')
+    args.moonraker_port = max(1, min(65535, int(saved_config.get('moonraker_port', 7125))))
+    args.timelapse_output_fps = max(1, min(120, int(saved_config.get('timelapse_output_fps', 30))))
+    args.timelapse_variable_fps = saved_config.get('timelapse_variable_fps', 'false') == 'true'
+    args.timelapse_target_length = max(1, min(300, int(saved_config.get('timelapse_target_length', 10))))
+    args.timelapse_variable_fps_min = max(1, min(60, int(saved_config.get('timelapse_variable_fps_min', 5))))
+    args.timelapse_variable_fps_max = max(1, min(120, int(saved_config.get('timelapse_variable_fps_max', 60))))
+    args.timelapse_crf = max(0, min(51, int(saved_config.get('timelapse_crf', 23))))
+    args.timelapse_duplicate_last_frame = max(0, min(60, int(saved_config.get('timelapse_duplicate_last_frame', 0))))
+    args.timelapse_stream_delay = max(0, min(5, float(saved_config.get('timelapse_stream_delay', 0.05))))
+    args.timelapse_flip_x = saved_config.get('timelapse_flip_x', 'false') == 'true'
+    args.timelapse_flip_y = saved_config.get('timelapse_flip_y', 'false') == 'true'
 
     app = StreamerApp(args)
 

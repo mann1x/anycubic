@@ -120,6 +120,13 @@ static void handle_video_request(RPCClient *client, cJSON *video_request) {
     if (strcmp(m, "openDelayCamera") == 0) {
         rpc_log("Received openDelayCamera\n");
 
+        /* If custom timelapse mode is enabled, ignore RPC timelapse commands */
+        if (timelapse_is_custom_mode()) {
+            rpc_log("Ignoring openDelayCamera - custom timelapse mode active\n");
+            rpc_send_video_reply(client, id, m);  /* Still respond success */
+            return;
+        }
+
         const char *filepath = NULL;
         if (req_params) {
             cJSON *fp = cJSON_GetObjectItem(req_params, "filepath");
@@ -128,7 +135,7 @@ static void handle_video_request(RPCClient *client, cJSON *video_request) {
             }
         }
 
-        if (timelapse_init(filepath) == 0) {
+        if (timelapse_init_legacy(filepath) == 0) {
             rpc_send_video_reply(client, id, m);
         } else {
             rpc_log("openDelayCamera: timelapse_init failed\n");
@@ -149,7 +156,13 @@ static void handle_video_request(RPCClient *client, cJSON *video_request) {
         rpc_log("Received startLanCapture\n");
         rpc_send_video_reply(client, id, m);
 
-        /* Capture timelapse frame if active */
+        /* If custom timelapse mode is enabled, ignore RPC capture commands */
+        if (timelapse_is_custom_mode()) {
+            /* Don't log - this gets called frequently during print */
+            return;
+        }
+
+        /* Capture timelapse frame if active (RPC mode) */
         if (timelapse_is_active()) {
             timelapse_capture_frame();
         }
@@ -166,6 +179,11 @@ static void handle_video_request(RPCClient *client, cJSON *video_request) {
 
 /* Check for print completion to finalize timelapse */
 static void check_print_completion(cJSON *status) {
+    /* If custom timelapse mode is enabled, h264_server handles finalization */
+    if (timelapse_is_custom_mode()) {
+        return;
+    }
+
     if (!timelapse_is_active()) {
         return;
     }
