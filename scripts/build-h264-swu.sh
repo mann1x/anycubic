@@ -13,8 +13,13 @@
 set -e
 
 KOBRA_MODEL_CODE=${1:-KS1}
-OUTPUT_DIR=${2:-/workspace/dist}
+OUTPUT_DIR_ARG=${2:-/workspace/dist}
 WORKSPACE=${WORKSPACE:-/workspace}
+
+# Convert OUTPUT_DIR to absolute path
+OUTPUT_DIR=$(cd "$(dirname "$OUTPUT_DIR_ARG")" 2>/dev/null && pwd)/$(basename "$OUTPUT_DIR_ARG")
+mkdir -p "$OUTPUT_DIR"
+OUTPUT_DIR=$(cd "$OUTPUT_DIR" && pwd)
 
 # Validate model code
 case "$KOBRA_MODEL_CODE" in
@@ -46,9 +51,6 @@ if [ ! -f "$ENCODER_SRC" ]; then
     echo "Please build the encoder first and run 'make install-h264'"
     exit 1
 fi
-
-# Create output directory
-mkdir -p "$OUTPUT_DIR"
 
 # Create temp directory for SWU content
 UPDATE_DIR=/tmp/update_swu_$$
