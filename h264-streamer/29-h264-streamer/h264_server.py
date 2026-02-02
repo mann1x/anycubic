@@ -4181,6 +4181,11 @@ if(flvjs.isSupported()){{
                 ? document.getElementById('mjpeg_fps_slider_yuyv').value
                 : document.getElementById('mjpeg_fps_slider').value;
             data.append('mjpeg_fps', mjpegFpsValue);
+            // Display capture settings
+            if (formData.has('display_enabled')) {{
+                data.append('display_enabled', 'on');
+            }}
+            data.append('display_fps', document.querySelector('[name=display_fps]').value);
 
             // Check if settings require restart
             const newMjpegFps = parseInt(mjpegFpsValue) || 10;
