@@ -380,6 +380,42 @@ Resolution detection falls back to 1280x720 if v4l2-ctl is not available.
 
 ## Development Notes
 
+### Modifying the Control Page
+
+The control page (`/control`) uses JavaScript to handle form submission. **Important:** When adding new form fields, you must update TWO places:
+
+1. **HTML form** - Add the input/select element inside the `<form id="settings-form">` tag
+2. **JavaScript submit handler** - Add the field to the form data builder
+
+The JavaScript form handler is around line 4163 in `h264_server.py`:
+
+```javascript
+document.getElementById('settings-form').addEventListener('submit', function(e) {
+    e.preventDefault();
+    const formData = new FormData(this);
+    const data = new URLSearchParams();
+
+    // Each field must be explicitly added:
+    data.append('field_name', document.querySelector('[name=field_name]').value);
+
+    // For checkboxes:
+    if (formData.has('checkbox_name')) {
+        data.append('checkbox_name', 'on');
+    }
+    // ...
+});
+```
+
+**Common mistake:** Adding a form field to the HTML but forgetting to add it to the JavaScript handler. The form uses `e.preventDefault()` and manually builds the POST data, so fields not explicitly added will NOT be submitted.
+
+**Checklist for new control page settings:**
+1. Add HTML input/select inside `<form id="settings-form">`
+2. Add `data.append()` call in JavaScript submit handler
+3. Add POST handler parsing in `_handle_control_post()` method
+4. Add to `write_ctrl_file()` if encoder needs to read it
+5. Add to `save_config()` for persistence
+6. Add to config loading in `main()` for startup
+
 ### Process Management
 **⛔ See CRITICAL WARNING at top of this file! ⛔**
 
@@ -483,28 +519,35 @@ This ensures the printer maintains at least 40% CPU headroom for other tasks.
 Captures the printer's LCD framebuffer (/dev/fb0) and streams it as MJPEG for remote viewing of the printer's touchscreen.
 
 ### Endpoints
-- `/display` - MJPEG multipart stream (5 fps)
+- `/display` - MJPEG multipart stream (configurable 1-10 fps)
 - `/display/snapshot` - Single JPEG frame
 
 ### Features
-- **Auto-orientation**: Detects printer model and applies correct rotation (90°, 180°, or 270°)
-- **Hardware encoding**: Uses RV1106 VENC for efficient JPEG compression
-- **Low CPU**: ~15% CPU usage at 5 fps
+- **On-demand encoding**: Only captures when clients connected AND enabled (saves CPU)
+- **Disabled by default**: Enable via control page to save CPU when not needed
+- **Configurable FPS**: 1-10 fps selectable via control page
+- **Auto-orientation**: Detects printer model and applies correct rotation
+- **Full hardware acceleration**: RGA rotation + RGA color conversion + VENC JPEG encoding
+- **CPU usage**: ~0-10% when active (full hardware pipeline)
 
 ### How It Works
 1. Framebuffer is memory-mapped from /dev/fb0 (800×480 BGRX, 32bpp)
 2. Copied to DMA buffer (framebuffer mmap is slow/uncached)
-3. CPU rotation applied based on printer model (NEON SIMD for 180°)
-4. RGA converts BGRX → NV12
-5. VENC encodes to JPEG
+3. RGA hardware rotation/flip based on printer model
+4. RGA hardware color conversion BGRX → NV12
+5. VENC hardware encodes to JPEG
 6. Served via HTTP on `/display` endpoint
 
 ### Printer Model Orientation
-| Model | Orientation |
-|-------|-------------|
-| KS1, KS1M | 180° flip |
-| K3M | 270° rotation |
-| K3, K2P, K3V2 | 90° rotation |
+| Model | Orientation | RGA Operation |
+|-------|-------------|---------------|
+| KS1, KS1M | 180° flip | `imflip()` FLIP_H_V |
+| K3M | 270° rotation | `imrotate()` ROT_270 |
+| K3, K2P, K3V2 | 90° rotation | `imrotate()` ROT_90 |
+
+### Control Page Settings
+- **Display Capture toggle**: Enable/disable display streaming
+- **Display FPS**: 1, 2, 5, or 10 fps (lower = less CPU)
 
 ---
 
