@@ -84,9 +84,15 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <linux/fb.h>
+#include <linux/input.h>
 #include <math.h>
 #include <ctype.h>
 #include <time.h>
+
+// Display wake paths
+#define BRIGHTNESS_PATH "/sys/class/backlight/backlight/brightness"
+#define TOUCH_DEVICE "/dev/input/event0"
+#define WAKE_TOUCH_DURATION_MS 50
 
 // Screen orientation modes (based on printer model)
 typedef enum {
@@ -461,6 +467,85 @@ static void release_lock(int fd) {
         flock(fd, LOCK_UN);
         close(fd);
     }
+}
+
+// Emit a single input event
+static void emit_input_event(int fd, int type, int code, int val) {
+    struct input_event ie;
+    memset(&ie, 0, sizeof(ie));
+    gettimeofday(&ie.time, NULL);
+    ie.type = type;
+    ie.code = code;
+    ie.value = val;
+    write(fd, &ie, sizeof(ie));
+}
+
+// Inject touch at specified coordinates
+static int inject_touch(int x, int y, int duration_ms) {
+    int fd = open(TOUCH_DEVICE, O_WRONLY);
+    if (fd < 0) {
+        return -1;
+    }
+
+    // Touch down - MT Protocol B
+    emit_input_event(fd, EV_ABS, ABS_MT_SLOT, 0);
+    emit_input_event(fd, EV_ABS, ABS_MT_TRACKING_ID, 1);
+    emit_input_event(fd, EV_ABS, ABS_MT_POSITION_X, x);
+    emit_input_event(fd, EV_ABS, ABS_MT_POSITION_Y, y);
+    emit_input_event(fd, EV_ABS, ABS_MT_TOUCH_MAJOR, 50);
+    emit_input_event(fd, EV_ABS, ABS_MT_PRESSURE, 100);
+    emit_input_event(fd, EV_KEY, BTN_TOUCH, 1);
+    emit_input_event(fd, EV_SYN, SYN_REPORT, 0);
+
+    usleep(duration_ms * 1000);
+
+    // Touch up
+    emit_input_event(fd, EV_ABS, ABS_MT_TRACKING_ID, -1);
+    emit_input_event(fd, EV_KEY, BTN_TOUCH, 0);
+    emit_input_event(fd, EV_SYN, SYN_REPORT, 0);
+
+    close(fd);
+    return 0;
+}
+
+// Wake display by injecting touch at safe coordinates
+// Touch wakes K3SysUi which restores brightness AND proper background
+// (Standby mode sets brightness=0 AND changes background to gray)
+// Safe coordinates are in the upper-right corner (status icon area) to avoid triggering UI actions
+static void wake_display(void) {
+    // Get framebuffer dimensions for safe touch coordinates
+    int fb_width = 800, fb_height = 480;  // defaults
+    FILE *vsize = fopen("/sys/class/graphics/fb0/virtual_size", "r");
+    if (vsize) {
+        fscanf(vsize, "%d,%d", &fb_width, &fb_height);
+        fclose(vsize);
+    }
+
+    // Calculate safe wake coordinates based on orientation
+    // Touch at upper-right corner (status icon area) - won't trigger UI buttons
+    int safe_x, safe_y;
+    switch (g_orientation) {
+        case ORIENT_FLIP_180:  // KS1, KS1M - 180° flip
+            safe_x = 2;
+            safe_y = fb_height - 2;
+            break;
+        case ORIENT_ROTATE_270:  // K3M - 270° rotation
+            safe_x = 2;
+            safe_y = 2;
+            break;
+        case ORIENT_ROTATE_90:  // K3, K2P, K3V2 - 90° rotation
+        case ORIENT_NORMAL:
+        default:
+            safe_x = fb_width - 2;
+            safe_y = 2;
+            break;
+    }
+
+    // Inject touch to wake display and reset K3SysUi sleep timer
+    inject_touch(safe_x, safe_y, WAKE_TOUCH_DURATION_MS);
+
+    // Small delay to let display wake up
+    usleep(100000);  // 100ms
 }
 
 static int save_screen(void) {
@@ -2141,6 +2226,9 @@ int main(int argc, char *argv[]) {
 
     // Commands without framebuffer
     if (strcmp(cmd, "save") == 0) {
+        // Wake display before saving to ensure we capture visible content
+        g_orientation = detect_orientation();
+        wake_display();
         ret = save_screen();
         if (ret == 0) printf("Screen saved\n");
         return ret;
@@ -2214,6 +2302,9 @@ int main(int argc, char *argv[]) {
         // Detect orientation
         g_orientation = detect_orientation();
 
+        // Wake display before saving to ensure we capture visible content
+        wake_display();
+
         // Save screen to memory buffer (for double-buffering)
         if (save_screen_to_buffer(&state.fb, &state.saved_screen, &state.saved_screen_size) != 0) {
             fprintf(stderr, "Failed to save screen to memory\n");
@@ -2263,6 +2354,9 @@ int main(int argc, char *argv[]) {
     }
 
     g_orientation = detect_orientation();
+
+    // Wake display before showing message (ensures it's visible)
+    wake_display();
 
     if (set_busy) {
         set_printer_busy(1);

@@ -4,7 +4,7 @@
 
 Investigation into detecting and controlling the LCD display standby mode on RV1106-based Anycubic printers (Kobra 2 Pro, Kobra 3, Kobra S1, etc.).
 
-**Status**: Display wake via sysfs brightness CONFIRMED WORKING. Touch injection PARTIALLY IMPLEMENTED - needs verification.
+**Status**: Display wake via sysfs brightness CONFIRMED WORKING. Touch injection CONFIRMED WORKING.
 
 ## Key Findings
 
@@ -82,6 +82,21 @@ fi
 | 0 | Standby (backlight off) |
 | 1-255 | Awake (255 = full brightness) |
 
+### Standby Mode Behavior
+
+When K3SysUi puts the display into standby mode, it does TWO things:
+1. Sets brightness to 0 (backlight off)
+2. **Changes the framebuffer background to gray** (not black)
+
+This means capturing the framebuffer while in standby will show gray content, not the actual UI.
+
+**Important**: Touch injection is the preferred wake method because it triggers K3SysUi to:
+- Restore brightness to full (255)
+- Restore the proper black background
+- Reset the sleep timer
+
+Simply setting brightness via sysfs only turns on the backlight but does NOT restore the background.
+
 ## Waking the Display
 
 ### Method 1: Sysfs Brightness (CONFIRMED WORKING)
@@ -109,9 +124,9 @@ echo 1 > /sys/devices/platform/ff350000.pwm/pwm/pwmchip0/pwm0/enable  # BAD!
 
 K3SysUi monitors `/dev/input/event0` for touch events. However, K3SysUi **grabs the device exclusively** via `EVIOCGRAB`, which complicates injection.
 
-#### Approach 1: Direct Event Write (PARTIALLY WORKING)
+#### Approach 1: Direct Event Write (CONFIRMED WORKING)
 
-Writing directly to `/dev/input/event0` appears to work (no errors), but verification of K3SysUi receiving events is pending.
+Writing directly to `/dev/input/event0` works. K3SysUi receives and processes the injected touch events.
 
 **C Implementation** (`touch_direct.c`):
 ```c
@@ -157,7 +172,7 @@ int inject_touch(int x, int y, int duration_ms) {
 }
 ```
 
-**Status**: Events write successfully, but K3SysUi response not verified. May need visual confirmation via display stream.
+**Status**: CONFIRMED WORKING - K3SysUi receives and processes injected touch events.
 
 #### Approach 2: uinput Virtual Device (DOES NOT WORK)
 
@@ -205,17 +220,33 @@ No display-related methods are exposed via the gkapi RPC interface (port 18086).
 ### For Detection Only
 Use `actual_brightness` sysfs - it's read-only and always accurate.
 
-### For Wake Functionality
-1. Try writing to `brightness` sysfs first
-2. If that doesn't work reliably, consider:
-   - Sending a signal to K3SysUi (needs investigation)
-   - Finding an IPC mechanism
-   - Physical touch remains the most reliable method
+### For Wake Functionality (CONFIRMED WORKING)
+1. **Touch injection** (RECOMMENDED) - Write events directly to `/dev/input/event0`
+   - Restores brightness to full
+   - Restores proper black background (standby uses gray)
+   - Resets K3SysUi sleep timer
+2. **Brightness sysfs** (partial wake only) - Write to `/sys/class/backlight/backlight/brightness`
+   - Only turns on backlight
+   - Does NOT restore background (stays gray)
+   - Does NOT reset sleep timer
+
+**For fb-status**: Use touch injection only at safe coordinates (upper-right corner).
+This properly wakes K3SysUi and restores the framebuffer to actual UI content.
 
 ### Avoid
 - Never write directly to PWM sysfs files
-- Never kill K3SysUi process
+- Never kill or send signals to K3SysUi process
+- Never try to manually restart K3SysUi - it requires boot-time Qt/framebuffer setup
 - Don't assume brightness writes will persist (timer will override)
+
+### Forcing Screen Refresh
+There is no safe programmatic way to force K3SysUi to refresh/repaint the display. Available options:
+- **Physical touch** on the screen
+- **Reboot** the printer
+- Trigger a state change K3SysUi monitors (start print, change settings, etc.)
+
+**WARNING**: Sending SIGUSR1 or other signals to K3SysUi will crash it, and manual restart
+results in incorrect display orientation due to missing boot-time environment setup.
 
 ## Related Files
 
@@ -234,13 +265,90 @@ Use `actual_brightness` sysfs - it's read-only and always accurate.
 - [x] Confirmed display wake via brightness sysfs
 - [x] Created direct event injection tool (`touch_direct.c`)
 - [x] Tested uinput approach (does not work - K3SysUi ignores virtual devices)
+- [x] Confirmed direct event write works - K3SysUi receives injected touches
+- [x] Confirmed EVIOCGRAB does NOT prevent write injection
 
 ### Pending
-- [ ] Visually verify touch injection works via display stream
-- [ ] Investigate if EVIOCGRAB prevents write injection
 - [ ] Integrate touch injection into display stream web interface
 - [ ] Add display wake to fb-status before framebuffer capture
 
 ### Use Cases
 1. **fb-status**: Wake display before capturing framebuffer background
 2. **Display stream**: Remote touch control via web interface mouse clicks
+
+## Safe Wake Touch Coordinates
+
+To wake the display without triggering any UI action, touch the **upper-right corner** where the Anycubic status icon is located.
+
+### Discovering Display Properties
+
+Display resolution and orientation vary by printer model. Discover dynamically:
+
+```bash
+# Get framebuffer dimensions
+cat /sys/class/graphics/fb0/virtual_size
+# Output: 800,480 (width,height)
+
+# Get bits per pixel and line length for orientation detection
+cat /sys/class/graphics/fb0/bits_per_pixel  # typically 32
+cat /sys/class/graphics/fb0/stride          # bytes per line
+
+# Detect orientation from fb_var_screeninfo
+# width > height = landscape (0° or 180°)
+# height > width = portrait (90° or 270°)
+```
+
+### Safe Wake Coordinates Formula
+
+The status icon is in the **upper-right corner** of the display (as viewed by user). Touch coordinates must account for both resolution AND orientation.
+
+```c
+// Discover dimensions at runtime
+int fb_width, fb_height;  // From /sys/class/graphics/fb0/virtual_size
+int orientation;          // 0, 90, 180, 270 degrees
+
+// Safe wake coordinates depend on orientation
+// Status icon is always upper-right in USER's view
+int safe_x, safe_y;
+
+switch (orientation) {
+    case 0:    // Normal landscape
+        safe_x = fb_width - 2;
+        safe_y = 2;
+        break;
+    case 90:   // Portrait, rotated CW
+        safe_x = fb_width - 2;
+        safe_y = fb_height - 2;
+        break;
+    case 180:  // Landscape, upside down
+        safe_x = 2;
+        safe_y = fb_height - 2;
+        break;
+    case 270:  // Portrait, rotated CCW
+        safe_x = 2;
+        safe_y = 2;
+        break;
+}
+```
+
+### Known Display Configurations
+
+Orientation is determined by model ID from `/userdata/app/gk/config/api.cfg`:
+
+| Model | Model ID | Orientation | FB Size | Touch Safe Wake |
+|-------|----------|-------------|---------|-----------------|
+| Kobra 2 Pro | 20021 | ROTATE_90 | 480x800 | (478, 2) |
+| Kobra 3 | 20024 | ROTATE_90 | 480x800 | (478, 2) |
+| Kobra S1 | 20025 | FLIP_180 | 800x480 | (2, 478) |
+| Kobra 3 Max | 20026 | ROTATE_270 | 480x800 | (2, 2) |
+| Kobra 3 V2 | 20027 | ROTATE_90 | 480x800 | (478, 2) |
+| Kobra S1 Max | 20029 | FLIP_180 | 800x480 | (2, 478) |
+
+**Note**: fb-status uses the same orientation detection logic. See `detect_orientation()` in `fb_status.c`.
+
+**Usage in fb-status:**
+1. Discover display dimensions from framebuffer
+2. Determine safe coordinates based on orientation
+3. Inject touch at safe coordinates: `inject_touch(safe_x, safe_y, 50)`
+4. Wait briefly (100ms) for K3SysUi to restore display
+5. Capture framebuffer background (now shows actual UI, not gray)
