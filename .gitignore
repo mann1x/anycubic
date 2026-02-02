@@ -10,13 +10,13 @@ fb-status/fb_status
 fb-status/fb_status_arm
 h264-streamer/29-h264-streamer/rkmpi_enc
 
-# Large SDK directories (too big for git)
+# Large SDK libraries (too big for git, use printer libs at runtime)
 rkmpi-encoder/lib/
 rkmpi-encoder/lib-printer/
-rkmpi-encoder/include/
 rkmpi-encoder/openssl-1.1.1w/
 rkmpi-encoder/openssl-1.1.1w.tar.gz
-rkmpi-encoder/openssl-arm/
+# Note: rkmpi-encoder/include/ and rkmpi-encoder/openssl-arm/ are tracked
+# They contain headers needed for CI builds (~17MB)
 
 # Python cache
 __pycache__/
