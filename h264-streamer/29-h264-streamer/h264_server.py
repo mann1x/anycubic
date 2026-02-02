@@ -3467,7 +3467,7 @@ class StreamerApp:
                 </div>
                 <div id="tab-display" class="tab-content">
                     <img id="display-stream" style="display:none">
-                    <p style="color:#888;font-size:12px">Printer LCD framebuffer (5 FPS)</p>
+                    <p style="color:#888;font-size:12px">Printer LCD framebuffer</p>
                 </div>
             </div>
             <div class="links" style="margin-top:10px;display:flex;justify-content:space-between;align-items:center;">
@@ -3671,7 +3671,7 @@ class StreamerApp:
                             </label>
                         </div>
                     </div>
-                    <div class="setting-note">Capture printer LCD screen (uses ~15% CPU when active)</div>
+                    <div class="setting-note">Capture printer LCD screen (full hardware acceleration)</div>
                 </div>
                 <div class="setting rkmpi-only" style="{'display:none' if not self.is_rkmpi_mode() else ''}">
                     <div class="setting-row">
