@@ -47,8 +47,20 @@ Hardware H.264/JPEG encoder for RV1106-based Anycubic 3D printers.
 | `-n` | Disable H.264 (MJPEG only) | off |
 | `-v` | Verbose output | off |
 | `-S` | Server mode (built-in HTTP) | off |
+| `--yuyv` | Use YUYV capture (lower CPU) | off |
 | `--display` | Enable display capture | off |
 | `--streaming-port` | HTTP server port | 8080 |
+
+### Mode Comparison
+
+| Feature | MJPEG Mode | YUYV Mode |
+|---------|------------|-----------|
+| Camera Format | MJPEG | YUYV |
+| JPEG Output | Pass-through | Hardware encode |
+| H.264 Encoding | Hardware | Hardware |
+| CPU Usage | ~15-20% | ~5-10% |
+| Max FPS (720p) | 30 fps | 5-10 fps |
+| Best For | High FPS | Low CPU |
 
 ## HTTP Endpoints
 
@@ -96,11 +108,13 @@ Located in `/oem/usr/lib/`:
 
 ## Architecture
 
+### MJPEG Capture Mode (default)
+
 ```
 USB Camera (V4L2 MJPEG)
     │
     ▼
-TurboJPEG decode (software)
+TurboJPEG decode (software, ~15% CPU)
     │
     ▼
 NV12 frame buffer
@@ -108,13 +122,54 @@ NV12 frame buffer
     ├──► VENC Ch0 (H.264) ──► FLV HTTP :18088
     │
     └──► VENC Ch1 (MJPEG) ──► MJPEG HTTP :8080
-
-Display Capture (--display flag):
-    /dev/fb0 ──► RGA rotation ──► RGA BGRX→NV12 ──► VENC Ch2 (MJPEG)
-                                                          │
-                                                          ▼
-                                                   /display :8080
 ```
+
+- Higher FPS possible (up to 30 fps)
+- Software JPEG decode adds CPU overhead
+- Best for: High frame rate streaming
+
+### YUYV Capture Mode (`--yuyv`)
+
+```
+USB Camera (V4L2 YUYV)
+    │
+    ▼
+YUYV → NV12 conversion (CPU, ~5% CPU)
+    │
+    ▼
+NV12 frame buffer
+    │
+    ├──► VENC Ch0 (H.264) ──► FLV HTTP :18088
+    │
+    └──► VENC Ch1 (MJPEG) ──► MJPEG HTTP :8080  ← Hardware JPEG encoding
+```
+
+- Lower CPU usage (no TurboJPEG decode)
+- Limited to ~5-10 fps at 720p (USB bandwidth constraint)
+- Both H.264 and MJPEG use hardware encoding
+- Best for: Low CPU overhead
+
+### Display Capture (`--display`)
+
+```
+/dev/fb0 (800x480 BGRX)
+    │
+    ▼
+RGA DMA copy (10-15x faster than CPU memcpy)
+    │
+    ▼
+RGA rotation/flip (model-specific)
+    │
+    ▼
+RGA BGRX → NV12 conversion
+    │
+    ▼
+VENC Ch2 (MJPEG) ──► /display :8080
+```
+
+- Full hardware acceleration (RGA + VENC)
+- CPU usage: ~7-13% at 10fps
+- On-demand: Only encodes when clients connected
 
 ## Display Capture
 
