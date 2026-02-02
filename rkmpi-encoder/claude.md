@@ -239,18 +239,26 @@ Auto-detected from `/userdata/app/gk/config/api.cfg` (JSON format with `modelId`
 - `/display/snapshot` - Single JPEG frame (on-demand capture)
 
 ### Performance
-- **CPU usage**: ~0-10% when active (full hardware pipeline)
+- **CPU usage**: ~7-13% when active at 10fps (full hardware pipeline with RGA DMA copy)
+- **Per-frame timing** (measured):
+  - RGA framebuffer copy: ~2ms (vs 20-50ms for CPU memcpy)
+  - RGA rotation: ~2ms
+  - RGA color conversion: ~1.5ms
+  - VENC JPEG: ~1ms
+  - Total: ~6-11ms per frame
 - **Memory**: 3 DMA buffers (~4.5MB total)
   - Source BGRX: 800×480×4 = 1.5MB
   - Rotation BGRX: 800×480×4 = 1.5MB
   - NV12 output: 800×480×1.5 = 0.6MB
 
 ### Implementation Details
+- RGA DMA copy from framebuffer (10-15x faster than CPU memcpy from uncached mmap)
 - Two-step RGA pipeline: rotation/flip first, then color conversion
 - DMA buffers allocated via `RK_MPI_MMZ_Alloc` for RGA/VENC access
 - Cache flush required after CPU writes, before hardware reads
 - Uses VENC channel 2 (separate from camera channels 0, 1)
-- CPU fallback available if RGA rotation fails
+- CPU fallback available if RGA copy or rotation fails
+- Timing instrumentation available via `-DDISPLAY_TIMING` compile flag
 
 ## Output Pipes
 
