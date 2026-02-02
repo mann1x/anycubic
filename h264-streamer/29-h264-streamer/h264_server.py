@@ -2354,9 +2354,13 @@ class StreamerApp:
             config['display_enabled'] = 'true' if self.display_enabled else 'false'
             config['display_fps'] = str(self.display_fps)
 
-            # Write back
+            # Write back with explicit flush and sync
             with open(config_path, 'w') as f:
                 json.dump(config, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            # System-wide sync to ensure all buffers are written to disk
+            os.sync()
             print(f"Settings saved to {config_path}", flush=True)
         except Exception as e:
             print(f"Error saving config: {e}", flush=True)
