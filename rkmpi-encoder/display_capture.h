@@ -28,7 +28,7 @@
 #define DISPLAY_JPEG_QUALITY  80
 
 /* Default capture FPS (display updates are typically slow) */
-#define DISPLAY_DEFAULT_FPS   1
+#define DISPLAY_DEFAULT_FPS   5
 
 /* Maximum display FPS */
 #define DISPLAY_MAX_FPS       10
