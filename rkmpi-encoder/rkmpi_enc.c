@@ -611,6 +611,9 @@ static void read_ctrl_file(void) {
         } else if (strncmp(line, "timelapse_temp_dir:", 19) == 0) {
             /* Set temp directory for timelapse frames */
             timelapse_set_temp_dir(line + 19);
+        } else if (sscanf(line, "timelapse_use_venc:%d", &val) == 1) {
+            /* Enable/disable hardware VENC encoding (1=VENC, 0=ffmpeg) */
+            timelapse_set_use_venc(val);
         }
     }
     fclose(f);

@@ -275,14 +275,23 @@ int timelapse_init(const char *gcode_name, const char *output_dir) {
     /* Initialize state */
     g_timelapse.frame_count = 0;
     g_timelapse.active = 1;
+    g_timelapse.venc_initialized = 0;
+    g_timelapse.frame_width = 0;
+    g_timelapse.frame_height = 0;
+
+    /* Default to hardware VENC encoding (can be overridden via control file) */
+    if (g_timelapse.use_venc == 0) {
+        g_timelapse.use_venc = 1;  /* Enable VENC by default */
+    }
 
     timelapse_log("Started: %s (seq %02d), frames -> %s, output -> %s\n",
                   g_timelapse.gcode_name, g_timelapse.sequence_num,
                   g_timelapse.temp_dir, get_output_dir());
-    timelapse_log("Config: fps=%d, crf=%d, variable=%d, flip=%d/%d\n",
+    timelapse_log("Config: fps=%d, crf=%d, variable=%d, flip=%d/%d, use_venc=%d\n",
                   g_timelapse.config.output_fps, g_timelapse.config.crf,
                   g_timelapse.config.variable_fps,
-                  g_timelapse.config.flip_x, g_timelapse.config.flip_y);
+                  g_timelapse.config.flip_x, g_timelapse.config.flip_y,
+                  g_timelapse.use_venc);
 
     return 0;
 }
