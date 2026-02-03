@@ -2253,6 +2253,18 @@ int main(int argc, char *argv[]) {
                         RK_U32 jpeg_len = stJpegStream.pstPack->u32Len;
 
                         if (jpeg_data && jpeg_len > 0) {
+                            /* Validate JPEG header (0xFFD8) and minimum size */
+                            const uint8_t *jpg = (const uint8_t *)jpeg_data;
+                            int valid_jpeg = (jpeg_len >= 100 && jpg[0] == 0xFF && jpg[1] == 0xD8);
+
+                            if (!valid_jpeg) {
+                                log_info("[JPEG] Bad frame detected: len=%u, header=0x%02x%02x\n",
+                                         jpeg_len, jpg[0], jpg[1]);
+                                /* Skip this frame */
+                                RK_MPI_VENC_ReleaseStream(VENC_CHN_JPEG, &stJpegStream);
+                                goto skip_jpeg_output;
+                            }
+
                             /* Write to frame buffer for HTTP servers */
                             TIMING_START(frame_buffer);
                             if (cfg.server_mode && frame_buffers_initialized) {
@@ -2292,6 +2304,7 @@ int main(int argc, char *argv[]) {
                     }
                 }
             }
+skip_jpeg_output:
 
             /*
              * Encode to H.264 (hardware) - always at full speed in YUYV mode
