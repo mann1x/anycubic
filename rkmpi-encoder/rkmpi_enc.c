@@ -333,6 +333,17 @@ static int client_activity_check(int mjpeg_clients, int flv_clients, int server_
 
 /* Global state */
 static volatile int g_running = 1;
+static volatile int g_snapshot_pending = 0;  /* HTTP snapshot requested */
+
+/* Request a snapshot (called from HTTP server thread) */
+void request_camera_snapshot(void) {
+    g_snapshot_pending = 1;
+}
+
+/* Check if snapshot is still pending */
+int is_snapshot_pending(void) {
+    return g_snapshot_pending;
+}
 
 /* V4L2 buffer info */
 typedef struct {
@@ -513,6 +524,11 @@ static void write_ctrl_file(void) {
     fprintf(f, "mjpeg_clients=%d\n", g_stats.mjpeg_clients);
     fprintf(f, "flv_clients=%d\n", g_stats.flv_clients);
     fprintf(f, "display_clients=%d\n", display_get_client_count());
+    /* Detected camera max FPS (for h264_server.py to update slider limits) */
+    if (g_mjpeg_ctrl.camera_fps_detected && g_mjpeg_ctrl.camera_interval > 0) {
+        int camera_max_fps = 1000000 / g_mjpeg_ctrl.camera_interval;
+        fprintf(f, "camera_max_fps=%d\n", camera_max_fps);
+    }
     fclose(f);
 }
 
@@ -1873,19 +1889,19 @@ int main(int argc, char *argv[]) {
             int flv_clients = cfg.server_mode ? flv_server_client_count() : 0;
             int total_clients = mjpeg_clients + flv_clients;
 
-            /* Idle mode - no clients, sleep longer */
-            if (cfg.server_mode && !cfg.mjpeg_stdout && total_clients == 0) {
+            /* Idle mode - no clients, sleep longer (unless snapshot pending) */
+            if (cfg.server_mode && !cfg.mjpeg_stdout && total_clients == 0 && !g_snapshot_pending) {
                 usleep(500000);  /* 500ms sleep when fully idle */
                 continue;
             }
 
-            /* Only rate limit if camera is faster than target (adaptive) */
-            if (g_mjpeg_ctrl.rate_limit_needed) {
+            /* Always apply rate limiting in MJPEG mode to enforce target fps */
+            {
                 RK_U64 now = get_timestamp_us();
                 RK_U64 next_frame_time = g_mjpeg_ctrl.last_output_time + g_mjpeg_ctrl.target_interval;
                 if (now < next_frame_time) {
                     RK_U64 sleep_time = next_frame_time - now;
-                    usleep(sleep_time);  /* Sleep without touching V4L2 */
+                    usleep(sleep_time);  /* Sleep to enforce target fps */
                 }
             }
         }
@@ -1928,11 +1944,9 @@ int main(int argc, char *argv[]) {
                 if (captured_count >= 30) {
                     int camera_fps = 1000000 / g_mjpeg_ctrl.camera_interval;
                     g_mjpeg_ctrl.camera_fps_detected = 1;
-                    /* Only rate limit if camera is significantly faster than target */
                     g_mjpeg_ctrl.rate_limit_needed = (camera_fps > g_mjpeg_ctrl.target_fps + 2);
-                    log_info("Camera rate detected: %d fps (interval %llu us), target %d fps, rate limiting: %s\n",
-                             camera_fps, g_mjpeg_ctrl.camera_interval, g_mjpeg_ctrl.target_fps,
-                             g_mjpeg_ctrl.rate_limit_needed ? "enabled" : "disabled");
+                    log_info("Camera rate detected: %d fps (interval %llu us), output limited to %d fps\n",
+                             camera_fps, g_mjpeg_ctrl.camera_interval, g_mjpeg_ctrl.target_fps);
                 }
             }
             g_mjpeg_ctrl.last_dqbuf_time = now;
@@ -1944,6 +1958,18 @@ int main(int argc, char *argv[]) {
          * MJPEG mode: TurboJPEG decode is CPU-intensive
          */
         if (cfg.yuyv_mode) {
+            /* Check for idle mode (no clients, no snapshot pending) */
+            int mjpeg_clients = cfg.server_mode ? mjpeg_server_client_count() : 0;
+            int flv_clients = cfg.server_mode ? flv_server_client_count() : 0;
+            int total_clients = mjpeg_clients + flv_clients;
+
+            if (cfg.server_mode && total_clients == 0 && !g_snapshot_pending) {
+                /* Idle mode - no clients, requeue and sleep */
+                ioctl(v4l2_fd, VIDIOC_QBUF, &buf);
+                usleep(500000);  /* 500ms sleep when fully idle */
+                continue;
+            }
+
             /* Apply rate control to reduce YUYV→NV12 conversion overhead */
             int process_frame = mjpeg_rate_control(captured_count);
             if (!process_frame) {
@@ -2000,6 +2026,7 @@ int main(int argc, char *argv[]) {
                             if (cfg.server_mode && frame_buffers_initialized) {
                                 frame_buffer_write(&g_jpeg_buffer, jpeg_data, jpeg_len,
                                                    get_timestamp_us(), 0);
+                                g_snapshot_pending = 0;  /* Clear snapshot request */
                             }
                             TIMING_END(frame_buffer);
 
@@ -2108,11 +2135,12 @@ int main(int argc, char *argv[]) {
             uint8_t *jpeg_data = capture_data;
             size_t jpeg_len = capture_len;
 
-            /* Write JPEG to frame buffer for HTTP servers (only if clients connected) */
+            /* Write JPEG to frame buffer for HTTP servers (if clients connected or snapshot pending) */
             TIMING_START(frame_buffer);
-            if (cfg.server_mode && frame_buffers_initialized && mjpeg_clients > 0) {
+            if (cfg.server_mode && frame_buffers_initialized && (mjpeg_clients > 0 || g_snapshot_pending)) {
                 frame_buffer_write(&g_jpeg_buffer, jpeg_data, jpeg_len,
                                    get_timestamp_us(), 0);
+                g_snapshot_pending = 0;  /* Clear snapshot request after writing frame */
             }
             TIMING_END(frame_buffer);
 
@@ -2287,14 +2315,11 @@ int main(int argc, char *argv[]) {
             last_stats_write = now;
         }
 
-        /* Print stats every 5 seconds */
+        /* Print stats every 5 seconds - use interval FPS (same as ctrl file) for consistency */
         if (g_verbose && (now - last_stats_time) >= 5000000) {
-            double elapsed = (now - start_time) / 1000000.0;
-            double mjpeg_fps = mjpeg_frame_count / elapsed;
-            double h264_fps = h264_frame_count / elapsed;
             log_info("Stats: MJPEG=%llu (%.1f fps), H.264=%llu (%.1f fps, %s skip=%d%s)\n",
-                     (unsigned long long)mjpeg_frame_count, mjpeg_fps,
-                     (unsigned long long)h264_frame_count, h264_fps,
+                     (unsigned long long)mjpeg_frame_count, g_stats.mjpeg_fps,
+                     (unsigned long long)h264_frame_count, g_stats.h264_fps,
                      g_ctrl.h264_enabled ? "on" : "off", g_ctrl.skip_ratio,
                      g_ctrl.auto_skip ? " auto" : "");
             last_stats_time = now;

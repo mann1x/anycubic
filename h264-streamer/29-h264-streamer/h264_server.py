@@ -2759,7 +2759,7 @@ class StreamerApp:
         # Runtime state
         self.autolanmode = args.autolanmode
         self.logging = getattr(args, 'logging', False)  # Debug logging enabled
-        self.h264_enabled = True
+        self.h264_enabled = getattr(args, 'h264_enabled', True)
         self.skip_ratio = getattr(args, 'skip_ratio', 4)  # Default 25% (100/4)
         self.saved_skip_ratio = self.skip_ratio  # Manual setting to restore when auto_skip disabled
         self.auto_skip = getattr(args, 'auto_skip', True)  # Default enabled
@@ -2927,6 +2927,14 @@ class StreamerApp:
                             self.encoder_flv_clients = int(line.split('=')[1])
                         except ValueError:
                             pass
+                    elif line.startswith('camera_max_fps='):
+                        try:
+                            detected_fps = int(line.split('=')[1])
+                            # Update max_camera_fps if encoder detected a different rate
+                            if detected_fps > 0 and detected_fps != self.max_camera_fps:
+                                self.max_camera_fps = detected_fps
+                        except ValueError:
+                            pass
         except Exception:
             pass
 
@@ -2948,6 +2956,7 @@ class StreamerApp:
             config['gkcam_all_frames'] = 'true' if self.gkcam_all_frames else 'false'
             config['autolanmode'] = 'true' if self.autolanmode else 'false'
             config['logging'] = 'true' if self.logging else 'false'
+            config['h264_enabled'] = 'true' if self.h264_enabled else 'false'
             config['auto_skip'] = 'true' if self.auto_skip else 'false'
             config['target_cpu'] = str(self.target_cpu)
             config['skip_ratio'] = str(self.saved_skip_ratio)  # Save manual setting
@@ -3193,13 +3202,25 @@ class StreamerApp:
             effective_skip = self.skip_ratio
             effective_auto_skip = self.auto_skip
 
+        # Determine camera/encode resolution based on mode and settings
+        # For rkmpi-yuyv: h264_resolution sets camera capture resolution
+        # For rkmpi: camera is always at native res, h264_resolution sets encode resolution
+        if self.encoder_type == 'rkmpi-yuyv' and self.h264_resolution:
+            # Parse resolution setting for YUYV camera capture
+            try:
+                cam_w, cam_h = map(int, self.h264_resolution.split('x'))
+            except:
+                cam_w, cam_h = self.camera_width, self.camera_height
+        else:
+            cam_w, cam_h = self.camera_width, self.camera_height
+
         cmd = [
             encoder_path,
             '-S',  # Server mode
             '-N',  # No stdout
             '-d', self.camera_device,
-            '-w', str(self.camera_width),
-            '-h', str(self.camera_height),
+            '-w', str(cam_w),
+            '-h', str(cam_h),
             '-f', str(self.mjpeg_fps_target),
             '-s', str(effective_skip),
             '-b', str(self.bitrate),
@@ -4219,8 +4240,8 @@ class StreamerApp:
                         <div class="control">
                             <select name="encoder_type" id="encoder_type" onchange="handleEncoderChange(this)" style="padding:8px;border-radius:4px;border:1px solid #555;background:#333;color:#fff;">
                                 <option value="gkcam" {'selected' if self.encoder_type == 'gkcam' else ''}>gkcam (built-in)</option>
-                                <option value="rkmpi" {'selected' if self.encoder_type == 'rkmpi' else ''}>rkmpi (USB camera)</option>
-                                <option value="rkmpi-yuyv" {'selected' if self.encoder_type == 'rkmpi-yuyv' else ''}>rkmpi-yuyv (HW JPEG)</option>
+                                <option value="rkmpi" {'selected' if self.encoder_type == 'rkmpi' else ''}>rkmpi (HW MJPEG)</option>
+                                <option value="rkmpi-yuyv" {'selected' if self.encoder_type == 'rkmpi-yuyv' else ''}>rkmpi-yuyv (HW H.264)</option>
                             </select>
                         </div>
                     </div>
@@ -4344,17 +4365,18 @@ class StreamerApp:
                     </div>
                     <div class="setting-note">Requires restart</div>
                 </div>
-                <div class="setting rkmpi-mjpeg-only" style="{'display:none' if self.encoder_type != 'rkmpi' else ''}">
+                <div class="setting rkmpi-only" style="{'display:none' if not self.is_rkmpi_mode() else ''}">
                     <div class="setting-row">
-                        <span class="label">H.264 Resolution:</span>
+                        <span class="label">Camera Resolution:</span>
                         <div class="control">
-                            <select name="h264_resolution" style="padding:8px;border-radius:4px;border:1px solid #555;background:#333;color:#fff;">
+                            <select name="h264_resolution" id="camera_resolution" style="padding:8px;border-radius:4px;border:1px solid #555;background:#333;color:#fff;">
                                 <option value="1280x720" {'selected' if self.h264_resolution == '1280x720' else ''}>1280x720 (full)</option>
-                                <option value="640x360" {'selected' if self.h264_resolution == '640x360' else ''}>640x360 (scaled, lower CPU)</option>
+                                <option value="640x360" {'selected' if self.h264_resolution == '640x360' else ''}>640x360 (scaled)</option>
                             </select>
                         </div>
                     </div>
-                    <div class="setting-note">Lower resolution = less TurboJPEG decode CPU. Requires restart.</div>
+                    <div class="setting-note rkmpi-mjpeg-note" style="{'display:none' if self.encoder_type != 'rkmpi' else ''}">Lower resolution = less TurboJPEG decode CPU. Requires restart.</div>
+                    <div class="setting-note rkmpi-yuyv-note" style="{'display:none' if self.encoder_type != 'rkmpi-yuyv' else ''}">Lower resolution = more FPS. Requires restart.</div>
                 </div>
                 <div class="setting rkmpi-only" style="{'display:none' if not self.is_rkmpi_mode() else ''}; border-top: 1px solid #444; padding-top: 15px; margin-top: 15px;">
                     <div class="setting-row">
@@ -4658,6 +4680,13 @@ class StreamerApp:
             document.querySelectorAll('.gkcam-only').forEach(el => {{
                 el.style.display = encoderType === 'gkcam' ? '' : 'none';
             }});
+            // Camera resolution notes - show appropriate note for encoder type
+            document.querySelectorAll('.rkmpi-mjpeg-note').forEach(el => {{
+                el.style.display = encoderType === 'rkmpi' ? '' : 'none';
+            }});
+            document.querySelectorAll('.rkmpi-yuyv-note').forEach(el => {{
+                el.style.display = encoderType === 'rkmpi-yuyv' ? '' : 'none';
+            }});
         }}
 
         // Handle encoder type change - requires restart
@@ -4695,6 +4724,9 @@ class StreamerApp:
             data.append('bitrate', document.querySelector('[name=bitrate]').value);
             data.append('mjpeg_fps', document.querySelector('[name=mjpeg_fps]').value);
             data.append('h264_resolution', document.querySelector('[name=h264_resolution]')?.value || '1280x720');
+            // Display capture settings
+            data.append('display_enabled', formData.has('display_enabled') ? 'on' : '');
+            data.append('display_fps', document.querySelector('[name=display_fps]').value);
 
             // Save settings, then restart
             // Stop stats polling during restart to avoid connection errors
@@ -4774,7 +4806,11 @@ class StreamerApp:
             event.target.classList.add('active');
 
             // Handle stream states
-            if (tab === 'mjpeg') {{
+            if (tab === 'snapshot') {{
+                // Refresh snapshot when switching to tab
+                const img = document.getElementById('preview-img');
+                img.src = streamBase + '/snapshot?' + Date.now();
+            }} else if (tab === 'mjpeg') {{
                 startMjpegStream();
             }} else {{
                 stopMjpegStream();
@@ -4978,6 +5014,7 @@ if(flvjs.isSupported()){{
 
         // FPS percentage helpers
         let currentMjpegFps = 20;  // Will be updated from stats
+        let currentMaxCameraFps = {self.max_camera_fps};  // Will be updated from encoder detection
         let savedSkipRatio = {self.saved_skip_ratio};  // Manual setting to restore
 
         function pctToSkipRatio(pct) {{
@@ -5242,6 +5279,21 @@ if(flvjs.isSupported()){{
                         currentMjpegFps = data.fps.mjpeg;
                         updateFpsLabel();
                     }}
+                    // Update MJPEG FPS slider max if camera detection changed it
+                    if (data.max_camera_fps && data.max_camera_fps !== currentMaxCameraFps) {{
+                        currentMaxCameraFps = data.max_camera_fps;
+                        const slider = document.getElementById('mjpeg_fps_slider');
+                        const input = document.getElementById('mjpeg_fps_input');
+                        if (slider && input) {{
+                            slider.max = currentMaxCameraFps;
+                            input.max = currentMaxCameraFps;
+                            // Clamp current value if it exceeds new max
+                            if (parseInt(slider.value) > currentMaxCameraFps) {{
+                                slider.value = currentMaxCameraFps;
+                                input.value = currentMaxCameraFps;
+                            }}
+                        }}
+                    }}
                     // Keep saved_skip_ratio in sync with server
                     if (data.saved_skip_ratio) {{
                         savedSkipRatio = data.saved_skip_ratio;
@@ -5305,7 +5357,7 @@ if(flvjs.isSupported()){{
             const needsGkcamRestart = (newGkcamAllFrames !== currentGkcamAllFrames) && currentEncoderType === 'gkcam';
             const needsLoggingRestart = (newLogging !== currentLogging);
             const needsBitrateRestart = (newBitrate !== currentBitrate) && (currentEncoderType === 'rkmpi' || currentEncoderType === 'rkmpi-yuyv');
-            const needsResolutionRestart = (newH264Resolution !== currentH264Resolution) && currentEncoderType === 'rkmpi';
+            const needsResolutionRestart = (newH264Resolution !== currentH264Resolution) && (currentEncoderType === 'rkmpi' || currentEncoderType === 'rkmpi-yuyv');
             const needsRestart = needsRkmpiRestart || needsGkcamRestart || needsLoggingRestart || needsBitrateRestart || needsResolutionRestart;
 
             if (needsRestart) {{
@@ -7585,6 +7637,10 @@ def main():
         args.auto_skip = saved_config['auto_skip'] == 'true'
     else:
         args.auto_skip = getattr(args, 'auto_skip', True)
+    if 'h264_enabled' in saved_config:
+        args.h264_enabled = saved_config['h264_enabled'] == 'true'
+    else:
+        args.h264_enabled = getattr(args, 'h264_enabled', True)
     args.target_cpu = max(25, min(90, int(saved_config.get('target_cpu', getattr(args, 'target_cpu', 25)))))
     args.skip_ratio = max(1, min(20, int(saved_config.get('skip_ratio', getattr(args, 'skip_ratio', 4)))))
     args.bitrate = max(100, min(4000, int(saved_config.get('bitrate', getattr(args, 'bitrate', 512)))))

@@ -312,9 +312,80 @@ static void http_send_snapshot_from_buffer(int fd, FrameBuffer *buffer, size_t m
     free(jpeg_buf);
 }
 
-/* Send single JPEG snapshot (camera) */
+/* External functions from rkmpi_enc.c for snapshot support */
+extern void request_camera_snapshot(void);
+extern int is_snapshot_pending(void);
+
+/* Send single JPEG snapshot (camera)
+ * If no clients are connected, the capture loop may be idle.
+ * Request a snapshot and wait for it.
+ */
 static void http_send_snapshot(int fd) {
-    http_send_snapshot_from_buffer(fd, &g_jpeg_buffer, FRAME_BUFFER_MAX_JPEG);
+    /* First try to get an existing frame */
+    uint64_t cur_seq = frame_buffer_get_sequence(&g_jpeg_buffer);
+    uint64_t cur_ts = 0;
+    uint8_t *jpeg_buf = malloc(FRAME_BUFFER_MAX_JPEG);
+    if (!jpeg_buf) {
+        http_send_404(fd);
+        return;
+    }
+
+    size_t jpeg_size = frame_buffer_copy(&g_jpeg_buffer, jpeg_buf,
+                                          FRAME_BUFFER_MAX_JPEG, NULL, &cur_ts);
+
+    /* If we have a recent frame (< 2 seconds old), use it */
+    uint64_t now = get_time_us();
+    if (jpeg_size > 0 && cur_ts > 0 && (now - cur_ts) < 2000000) {
+        char headers[256];
+        int hlen = snprintf(headers, sizeof(headers),
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: image/jpeg\r\n"
+            "Content-Length: %zu\r\n"
+            "Cache-Control: no-cache\r\n"
+            "Connection: close\r\n"
+            "\r\n", jpeg_size);
+        http_send(fd, headers, hlen);
+        http_send(fd, jpeg_buf, jpeg_size);
+        free(jpeg_buf);
+        return;
+    }
+
+    /* No recent frame - request capture and wait */
+    request_camera_snapshot();
+
+    int waited_ms = 0;
+    const int max_wait_ms = 3000;  /* 3 second timeout */
+    const int poll_ms = 50;
+
+    while (waited_ms < max_wait_ms) {
+        usleep(poll_ms * 1000);
+        waited_ms += poll_ms;
+
+        /* Check if new frame is available */
+        uint64_t new_seq = frame_buffer_get_sequence(&g_jpeg_buffer);
+        if (new_seq > cur_seq) {
+            jpeg_size = frame_buffer_copy(&g_jpeg_buffer, jpeg_buf,
+                                          FRAME_BUFFER_MAX_JPEG, NULL, NULL);
+            if (jpeg_size > 0) break;
+        }
+    }
+
+    if (jpeg_size > 0) {
+        char headers[256];
+        int hlen = snprintf(headers, sizeof(headers),
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: image/jpeg\r\n"
+            "Content-Length: %zu\r\n"
+            "Cache-Control: no-cache\r\n"
+            "Connection: close\r\n"
+            "\r\n", jpeg_size);
+        http_send(fd, headers, hlen);
+        http_send(fd, jpeg_buf, jpeg_size);
+    } else {
+        http_send_404(fd);
+    }
+
+    free(jpeg_buf);
 }
 
 /* Send single JPEG snapshot (display)
