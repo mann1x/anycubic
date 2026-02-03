@@ -706,12 +706,25 @@ static void *mjpeg_server_thread(void *arg) {
         uint64_t camera_seq = frame_buffer_get_sequence(&g_jpeg_buffer);
         uint64_t display_seq = frame_buffer_get_sequence(&g_display_buffer);
 
+        uint64_t now = get_time_us();
+
         for (int i = 0; i < HTTP_MAX_CLIENTS; i++) {
             HttpClient *client = &srv->clients[i];
 
             if (client->fd > 0 && client->state == CLIENT_STATE_CLOSING) {
                 http_close_client(srv, i);
                 continue;
+            }
+
+            /* Close idle connections that haven't sent a request */
+            if (client->fd > 0 && client->state == CLIENT_STATE_IDLE) {
+                uint64_t idle_time = (now - client->connect_time) / 1000000;  /* seconds */
+                if (idle_time >= HTTP_IDLE_TIMEOUT_SEC) {
+                    log_info("HTTP[%d]: Closing idle connection (slot %d, %llu sec)\n",
+                             srv->port, i, (unsigned long long)idle_time);
+                    http_close_client(srv, i);
+                    continue;
+                }
             }
 
             if (client->fd > 0 && client->state == CLIENT_STATE_STREAMING) {
@@ -892,6 +905,7 @@ static void *flv_server_thread(void *arg) {
 
         /* Stream H.264 to connected FLV clients */
         uint64_t current_seq = frame_buffer_get_sequence(&g_h264_buffer);
+        uint64_t now = get_time_us();
 
         for (int i = 0; i < HTTP_MAX_CLIENTS; i++) {
             HttpClient *client = &srv->clients[i];
@@ -900,6 +914,18 @@ static void *flv_server_thread(void *arg) {
                 http_close_client(srv, i);
                 flv_muxer_reset(&muxers[i]);
                 continue;
+            }
+
+            /* Close idle connections that haven't sent a request */
+            if (client->fd > 0 && client->state == CLIENT_STATE_IDLE) {
+                uint64_t idle_time = (now - client->connect_time) / 1000000;  /* seconds */
+                if (idle_time >= HTTP_IDLE_TIMEOUT_SEC) {
+                    log_info("HTTP[%d]: Closing idle connection (slot %d, %llu sec)\n",
+                             srv->port, i, (unsigned long long)idle_time);
+                    http_close_client(srv, i);
+                    flv_muxer_reset(&muxers[i]);
+                    continue;
+                }
             }
 
             if (client->fd > 0 && client->state == CLIENT_STATE_STREAMING &&

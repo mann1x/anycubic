@@ -20,9 +20,12 @@
 #define HTTP_FLV_PORT    18088
 
 /* Limits */
-#define HTTP_MAX_CLIENTS      8
+#define HTTP_MAX_CLIENTS      24
 #define HTTP_RECV_BUF_SIZE    4096
 #define HTTP_SEND_BUF_SIZE    (512 * 1024)
+
+/* Idle connection timeout (seconds) - close connections that don't send a request */
+#define HTTP_IDLE_TIMEOUT_SEC 10
 
 /* MJPEG boundary string */
 #define MJPEG_BOUNDARY  "mjpegstream"
