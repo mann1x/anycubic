@@ -2797,7 +2797,8 @@ class StreamerApp:
         self.target_cpu = getattr(args, 'target_cpu', 25)  # Default 25%
         self.bitrate = getattr(args, 'bitrate', 512)
         self.mjpeg_fps_target = getattr(args, 'mjpeg_fps', 10)  # Target MJPEG framerate
-        self.max_camera_fps = 30  # Will be detected from camera
+        self.max_camera_fps = 30  # Declared camera capability (from v4l2-ctl)
+        self.detected_camera_fps = 0  # Actual measured camera delivery rate
 
         # Display capture settings (disabled by default to save CPU)
         self.display_enabled = getattr(args, 'display_enabled', False)
@@ -2998,9 +2999,10 @@ class StreamerApp:
                     elif line.startswith('camera_max_fps='):
                         try:
                             detected_fps = int(line.split('=')[1])
-                            # Update max_camera_fps if encoder detected a different rate
-                            if detected_fps > 0 and detected_fps != self.max_camera_fps:
-                                self.max_camera_fps = detected_fps
+                            # Store actual measured camera rate (for display only)
+                            # Don't update max_camera_fps - that stays at declared capability
+                            if detected_fps > 0:
+                                self.detected_camera_fps = detected_fps
                         except ValueError:
                             pass
                     # Camera controls (read from encoder)
@@ -5436,7 +5438,7 @@ if(flvjs.isSupported()){{
 
         // FPS percentage helpers
         let currentMjpegFps = 20;  // Will be updated from stats
-        let currentMaxCameraFps = {self.max_camera_fps};  // Will be updated from encoder detection
+        let currentMaxCameraFps = {self.max_camera_fps};  // Declared camera capability (slider max)
         let savedSkipRatio = {self.saved_skip_ratio};  // Manual setting to restore
 
         function pctToSkipRatio(pct) {{
@@ -5701,21 +5703,7 @@ if(flvjs.isSupported()){{
                         currentMjpegFps = data.fps.mjpeg;
                         updateFpsLabel();
                     }}
-                    // Update MJPEG FPS slider max if camera detection changed it
-                    if (data.max_camera_fps && data.max_camera_fps !== currentMaxCameraFps) {{
-                        currentMaxCameraFps = data.max_camera_fps;
-                        const slider = document.getElementById('mjpeg_fps_slider');
-                        const input = document.getElementById('mjpeg_fps_input');
-                        if (slider && input) {{
-                            slider.max = currentMaxCameraFps;
-                            input.max = currentMaxCameraFps;
-                            // Clamp current value if it exceeds new max
-                            if (parseInt(slider.value) > currentMaxCameraFps) {{
-                                slider.value = currentMaxCameraFps;
-                                input.value = currentMaxCameraFps;
-                            }}
-                        }}
-                    }}
+                    // Track detected camera fps for display (slider max stays at declared capability)
                     // Keep saved_skip_ratio in sync with server
                     if (data.saved_skip_ratio) {{
                         savedSkipRatio = data.saved_skip_ratio;
@@ -6037,6 +6025,7 @@ if(flvjs.isSupported()){{
             'autolanmode': self.autolanmode,
             'mjpeg_fps_target': self.mjpeg_fps_target,
             'max_camera_fps': self.max_camera_fps,
+            'detected_camera_fps': self.detected_camera_fps,
             'session_id': self.session_id,
             'display_enabled': self.display_enabled,
             'display_fps': self.display_fps
