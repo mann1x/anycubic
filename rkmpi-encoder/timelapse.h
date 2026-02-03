@@ -14,9 +14,16 @@
 /* Default output directory for timelapse videos */
 #define TIMELAPSE_OUTPUT_DIR    "/useremain/app/gk/Time-lapse-Video/"
 #define TIMELAPSE_TEMP_DIR      "/tmp/timelapse_frames"
-#define TIMELAPSE_FFMPEG_PATH   "/ac_lib/lib/third_bin/ffmpeg"
+
+/* FFmpeg configuration
+ * Primary: Our bundled static ffmpeg (no dependencies)
+ * Fallback: Stock ffmpeg with LD_LIBRARY_PATH set
+ */
+#define TIMELAPSE_FFMPEG_PATH   "/useremain/home/rinkhals/apps/29-h264-streamer/ffmpeg"
+#define TIMELAPSE_FFMPEG_STOCK  "/ac_lib/lib/third_bin/ffmpeg"
 #define TIMELAPSE_FFMPEG_LIBS   "/ac_lib/lib/third_lib"
-#define TIMELAPSE_FFMPEG_CMD    "LD_LIBRARY_PATH=" TIMELAPSE_FFMPEG_LIBS ":$LD_LIBRARY_PATH " TIMELAPSE_FFMPEG_PATH
+#define TIMELAPSE_FFMPEG_CMD    TIMELAPSE_FFMPEG_PATH
+#define TIMELAPSE_FFMPEG_CMD_STOCK "LD_LIBRARY_PATH=" TIMELAPSE_FFMPEG_LIBS ":$LD_LIBRARY_PATH " TIMELAPSE_FFMPEG_STOCK
 
 /* Maximum path lengths */
 #define TIMELAPSE_PATH_MAX      1024
@@ -46,6 +53,12 @@ typedef struct {
     int frame_count;                        /* Number of frames captured */
     int sequence_num;                       /* Sequence number (_01, _02, etc.) */
     TimelapseConfig config;                 /* Current configuration */
+
+    /* Hardware VENC encoding state */
+    int use_venc;                           /* 1 to use hardware VENC, 0 for ffmpeg */
+    int venc_initialized;                   /* 1 if VENC encoder is ready */
+    int frame_width;                        /* Frame width (from first frame) */
+    int frame_height;                       /* Frame height (from first frame) */
 } TimelapseState;
 
 /* Global timelapse state */
@@ -62,6 +75,15 @@ void timelapse_set_duplicate_last(int count);
 void timelapse_set_flip(int flip_x, int flip_y);
 void timelapse_set_output_dir(const char *dir);
 void timelapse_set_temp_dir(const char *dir);
+
+/*
+ * Enable or disable hardware VENC encoding.
+ * When enabled, uses RV1106 hardware H.264 encoder instead of ffmpeg.
+ * Must be called before timelapse_init().
+ *
+ * @param enabled 1 to use VENC (default), 0 to use ffmpeg
+ */
+void timelapse_set_use_venc(int enabled);
 
 /*
  * Reset configuration to defaults.

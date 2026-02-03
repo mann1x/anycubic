@@ -1,15 +1,17 @@
 /*
  * Timelapse Recording Implementation
  *
- * Captures JPEG frames from the encoder's frame buffer and assembles
- * them into MP4 video using ffmpeg.
+ * Primary: Hardware VENC H.264 encoding with minimp4 muxing (no dependencies)
+ * Fallback: FFmpeg with libx264 software encoding
  */
 
 /* Disable format-truncation warnings - snprintf truncation is intentional and safe */
 #pragma GCC diagnostic ignored "-Wformat-truncation"
 
 #include "timelapse.h"
+#include "timelapse_venc.h"
 #include "frame_buffer.h"
+#include "turbojpeg.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
@@ -53,6 +55,12 @@ void timelapse_reset_config(void) {
     g_timelapse.config.flip_x = 0;
     g_timelapse.config.flip_y = 0;
     g_timelapse.config.output_dir[0] = '\0';
+    g_timelapse.use_venc = 1;  /* Default to hardware VENC encoding */
+}
+
+void timelapse_set_use_venc(int enabled) {
+    g_timelapse.use_venc = enabled ? 1 : 0;
+    timelapse_log("Set use_venc: %d\n", g_timelapse.use_venc);
 }
 
 /*
@@ -362,6 +370,54 @@ int timelapse_capture_frame(void) {
         return -1;
     }
 
+    /* VENC path: encode directly to H.264 */
+    if (g_timelapse.use_venc) {
+        /* Initialize VENC on first frame (need dimensions from JPEG header) */
+        if (!g_timelapse.venc_initialized) {
+            tjhandle tj = tjInitDecompress();
+            if (tj) {
+                int width, height, subsamp, colorspace;
+                if (tjDecompressHeader3(tj, jpeg_buf, jpeg_size, &width, &height,
+                                        &subsamp, &colorspace) == 0) {
+                    g_timelapse.frame_width = width;
+                    g_timelapse.frame_height = height;
+                    int fps = g_timelapse.config.output_fps;
+                    timelapse_log("VENC init: %dx%d @ %dfps\n", width, height, fps);
+
+                    if (timelapse_venc_init(width, height, fps) == 0) {
+                        g_timelapse.venc_initialized = 1;
+                    } else {
+                        timelapse_log("VENC init failed, falling back to ffmpeg\n");
+                        g_timelapse.use_venc = 0;
+                    }
+                } else {
+                    timelapse_log("Failed to parse JPEG header: %s\n", tjGetErrorStr());
+                    g_timelapse.use_venc = 0;
+                }
+                tjDestroy(tj);
+            } else {
+                timelapse_log("tjInitDecompress failed, falling back to ffmpeg\n");
+                g_timelapse.use_venc = 0;
+            }
+        }
+
+        /* Encode frame with VENC if initialized */
+        if (g_timelapse.venc_initialized) {
+            if (timelapse_venc_add_frame(jpeg_buf, jpeg_size) == 0) {
+                g_timelapse.frame_count++;
+                if (g_timelapse.frame_count % 10 == 0) {
+                    timelapse_log("VENC frame %d encoded\n", g_timelapse.frame_count);
+                }
+                free(jpeg_buf);
+                return 0;
+            } else {
+                timelapse_log("VENC encode failed for frame %d\n", g_timelapse.frame_count);
+                /* Continue to save JPEG as fallback */
+            }
+        }
+    }
+
+    /* FFmpeg path: save JPEG to disk for later encoding */
     /* Build frame filename */
     char filename[TIMELAPSE_PATH_MAX];
     snprintf(filename, sizeof(filename), "%s/frame_%04d.jpg",
@@ -457,10 +513,72 @@ int timelapse_finalize(void) {
 
     timelapse_log("Finalizing %d frames...\n", g_timelapse.frame_count);
 
+    /* Build output filenames */
+    const char *output_dir = get_output_dir();
+    char output_mp4[TIMELAPSE_PATH_MAX];
+    char output_thumb[TIMELAPSE_PATH_MAX];
+
+    snprintf(output_mp4, sizeof(output_mp4), "%s/%s_%02d.mp4",
+             output_dir, g_timelapse.gcode_name,
+             g_timelapse.sequence_num);
+
+    snprintf(output_thumb, sizeof(output_thumb), "%s/%s_%02d_%d.jpg",
+             output_dir, g_timelapse.gcode_name,
+             g_timelapse.sequence_num, g_timelapse.frame_count);
+
+    /* VENC path: finalize hardware-encoded MP4 */
+    if (g_timelapse.venc_initialized) {
+        timelapse_log("VENC finalize: %d frames -> %s\n", g_timelapse.frame_count, output_mp4);
+
+        /* Ensure output directory exists */
+        ensure_directory(output_dir);
+
+        int ret = timelapse_venc_finish(output_mp4);
+        g_timelapse.venc_initialized = 0;
+
+        if (ret == 0) {
+            timelapse_log("VENC created: %s\n", output_mp4);
+
+            /* Generate thumbnail from last JPEG in frame buffer */
+            uint8_t *jpeg_buf = malloc(FRAME_BUFFER_MAX_JPEG);
+            if (jpeg_buf) {
+                uint64_t seq;
+                size_t jpeg_size = frame_buffer_copy(&g_jpeg_buffer, jpeg_buf,
+                                                      FRAME_BUFFER_MAX_JPEG,
+                                                      &seq, NULL, NULL);
+                if (jpeg_size > 0) {
+                    FILE *f = fopen(output_thumb, "wb");
+                    if (f) {
+                        fwrite(jpeg_buf, 1, jpeg_size, f);
+                        fclose(f);
+                        timelapse_log("Created thumbnail: %s\n", output_thumb);
+                    }
+                }
+                free(jpeg_buf);
+            }
+
+            /* Reset state */
+            g_timelapse.active = 0;
+            g_timelapse.frame_count = 0;
+            memset(g_timelapse.gcode_name, 0, sizeof(g_timelapse.gcode_name));
+            memset(g_timelapse.temp_dir, 0, sizeof(g_timelapse.temp_dir));
+            return 0;
+        } else {
+            timelapse_log("VENC finalize failed, cannot fall back (frames not saved to disk)\n");
+            g_timelapse.active = 0;
+            g_timelapse.frame_count = 0;
+            memset(g_timelapse.gcode_name, 0, sizeof(g_timelapse.gcode_name));
+            memset(g_timelapse.temp_dir, 0, sizeof(g_timelapse.temp_dir));
+            return -1;
+        }
+    }
+
+    /* FFmpeg path: assemble JPEGs from disk */
+
     /* Duplicate last frame if configured */
     if (g_timelapse.config.duplicate_last_frame > 0) {
-        char last_frame[TIMELAPSE_PATH_MAX];
-        snprintf(last_frame, sizeof(last_frame), "%s/frame_%04d.jpg",
+        char last_frame_path[TIMELAPSE_PATH_MAX];
+        snprintf(last_frame_path, sizeof(last_frame_path), "%s/frame_%04d.jpg",
                  g_timelapse.temp_dir, g_timelapse.frame_count - 1);
 
         for (int i = 0; i < g_timelapse.config.duplicate_last_frame; i++) {
@@ -469,7 +587,7 @@ int timelapse_finalize(void) {
                      g_timelapse.temp_dir, g_timelapse.frame_count + i);
 
             char cmd[TIMELAPSE_PATH_MAX * 2 + 32];
-            snprintf(cmd, sizeof(cmd), "cp '%s' '%s'", last_frame, dup_frame);
+            snprintf(cmd, sizeof(cmd), "cp '%s' '%s'", last_frame_path, dup_frame);
             system(cmd);
         }
         g_timelapse.frame_count += g_timelapse.config.duplicate_last_frame;
@@ -480,20 +598,12 @@ int timelapse_finalize(void) {
     /* Calculate output FPS */
     int output_fps = calculate_output_fps(g_timelapse.frame_count);
 
-    /* Build output filenames */
-    const char *output_dir = get_output_dir();
-    char output_mp4[TIMELAPSE_PATH_MAX];
-    char output_thumb[TIMELAPSE_PATH_MAX];
-    char last_frame[TIMELAPSE_PATH_MAX];
-
-    snprintf(output_mp4, sizeof(output_mp4), "%s/%s_%02d.mp4",
-             output_dir, g_timelapse.gcode_name,
-             g_timelapse.sequence_num);
-
+    /* Update output filenames (frame count may have changed from duplicates) */
     snprintf(output_thumb, sizeof(output_thumb), "%s/%s_%02d_%d.jpg",
              output_dir, g_timelapse.gcode_name,
              g_timelapse.sequence_num, g_timelapse.frame_count);
 
+    char last_frame[TIMELAPSE_PATH_MAX];
     snprintf(last_frame, sizeof(last_frame), "%s/frame_%04d.jpg",
              g_timelapse.temp_dir, g_timelapse.frame_count - 1);
 
@@ -525,17 +635,39 @@ int timelapse_finalize(void) {
     timelapse_log("Running ffmpeg (fps=%d, crf=%d)...\n", output_fps, crf);
     int ret = system(cmd);
 
-    /* Fallback to mpeg4 if libx264 fails (e.g., OOM) */
+    /* Fallback 1: Try stock ffmpeg with LD_LIBRARY_PATH if static failed */
+    if (ret != 0) {
+        timelapse_log("Static ffmpeg failed (code %d), trying stock ffmpeg...\n", ret);
+        if (vf_filter[0] != '\0') {
+            snprintf(cmd, sizeof(cmd),
+                     TIMELAPSE_FFMPEG_CMD_STOCK " -y -framerate %d -i '%s/frame_%%04d.jpg' "
+                     "-vf '%s' "
+                     "-c:v libx264 -preset ultrafast -tune zerolatency "
+                     "-x264-params keyint=30:min-keyint=10:scenecut=0:bframes=0:ref=1:rc-lookahead=0:threads=1 "
+                     "-crf %d -pix_fmt yuv420p '%s' >/dev/null 2>&1",
+                     output_fps, g_timelapse.temp_dir, vf_filter, crf, output_mp4);
+        } else {
+            snprintf(cmd, sizeof(cmd),
+                     TIMELAPSE_FFMPEG_CMD_STOCK " -y -framerate %d -i '%s/frame_%%04d.jpg' "
+                     "-c:v libx264 -preset ultrafast -tune zerolatency "
+                     "-x264-params keyint=30:min-keyint=10:scenecut=0:bframes=0:ref=1:rc-lookahead=0:threads=1 "
+                     "-crf %d -pix_fmt yuv420p '%s' >/dev/null 2>&1",
+                     output_fps, g_timelapse.temp_dir, crf, output_mp4);
+        }
+        ret = system(cmd);
+    }
+
+    /* Fallback 2: Try mpeg4 codec if libx264 fails (e.g., OOM) */
     if (ret != 0) {
         timelapse_log("libx264 failed (code %d), trying mpeg4...\n", ret);
         if (vf_filter[0] != '\0') {
             snprintf(cmd, sizeof(cmd),
-                     TIMELAPSE_FFMPEG_CMD " -y -framerate %d -i '%s/frame_%%04d.jpg' "
+                     TIMELAPSE_FFMPEG_CMD_STOCK " -y -framerate %d -i '%s/frame_%%04d.jpg' "
                      "-vf '%s' -c:v mpeg4 -q:v 5 '%s' >/dev/null 2>&1",
                      output_fps, g_timelapse.temp_dir, vf_filter, output_mp4);
         } else {
             snprintf(cmd, sizeof(cmd),
-                     TIMELAPSE_FFMPEG_CMD " -y -framerate %d -i '%s/frame_%%04d.jpg' "
+                     TIMELAPSE_FFMPEG_CMD_STOCK " -y -framerate %d -i '%s/frame_%%04d.jpg' "
                      "-c:v mpeg4 -q:v 5 '%s' >/dev/null 2>&1",
                      output_fps, g_timelapse.temp_dir, output_mp4);
         }
@@ -572,6 +704,12 @@ void timelapse_cancel(void) {
 
     timelapse_log("Canceling (had %d frames)\n", g_timelapse.frame_count);
 
+    /* Cleanup VENC if it was initialized */
+    if (g_timelapse.venc_initialized) {
+        timelapse_venc_cancel();
+        g_timelapse.venc_initialized = 0;
+    }
+
     /* Cleanup temp directory if it exists */
     if (strlen(g_timelapse.temp_dir) > 0) {
         cleanup_temp_dir(g_timelapse.temp_dir);
@@ -580,6 +718,8 @@ void timelapse_cancel(void) {
     /* Reset state */
     g_timelapse.active = 0;
     g_timelapse.frame_count = 0;
+    g_timelapse.frame_width = 0;
+    g_timelapse.frame_height = 0;
     memset(g_timelapse.gcode_name, 0, sizeof(g_timelapse.gcode_name));
     memset(g_timelapse.temp_dir, 0, sizeof(g_timelapse.temp_dir));
 }

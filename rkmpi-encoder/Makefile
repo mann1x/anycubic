@@ -50,6 +50,7 @@ SRCS = rkmpi_enc.c \
        mqtt_client.c \
        rpc_client.c \
        timelapse.c \
+       timelapse_venc.c \
        display_capture.c \
        cJSON.c
 
@@ -63,6 +64,8 @@ HDRS = frame_buffer.h \
        mqtt_client.h \
        rpc_client.h \
        timelapse.h \
+       timelapse_venc.h \
+       minimp4.h \
        display_capture.h
 
 .PHONY: all clean install static dynamic server-only timing
