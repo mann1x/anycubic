@@ -578,6 +578,8 @@ static void http_handle_client_read(HttpServer *srv, HttpClient *client) {
                 http_send_mjpeg_headers(client->fd);
                 client->state = CLIENT_STATE_STREAMING;
                 client->header_sent = 1;
+                /* Skip stale frame in buffer - wait for next fresh frame */
+                client->last_frame_seq = frame_buffer_get_sequence(&g_jpeg_buffer);
                 log_info("HTTP[%d]: MJPEG stream started\n", srv->port);
                 break;
 
@@ -590,6 +592,8 @@ static void http_handle_client_read(HttpServer *srv, HttpClient *client) {
                 http_send_mjpeg_headers(client->fd);
                 client->state = CLIENT_STATE_STREAMING;
                 client->header_sent = 1;
+                /* Skip stale frame in buffer - wait for next fresh frame */
+                client->last_frame_seq = frame_buffer_get_sequence(&g_display_buffer);
                 display_client_connect();
                 log_info("HTTP[%d]: Display stream started\n", srv->port);
                 break;
@@ -603,6 +607,8 @@ static void http_handle_client_read(HttpServer *srv, HttpClient *client) {
                 http_send_flv_headers(client->fd);
                 client->state = CLIENT_STATE_STREAMING;
                 client->header_sent = 1;
+                /* Skip stale frame in buffer - wait for next fresh frame */
+                client->last_frame_seq = frame_buffer_get_sequence(&g_h264_buffer);
 
                 /* Allocate send buffer for FLV */
                 client->send_buf = malloc(HTTP_SEND_BUF_SIZE);

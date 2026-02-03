@@ -1092,9 +1092,35 @@ def stop_camera_stream():
 # Camera Detection and Management
 # ============================================================================
 
-def find_camera_device():
-    """Find USB camera device - works with any V4L2 camera"""
-    # Check by-id symlinks first (most reliable)
+def find_camera_device(internal_usb_port=None):
+    """Find USB camera device - prioritizes internal camera by USB port.
+
+    Args:
+        internal_usb_port: USB port for internal camera (e.g., "1.3").
+                          If None, uses first available camera.
+
+    The internal camera is typically at a fixed USB port (e.g., 1.3),
+    while external cameras connect through a USB hub (e.g., 1.4.x).
+    Using the USB path ensures we always get the internal camera,
+    even when external cameras are connected.
+    """
+    by_path = "/dev/v4l/by-path"
+
+    # First, try to find internal camera by USB port
+    if internal_usb_port and os.path.exists(by_path):
+        try:
+            # Pattern: platform-xhci-hcd.0.auto-usb-0:1.3:1.0-video-index0
+            port_pattern = f"usb-0:{internal_usb_port}:"
+            for entry in sorted(os.listdir(by_path)):
+                if port_pattern in entry and 'video-index0' in entry:
+                    device = os.path.realpath(os.path.join(by_path, entry))
+                    print(f"Found internal camera at USB port {internal_usb_port}: {entry} -> {device}", flush=True)
+                    return device
+            print(f"Internal camera not found at USB port {internal_usb_port}", flush=True)
+        except Exception as e:
+            print(f"Error scanning by-path for internal camera: {e}", flush=True)
+
+    # Fallback: Check by-id symlinks (any camera)
     by_id_path = "/dev/v4l/by-id"
     if os.path.exists(by_id_path):
         try:
@@ -1102,12 +1128,12 @@ def find_camera_device():
                 # Look for video-index0 (main capture device, not metadata)
                 if 'video-index0' in entry.lower():
                     device = os.path.realpath(os.path.join(by_id_path, entry))
-                    print(f"Found camera: {entry} -> {device}", flush=True)
+                    print(f"Found camera (by-id): {entry} -> {device}", flush=True)
                     return device
         except Exception as e:
             print(f"Error scanning by-id: {e}", flush=True)
 
-    # Try common USB camera devices on RV1106 (video10-19 range)
+    # Last resort: Try common USB camera devices on RV1106 (video10-19 range)
     for i in list(range(10, 20)) + list(range(0, 10)):
         device = f"/dev/video{i}"
         if os.path.exists(device):
@@ -2777,6 +2803,11 @@ class StreamerApp:
         self.display_enabled = getattr(args, 'display_enabled', False)
         self.display_fps = getattr(args, 'display_fps', 5)
 
+        # Internal camera USB port (for reliable detection when external cameras connected)
+        # Default: 1.3 (internal camera port on Anycubic printers)
+        # External cameras typically connect through hub at port 1.4.x
+        self.internal_usb_port = getattr(args, 'internal_usb_port', '1.3')
+
         # Advanced timelapse settings (Moonraker integration)
         self.timelapse_enabled = getattr(args, 'timelapse_enabled', False)
         self.timelapse_mode = getattr(args, 'timelapse_mode', 'layer')  # 'layer' or 'hyperlapse'
@@ -3047,6 +3078,7 @@ class StreamerApp:
             config['h264_resolution'] = self.h264_resolution
             config['display_enabled'] = 'true' if self.display_enabled else 'false'
             config['display_fps'] = str(self.display_fps)
+            config['internal_usb_port'] = self.internal_usb_port
 
             # Camera controls
             config['cam_brightness'] = str(self.cam_brightness)
@@ -3232,8 +3264,8 @@ class StreamerApp:
             start_camera_stream()
             time.sleep(2)
 
-        # Find camera
-        self.camera_device = find_camera_device()
+        # Find camera (prioritize internal camera by USB port)
+        self.camera_device = find_camera_device(self.internal_usb_port)
         if not self.camera_device:
             print("ERROR: No camera found!", flush=True)
             return False
@@ -6151,6 +6183,7 @@ addStream('Display Snapshot',streamBase+'/display/snapshot');
             'device': self.camera_device,
             'width': self.camera_width,
             'height': self.camera_height,
+            'internal_usb_port': self.internal_usb_port,
 
             # Operating mode
             'mode': self.mode,

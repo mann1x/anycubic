@@ -158,6 +158,9 @@ void __stack_chk_fail(void) {
 #define STATS_FILE         "/tmp/rkmpi_enc.stats"
 #define CTRL_CHECK_INTERVAL 30     /* Check control file every N frames */
 
+/* Camera warmup: skip first N frames to let auto-exposure stabilize */
+#define CAMERA_WARMUP_FRAMES 5
+
 /* MJPEG multipart boundary for HTTP streaming */
 #define MJPEG_BOUNDARY     "mjpegstream"
 
@@ -2209,6 +2212,22 @@ int main(int argc, char *argv[]) {
             }
             TIMING_END(yuyv_to_nv12);
 
+            /* Black frame detection: sample Y luminance values
+             * If average is very low, frame is likely black/corrupt */
+            {
+                int sum = 0;
+                int stride = cfg.width * cfg.height / 16;  /* Sample 16 pixels */
+                for (int i = 0; i < 16; i++) {
+                    sum += nv12_y[i * stride];
+                }
+                int avg_y = sum / 16;
+                if (avg_y < 8) {
+                    log_info("[FRAME] Black frame detected: avg_y=%d, skipping\n", avg_y);
+                    ioctl(v4l2_fd, VIDIOC_QBUF, &buf);
+                    continue;  /* Skip this frame */
+                }
+            }
+
             /* Prepare frame structure (shared by both encoders) */
             VIDEO_FRAME_INFO_S stEncFrame;
             memset(&stEncFrame, 0, sizeof(stEncFrame));
@@ -2246,9 +2265,11 @@ int main(int argc, char *argv[]) {
                                 goto skip_jpeg_output;
                             }
 
-                            /* Write to frame buffer for HTTP servers */
+                            /* Write to frame buffer for HTTP servers
+                             * Skip first few frames to let camera auto-exposure stabilize */
                             TIMING_START(frame_buffer);
-                            if (cfg.server_mode && frame_buffers_initialized) {
+                            if (cfg.server_mode && frame_buffers_initialized &&
+                                captured_count >= CAMERA_WARMUP_FRAMES) {
                                 frame_buffer_write(&g_jpeg_buffer, jpeg_data, jpeg_len,
                                                    get_timestamp_us(), 0);
                                 g_snapshot_pending = 0;  /* Clear snapshot request */
@@ -2361,9 +2382,12 @@ skip_jpeg_output:
             uint8_t *jpeg_data = capture_data;
             size_t jpeg_len = capture_len;
 
-            /* Write JPEG to frame buffer for HTTP servers (if clients connected or snapshot pending) */
+            /* Write JPEG to frame buffer for HTTP servers (if clients connected or snapshot pending)
+             * Skip first few frames to let camera auto-exposure stabilize */
             TIMING_START(frame_buffer);
-            if (cfg.server_mode && frame_buffers_initialized && (mjpeg_clients > 0 || g_snapshot_pending)) {
+            if (cfg.server_mode && frame_buffers_initialized &&
+                captured_count >= CAMERA_WARMUP_FRAMES &&
+                (mjpeg_clients > 0 || g_snapshot_pending)) {
                 frame_buffer_write(&g_jpeg_buffer, jpeg_data, jpeg_len,
                                    get_timestamp_us(), 0);
                 g_snapshot_pending = 0;  /* Clear snapshot request after writing frame */
