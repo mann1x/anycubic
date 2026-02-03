@@ -23,7 +23,7 @@
 #include "minimp4.h"
 
 /* VENC channel for timelapse - use channel 2 to avoid conflicts */
-#define VENC_CHN_TIMELAPSE  2
+#define VENC_CHN_TIMELAPSE  3  /* Channel 0=H.264, 1=JPEG, 2=Display, 3=Timelapse */
 
 /* Logging */
 #define TL_LOG(fmt, ...) fprintf(stderr, "[TIMELAPSE_VENC] " fmt, ##__VA_ARGS__)
