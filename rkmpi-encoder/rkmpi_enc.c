@@ -412,6 +412,7 @@ typedef struct {
     int vanilla_klipper;  /* 1=vanilla-klipper mode (skip MQTT/RPC) */
     /* Configurable ports */
     int streaming_port;   /* MJPEG HTTP port (default 8080) */
+    int control_port;     /* Control panel HTTP port (default 8081) */
     /* H.264 resolution (rkmpi mode only, 0=same as camera) */
     int h264_width;
     int h264_height;
@@ -1622,6 +1623,7 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "  --mode <mode>        Operating mode: go-klipper (default) or vanilla-klipper\n");
     fprintf(stderr, "                       vanilla-klipper: skip MQTT/RPC (for external Klipper)\n");
     fprintf(stderr, "  --streaming-port <n> MJPEG HTTP server port (default: %d)\n", HTTP_MJPEG_PORT);
+    fprintf(stderr, "  --control-port <n>   Control panel HTTP port for homepage links (default: %d)\n", HTTP_CONTROL_PORT);
     fprintf(stderr, "  --h264-resolution <WxH> H.264 encode resolution (rkmpi mode only, default: camera res)\n");
     fprintf(stderr, "                       Lower resolution reduces TurboJPEG decode CPU usage\n");
     fprintf(stderr, "  --display            Enable display framebuffer capture (server mode)\n");
@@ -1662,6 +1664,7 @@ int main(int argc, char *argv[]) {
         .no_stdout = 0,
         .vanilla_klipper = 0,
         .streaming_port = 0,
+        .control_port = 0,
         .h264_width = 0,
         .h264_height = 0,
         .display_capture = 0,
@@ -1692,6 +1695,7 @@ int main(int argc, char *argv[]) {
         {"help",         no_argument,       0, 'H'},
         {"mode",         required_argument, 0, 'M'},
         {"streaming-port", required_argument, 0, 'P'},
+        {"control-port", required_argument, 0, 'C'},
         {"h264-resolution", required_argument, 0, 'R'},
         {"display",      no_argument,       0, 'D'},
         {"display-fps",  required_argument, 0, 'F'},
@@ -1726,6 +1730,7 @@ int main(int argc, char *argv[]) {
                 }
                 break;
             case 'P': cfg.streaming_port = atoi(optarg); break;
+            case 'C': cfg.control_port = atoi(optarg); break;
             case 'R':
                 /* --h264-resolution: WxH format (e.g., 640x480) */
                 if (sscanf(optarg, "%dx%d", &cfg.h264_width, &cfg.h264_height) != 2) {
@@ -2039,6 +2044,9 @@ int main(int argc, char *argv[]) {
     if (cfg.server_mode) {
         log_info("Operating mode: %s\n", cfg.vanilla_klipper ? "vanilla-klipper" : "go-klipper");
         log_info("Starting built-in servers...\n");
+
+        /* Set control port for homepage links */
+        http_set_control_port(cfg.control_port);
 
         /* Start MJPEG HTTP server */
         int mjpeg_port = cfg.streaming_port > 0 ? cfg.streaming_port : HTTP_MJPEG_PORT;

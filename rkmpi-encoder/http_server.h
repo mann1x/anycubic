@@ -34,6 +34,9 @@ typedef enum {
     CLIENT_STATE_CLOSING        /* Marked for close */
 } ClientState;
 
+/* Default control port */
+#define HTTP_CONTROL_PORT 8081
+
 /* Client request type */
 typedef enum {
     REQUEST_NONE,
@@ -41,7 +44,8 @@ typedef enum {
     REQUEST_MJPEG_SNAPSHOT,     /* /snapshot */
     REQUEST_FLV_STREAM,         /* /flv */
     REQUEST_DISPLAY_STREAM,     /* /display */
-    REQUEST_DISPLAY_SNAPSHOT    /* /display/snapshot */
+    REQUEST_DISPLAY_SNAPSHOT,   /* /display/snapshot */
+    REQUEST_HOMEPAGE            /* / */
 } RequestType;
 
 /* Connection warmup to prevent CPU spikes */
@@ -104,5 +108,8 @@ void flv_server_stop(void);
 /* Get client counts (for stats) */
 int mjpeg_server_client_count(void);
 int flv_server_client_count(void);
+
+/* Set control port for homepage links (0 = use default HTTP_CONTROL_PORT) */
+void http_set_control_port(int port);
 
 #endif /* HTTP_SERVER_H */

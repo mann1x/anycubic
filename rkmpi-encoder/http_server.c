@@ -26,6 +26,13 @@
 MjpegServerThread g_mjpeg_server;
 FlvServerThread g_flv_server;
 
+/* Control port for homepage links (default: 8081) */
+static int g_control_port = HTTP_CONTROL_PORT;
+
+void http_set_control_port(int port) {
+    g_control_port = (port > 0) ? port : HTTP_CONTROL_PORT;
+}
+
 /*
  * Timing instrumentation - enable with -DENCODER_TIMING
  */
@@ -221,6 +228,10 @@ static RequestType parse_http_request(const char *buf, size_t len, int port) {
     int mjpeg_port = g_mjpeg_server.server.port > 0 ? g_mjpeg_server.server.port : HTTP_MJPEG_PORT;
 
     if (port == mjpeg_port) {
+        /* Homepage */
+        if (path_len == 1 && path[0] == '/') {
+            return REQUEST_HOMEPAGE;
+        }
         if (path_len >= 7 && strncmp(path, "/stream", 7) == 0) {
             return REQUEST_MJPEG_STREAM;
         }
@@ -269,6 +280,116 @@ static void http_send_404(int fd) {
         "\r\n"
         "Not Found";
     http_send(fd, response, strlen(response));
+}
+
+/* Send homepage */
+static void http_send_homepage(int fd, int streaming_port) {
+    int control_port = g_control_port;
+
+    /* Build HTML with embedded JavaScript for dynamic URLs */
+    char html[8192];
+    int len = snprintf(html, sizeof(html),
+        "<!DOCTYPE html><html><head><title>H264 Streamer</title>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<style>"
+        "body{font-family:sans-serif;margin:20px;background:#1a1a1a;color:#fff}"
+        ".container{max-width:800px;margin:0 auto}"
+        "h1{color:#4CAF50;margin-bottom:5px}"
+        ".subtitle{color:#888;margin-bottom:20px}"
+        ".section{background:#2d2d2d;padding:15px;margin:15px 0;border-radius:8px}"
+        ".section h2{margin:0 0 10px 0;color:#888;font-size:14px;text-transform:uppercase}"
+        "button{background:#4CAF50;color:#fff;border:none;padding:10px 20px;border-radius:4px;cursor:pointer;font-size:14px;margin:2px}"
+        "button:hover{background:#45a049}"
+        "button.secondary{background:#555}"
+        "button.secondary:hover{background:#666}"
+        ".stream-row{display:flex;align-items:center;margin:8px 0;padding:8px;background:#222;border-radius:4px}"
+        ".stream-url{flex:1;font-family:monospace;font-size:13px;color:#4CAF50;word-break:break-all}"
+        ".stream-btns{display:flex;gap:5px}"
+        ".stream-btns button{padding:5px 10px;font-size:12px}"
+        ".copy-btn{background:#444;padding:5px 8px !important}"
+        ".copy-btn:hover{background:#555}"
+        ".endpoint-row{display:flex;margin:6px 0;padding:6px 0;border-bottom:1px solid #333}"
+        ".endpoint-path{font-family:monospace;color:#4CAF50;min-width:180px}"
+        ".endpoint-desc{color:#aaa;font-size:13px}"
+        ".copied{background:#2e7d32 !important}"
+        "</style></head><body>"
+        "<div class='container'>"
+        "<h1>H264 Streamer</h1>"
+        "<p class='subtitle'>HTTP streaming server for Anycubic printers</p>"
+
+        /* Control Panel Section */
+        "<div class='section'>"
+        "<h2>Control Panel</h2>"
+        "<p style='color:#aaa;margin:0 0 10px 0;font-size:14px'>Configure streaming settings, camera controls, and preview video.</p>"
+        "<button onclick='openControl()'>Open Control Panel</button>"
+        "</div>"
+
+        /* Streams Section */
+        "<div class='section'>"
+        "<h2>Video Streams</h2>"
+        "<div id='streams'></div>"
+        "</div>"
+
+        /* Endpoints Section */
+        "<div class='section'>"
+        "<h2>API Endpoints</h2>"
+        "<p style='color:#888;font-size:12px;margin:0 0 10px 0'>Available on control port (<span id='cp'>%d</span>)</p>"
+        "<div class='endpoint-row'><span class='endpoint-path'>/control</span><span class='endpoint-desc'>Web control panel with settings and preview</span></div>"
+        "<div class='endpoint-row'><span class='endpoint-path'>/api/stats</span><span class='endpoint-desc'>JSON stats (FPS, CPU, clients)</span></div>"
+        "<div class='endpoint-row'><span class='endpoint-path'>/api/config</span><span class='endpoint-desc'>JSON full running configuration</span></div>"
+        "<div class='endpoint-row'><span class='endpoint-path'>/status</span><span class='endpoint-desc'>Plain text status summary</span></div>"
+        "<div class='endpoint-row'><span class='endpoint-path'>/timelapse</span><span class='endpoint-desc'>Timelapse management page</span></div>"
+        "<div class='endpoint-row'><span class='endpoint-path'>/api/timelapse/list</span><span class='endpoint-desc'>JSON list of timelapse recordings</span></div>"
+        "<div class='endpoint-row'><span class='endpoint-path'>/api/camera/controls</span><span class='endpoint-desc'>JSON camera controls with ranges</span></div>"
+        "<div class='endpoint-row'><span class='endpoint-path'>/api/touch</span><span class='endpoint-desc'>POST touch events to printer LCD</span></div>"
+        "</div>"
+        "</div>"
+
+        /* JavaScript */
+        "<script>"
+        "var sp=%d,cp=%d;"
+        "var host=location.hostname;"
+        "var streamBase='http://'+host+':'+sp;"
+        "var ctrlBase='http://'+host+':'+cp;"
+        "function openControl(){window.open(ctrlBase+'/control','_blank')}"
+        "function openStream(url){window.open(url,'_blank')}"
+        "function copyText(text,btn){"
+        "var ta=document.createElement('textarea');"
+        "ta.value=text;ta.style.position='fixed';ta.style.left='-9999px';"
+        "document.body.appendChild(ta);ta.select();"
+        "try{document.execCommand('copy');"
+        "btn.classList.add('copied');btn.textContent='Copied!';"
+        "setTimeout(function(){btn.classList.remove('copied');btn.textContent='Copy'},1500)"
+        "}catch(e){alert('Copy failed: '+text)}"
+        "document.body.removeChild(ta)}"
+        "function addStream(name,url){"
+        "var d=document.getElementById('streams');"
+        "var r=document.createElement('div');r.className='stream-row';"
+        "var u=encodeURIComponent(url);"
+        "r.innerHTML='<span class=\"stream-url\">'+url+'</span>"
+        "<div class=\"stream-btns\"><button onclick=\"openStream(decodeURIComponent(\\''+u+'\\'))\" class=\"secondary\">Open</button>"
+        "<button onclick=\"copyText(decodeURIComponent(\\''+u+'\\'),this)\" class=\"copy-btn\">Copy</button></div>';"
+        "d.appendChild(r)}"
+        "addStream('MJPEG Stream',streamBase+'/stream');"
+        "addStream('Snapshot',streamBase+'/snapshot');"
+        "addStream('H.264 FLV','http://'+host+':18088/flv');"
+        "addStream('Display Stream',streamBase+'/display');"
+        "addStream('Display Snapshot',streamBase+'/display/snapshot');"
+        "</script></body></html>",
+        control_port, streaming_port, control_port
+    );
+
+    char headers[256];
+    int hlen = snprintf(headers, sizeof(headers),
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/html; charset=utf-8\r\n"
+        "Content-Length: %d\r\n"
+        "Cache-Control: no-cache\r\n"
+        "Connection: close\r\n"
+        "\r\n", len);
+
+    http_send(fd, headers, hlen);
+    http_send(fd, html, len);
 }
 
 /* Send MJPEG stream headers */
@@ -517,6 +638,11 @@ static void http_handle_client_read(HttpServer *srv, HttpClient *client) {
                 client->send_buf_size = HTTP_SEND_BUF_SIZE;
                 client->send_buf_pos = 0;
                 log_info("HTTP[%d]: FLV stream started\n", srv->port);
+                break;
+
+            case REQUEST_HOMEPAGE:
+                http_send_homepage(client->fd, srv->port);
+                client->state = CLIENT_STATE_CLOSING;
                 break;
 
             default:
