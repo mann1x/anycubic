@@ -274,11 +274,22 @@ export LD_LIBRARY_PATH=/oem/usr/lib:$LD_LIBRARY_PATH
 | `mqtt_client.c` | MQTT client for camera control |
 | `rpc_client.c` | RPC client for timelapse |
 | `timelapse.c` | Timelapse recording logic |
+| `timelapse_venc.c` | Hardware VENC timelapse encoding |
 | `flv_mux.c` | FLV container muxer |
+| `minimp4.h` | MP4 muxer (header-only library) |
 
 ## Timelapse Recording
 
-The encoder includes built-in timelapse recording with frame capture and MP4 assembly.
+The encoder includes built-in timelapse recording with hardware VENC H.264 encoding.
+
+### Video Encoding
+
+| Method | Description | Dependencies |
+|--------|-------------|--------------|
+| **VENC (Default)** | Hardware H.264 encoding via RV1106 VENC | None (minimp4 built-in) |
+| FFmpeg Fallback | Software encoding if VENC fails | ffmpeg on printer |
+
+The VENC encoder uses channel 2, separate from live streaming (channel 0), so timelapse works with all capture modes (rkmpi, rkmpi + H.264, rkmpi-yuyv).
 
 ### Timelapse Modes
 
@@ -298,15 +309,10 @@ Commands sent via `/tmp/h264_ctrl`:
 | `timelapse_finalize` | Assemble MP4 video |
 | `timelapse_cancel` | Save partial video (or cleanup if no frames) |
 | `timelapse_fps:<n>` | Set output FPS |
-| `timelapse_crf:<n>` | Set H.264 quality (0-51) |
+| `timelapse_crf:<n>` | Set H.264 quality (0-51, ffmpeg only) |
 | `timelapse_flip:<x>:<y>` | Set flip options |
 | `timelapse_custom_mode:<0\|1>` | Enable/disable custom mode |
-
-### Video Encoding
-
-- **Primary**: libx264 with memory-optimized settings (ultrafast, zerolatency, no bframes)
-- **Fallback**: mpeg4 if libx264 fails (OOM on low-memory systems)
-- **Output**: `/useremain/app/gk/Time-lapse-Video/` or USB at `/mnt/udisk/Time-lapse-Video/`
+| `timelapse_use_venc:<0\|1>` | Use hardware VENC (default: 1) |
 
 ### Output Files
 
@@ -314,6 +320,8 @@ Commands sent via `/tmp/h264_ctrl`:
 |------|---------|
 | Video | `{gcode_name}_{sequence}.mp4` |
 | Thumbnail | `{gcode_name}_{sequence}_{frames}.jpg` |
+
+Default output: `/useremain/app/gk/Time-lapse-Video/` or USB at `/mnt/udisk/Time-lapse-Video/`
 
 ## Documentation
 

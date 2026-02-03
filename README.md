@@ -24,7 +24,7 @@ Hardware H.264/JPEG encoder using the RV1106 Video Encoder (VENC).
 - Hardware MJPEG encoding for snapshots
 - Display capture with hardware rotation (RGA)
 - Built-in HTTP/MQTT/RPC servers
-- Timelapse recording (native Anycubic + advanced Moonraker modes)
+- Timelapse with hardware VENC encoding (no ffmpeg dependency)
 
 ```bash
 # Quick start

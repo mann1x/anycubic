@@ -22,7 +22,7 @@ Native USB camera capture with RV1106 hardware H.264 encoding.
 - RKMPI VENC hardware H.264 encoding
 - Built-in HTTP, MQTT, and RPC servers
 - **Display capture** with full hardware acceleration (RGA + VENC)
-- **Timelapse recording** with automatic MP4 assembly (libx264 + mpeg4 fallback)
+- **Timelapse recording** with hardware VENC encoding (no ffmpeg dependency)
 - **MQTT keepalive** - automatic PINGREQ to prevent broker disconnections
 - See: `rkmpi-encoder/claude.md`
 

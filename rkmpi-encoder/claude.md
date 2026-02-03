@@ -371,7 +371,38 @@ export LD_LIBRARY_PATH=/oem/usr/lib:$LD_LIBRARY_PATH
 
 ## Timelapse Recording
 
-The encoder includes built-in timelapse recording with frame capture and MP4 assembly.
+The encoder includes built-in timelapse recording with hardware VENC H.264 encoding.
+
+### Video Encoding Methods
+
+**Hardware VENC (Default)**
+- Uses RV1106 hardware H.264 encoder directly
+- No external dependencies (no ffmpeg required)
+- Frames encoded in real-time as they're captured
+- MP4 muxing via minimp4 header-only library
+- Works with all capture modes: rkmpi, rkmpi + H.264, rkmpi-yuyv
+- Uses VENC channel 2 (separate from live stream on channel 0)
+
+**FFmpeg Fallback**
+- Used if VENC initialization fails
+- Saves JPEG frames to disk, assembles at finalize
+- Tries bundled static ffmpeg first, then stock ffmpeg with LD_LIBRARY_PATH
+- Falls back to mpeg4 codec if libx264 fails (OOM)
+
+### VENC Pipeline
+
+```
+JPEG frame (from frame buffer)
+    │
+    ▼
+TurboJPEG decode → NV12
+    │
+    ▼
+VENC Channel 2 (H.264, VBR 4Mbps)
+    │
+    ▼
+minimp4 muxer → .mp4 file
+```
 
 ### Timelapse Modes
 
@@ -398,18 +429,19 @@ The encoder reads commands from a control file (default: `/tmp/rkmpi.ctrl`):
 | `timelapse_finalize` | Assemble frames into MP4 |
 | `timelapse_cancel` | Discard frames and cleanup |
 | `timelapse_fps:<n>` | Set output FPS (1-60) |
-| `timelapse_crf:<n>` | Set H.264 quality (0-51) |
+| `timelapse_crf:<n>` | Set H.264 quality (0-51, ffmpeg only) |
 | `timelapse_variable_fps:<0\|1>:<min>:<max>:<target>:<dup>` | Configure variable FPS |
 | `timelapse_flip:<flip_x>:<flip_y>` | Set flip options (0 or 1) |
 | `timelapse_output_dir:<path>` | Set output directory |
 | `timelapse_custom_mode:<0\|1>` | Enable/disable custom mode |
+| `timelapse_use_venc:<0\|1>` | Use hardware VENC (default: 1) |
 
 ### Timelapse Configuration (timelapse.h)
 
 ```c
 typedef struct {
     int output_fps;           // Video playback FPS (default: 10)
-    int crf;                  // H.264 quality 0-51 (default: 23)
+    int crf;                  // H.264 quality 0-51 (default: 23, ffmpeg only)
     int variable_fps;         // Auto-calculate FPS (default: 0)
     int target_length;        // Target video length in seconds
     int variable_fps_min;     // Minimum FPS for variable mode
@@ -419,6 +451,14 @@ typedef struct {
     int flip_y;               // Vertical flip (default: 0)
     char output_dir[256];     // Output directory path
 } TimelapseConfig;
+
+typedef struct {
+    // ... other fields ...
+    int use_venc;             // 1 = hardware VENC (default), 0 = ffmpeg
+    int venc_initialized;     // 1 if VENC encoder is ready
+    int frame_width;          // Frame width (auto-detected)
+    int frame_height;         // Frame height (auto-detected)
+} TimelapseState;
 ```
 
 ### Variable FPS Calculation
@@ -430,7 +470,7 @@ fps = max(min_fps, min(max_fps, frame_count / target_length))
 
 This ensures short prints don't have overly long videos and long prints don't exceed frame rate limits.
 
-### Video Assembly (ffmpeg)
+### FFmpeg Fallback (when VENC disabled or fails)
 
 The `timelapse_finalize()` function assembles frames using ffmpeg with memory-optimized settings:
 
@@ -451,23 +491,26 @@ ffmpeg -y -framerate <fps> -i frames/frame_%04d.jpg \
 
 **Note:** mpeg4 videos may not play in browser preview but will work when downloaded.
 
-Flip filters are applied based on configuration:
+Flip filters are applied based on configuration (ffmpeg mode only):
 - `flip_x=1, flip_y=0` → `-vf hflip`
 - `flip_x=0, flip_y=1` → `-vf vflip`
 - `flip_x=1, flip_y=1` → `-vf hflip,vflip`
 
 ### Output Files
 
-- **Frames**: `/tmp/timelapse-{gcode}/frames/000001.jpg`, etc.
 - **Video**: `{output_dir}/{gcode}_NN.mp4`
 - **Thumbnail**: `{output_dir}/{gcode}_NN_{frames}.jpg` (last frame)
+- **Temp frames** (ffmpeg mode only): `/tmp/timelapse_frames/frame_NNNN.jpg`
 
 Default output directory: `/useremain/app/gk/Time-lapse-Video/`
 
 ### Implementation Files
 
 - `timelapse.h` - Configuration struct and function prototypes
-- `timelapse.c` - Frame capture, finalization, variable FPS calculation
+- `timelapse.c` - Frame capture, finalization, VENC/ffmpeg routing
+- `timelapse_venc.h` - Hardware VENC encoding API
+- `timelapse_venc.c` - VENC encoder with minimp4 muxer
+- `minimp4.h` - Header-only MP4 muxer library (public domain)
 - `rpc_client.c` - RPC command handlers (legacy mode)
 - `rkmpi_enc.c` - Control file parsing for custom mode
 
