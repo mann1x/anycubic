@@ -351,6 +351,46 @@ typedef struct {
     size_t length;
 } V4L2Buffer;
 
+/* Camera V4L2 controls - matches UVC camera capabilities */
+typedef struct {
+    int brightness;           /* 0-255, default 0 */
+    int contrast;             /* 0-255, default 32 */
+    int saturation;           /* 0-132, default 85 */
+    int hue;                  /* -180 to 180, default 0 */
+    int gamma;                /* 90-150, default 100 */
+    int sharpness;            /* 0-30, default 3 */
+    int gain;                 /* 0-1, default 1 */
+    int backlight_comp;       /* 0-7, default 0 */
+    int white_balance_temp;   /* 2800-6500, default 4000 */
+    int white_balance_auto;   /* 0-1, default 1 */
+    int exposure_auto;        /* 1=manual, 3=aperture priority, default 3 */
+    int exposure_absolute;    /* 10-2500, default 156 */
+    int exposure_auto_priority; /* 0-1, default 0 */
+    int power_line_freq;      /* 0=disabled, 1=50Hz, 2=60Hz, default 1 */
+    /* Flags to track which values have been set */
+    unsigned int set_mask;    /* Bitmask of which controls to apply */
+} CameraControls;
+
+/* Bitmask values for set_mask */
+#define CAM_CTRL_BRIGHTNESS       (1 << 0)
+#define CAM_CTRL_CONTRAST         (1 << 1)
+#define CAM_CTRL_SATURATION       (1 << 2)
+#define CAM_CTRL_HUE              (1 << 3)
+#define CAM_CTRL_GAMMA            (1 << 4)
+#define CAM_CTRL_SHARPNESS        (1 << 5)
+#define CAM_CTRL_GAIN             (1 << 6)
+#define CAM_CTRL_BACKLIGHT        (1 << 7)
+#define CAM_CTRL_WB_TEMP          (1 << 8)
+#define CAM_CTRL_WB_AUTO          (1 << 9)
+#define CAM_CTRL_EXPOSURE_AUTO    (1 << 10)
+#define CAM_CTRL_EXPOSURE_ABS     (1 << 11)
+#define CAM_CTRL_EXPOSURE_PRIO    (1 << 12)
+#define CAM_CTRL_POWER_LINE       (1 << 13)
+
+/* Global camera controls (can be modified at runtime via ctrl file) */
+static CameraControls g_cam_ctrl = {0};
+static int g_v4l2_fd = -1;  /* V4L2 file descriptor for runtime control changes */
+
 /* Configuration */
 typedef struct {
     char device[64];
@@ -452,6 +492,50 @@ static void read_ctrl_file(void) {
         } else if (sscanf(line, "display_fps=%d", &val) == 1) {
             display_set_fps(val);
         }
+        /* Camera controls - cam_<control>=<value> */
+        else if (sscanf(line, "cam_brightness=%d", &val) == 1) {
+            g_cam_ctrl.brightness = val;
+            g_cam_ctrl.set_mask |= CAM_CTRL_BRIGHTNESS;
+        } else if (sscanf(line, "cam_contrast=%d", &val) == 1) {
+            g_cam_ctrl.contrast = val;
+            g_cam_ctrl.set_mask |= CAM_CTRL_CONTRAST;
+        } else if (sscanf(line, "cam_saturation=%d", &val) == 1) {
+            g_cam_ctrl.saturation = val;
+            g_cam_ctrl.set_mask |= CAM_CTRL_SATURATION;
+        } else if (sscanf(line, "cam_hue=%d", &val) == 1) {
+            g_cam_ctrl.hue = val;
+            g_cam_ctrl.set_mask |= CAM_CTRL_HUE;
+        } else if (sscanf(line, "cam_gamma=%d", &val) == 1) {
+            g_cam_ctrl.gamma = val;
+            g_cam_ctrl.set_mask |= CAM_CTRL_GAMMA;
+        } else if (sscanf(line, "cam_sharpness=%d", &val) == 1) {
+            g_cam_ctrl.sharpness = val;
+            g_cam_ctrl.set_mask |= CAM_CTRL_SHARPNESS;
+        } else if (sscanf(line, "cam_gain=%d", &val) == 1) {
+            g_cam_ctrl.gain = val;
+            g_cam_ctrl.set_mask |= CAM_CTRL_GAIN;
+        } else if (sscanf(line, "cam_backlight=%d", &val) == 1) {
+            g_cam_ctrl.backlight_comp = val;
+            g_cam_ctrl.set_mask |= CAM_CTRL_BACKLIGHT;
+        } else if (sscanf(line, "cam_wb_auto=%d", &val) == 1) {
+            g_cam_ctrl.white_balance_auto = val;
+            g_cam_ctrl.set_mask |= CAM_CTRL_WB_AUTO;
+        } else if (sscanf(line, "cam_wb_temp=%d", &val) == 1) {
+            g_cam_ctrl.white_balance_temp = val;
+            g_cam_ctrl.set_mask |= CAM_CTRL_WB_TEMP;
+        } else if (sscanf(line, "cam_exposure_auto=%d", &val) == 1) {
+            g_cam_ctrl.exposure_auto = val;
+            g_cam_ctrl.set_mask |= CAM_CTRL_EXPOSURE_AUTO;
+        } else if (sscanf(line, "cam_exposure=%d", &val) == 1) {
+            g_cam_ctrl.exposure_absolute = val;
+            g_cam_ctrl.set_mask |= CAM_CTRL_EXPOSURE_ABS;
+        } else if (sscanf(line, "cam_exposure_priority=%d", &val) == 1) {
+            g_cam_ctrl.exposure_auto_priority = val;
+            g_cam_ctrl.set_mask |= CAM_CTRL_EXPOSURE_PRIO;
+        } else if (sscanf(line, "cam_power_line=%d", &val) == 1) {
+            g_cam_ctrl.power_line_freq = val;
+            g_cam_ctrl.set_mask |= CAM_CTRL_POWER_LINE;
+        }
         /* Timelapse commands */
         else if (strncmp(line, "timelapse_init:", 15) == 0) {
             /* Format: timelapse_init:<gcode_name>:<output_path> */
@@ -529,6 +613,21 @@ static void write_ctrl_file(void) {
         int camera_max_fps = 1000000 / g_mjpeg_ctrl.camera_interval;
         fprintf(f, "camera_max_fps=%d\n", camera_max_fps);
     }
+    /* Current camera control values (for Python to read and display) */
+    fprintf(f, "cam_brightness=%d\n", g_cam_ctrl.brightness);
+    fprintf(f, "cam_contrast=%d\n", g_cam_ctrl.contrast);
+    fprintf(f, "cam_saturation=%d\n", g_cam_ctrl.saturation);
+    fprintf(f, "cam_hue=%d\n", g_cam_ctrl.hue);
+    fprintf(f, "cam_gamma=%d\n", g_cam_ctrl.gamma);
+    fprintf(f, "cam_sharpness=%d\n", g_cam_ctrl.sharpness);
+    fprintf(f, "cam_gain=%d\n", g_cam_ctrl.gain);
+    fprintf(f, "cam_backlight=%d\n", g_cam_ctrl.backlight_comp);
+    fprintf(f, "cam_wb_auto=%d\n", g_cam_ctrl.white_balance_auto);
+    fprintf(f, "cam_wb_temp=%d\n", g_cam_ctrl.white_balance_temp);
+    fprintf(f, "cam_exposure_auto=%d\n", g_cam_ctrl.exposure_auto);
+    fprintf(f, "cam_exposure=%d\n", g_cam_ctrl.exposure_absolute);
+    fprintf(f, "cam_exposure_priority=%d\n", g_cam_ctrl.exposure_auto_priority);
+    fprintf(f, "cam_power_line=%d\n", g_cam_ctrl.power_line_freq);
     fclose(f);
 }
 
@@ -731,6 +830,129 @@ static void v4l2_stop(int fd, V4L2Buffer *buffers, int buffer_count) {
 
     free(buffers);
     close(fd);
+}
+
+/*
+ * V4L2 Camera Control Functions
+ */
+
+/* Set a single V4L2 control */
+static int v4l2_set_ctrl(int fd, int id, int value) {
+    struct v4l2_control ctrl = {0};
+    ctrl.id = id;
+    ctrl.value = value;
+    if (ioctl(fd, VIDIOC_S_CTRL, &ctrl) < 0) {
+        log_info("[CAM] Failed to set control 0x%x to %d: %s\n", id, value, strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+/* Get a single V4L2 control */
+static int v4l2_get_ctrl(int fd, int id, int *value) {
+    struct v4l2_control ctrl = {0};
+    ctrl.id = id;
+    if (ioctl(fd, VIDIOC_G_CTRL, &ctrl) < 0) {
+        if (g_verbose) {
+            log_info("[CAM] Failed to get control 0x%x: %s\n", id, strerror(errno));
+        }
+        return -1;
+    }
+    *value = ctrl.value;
+    return 0;
+}
+
+/* Apply all camera controls that have been set */
+static void v4l2_apply_controls(int fd, CameraControls *ctrl) {
+    if (fd < 0 || !ctrl) return;
+
+    if (ctrl->set_mask & CAM_CTRL_BRIGHTNESS) {
+        if (v4l2_set_ctrl(fd, V4L2_CID_BRIGHTNESS, ctrl->brightness) == 0)
+            log_info("[CAM] brightness=%d\n", ctrl->brightness);
+    }
+    if (ctrl->set_mask & CAM_CTRL_CONTRAST) {
+        if (v4l2_set_ctrl(fd, V4L2_CID_CONTRAST, ctrl->contrast) == 0)
+            log_info("[CAM] contrast=%d\n", ctrl->contrast);
+    }
+    if (ctrl->set_mask & CAM_CTRL_SATURATION) {
+        if (v4l2_set_ctrl(fd, V4L2_CID_SATURATION, ctrl->saturation) == 0)
+            log_info("[CAM] saturation=%d\n", ctrl->saturation);
+    }
+    if (ctrl->set_mask & CAM_CTRL_HUE) {
+        if (v4l2_set_ctrl(fd, V4L2_CID_HUE, ctrl->hue) == 0)
+            log_info("[CAM] hue=%d\n", ctrl->hue);
+    }
+    if (ctrl->set_mask & CAM_CTRL_GAMMA) {
+        if (v4l2_set_ctrl(fd, V4L2_CID_GAMMA, ctrl->gamma) == 0)
+            log_info("[CAM] gamma=%d\n", ctrl->gamma);
+    }
+    if (ctrl->set_mask & CAM_CTRL_SHARPNESS) {
+        if (v4l2_set_ctrl(fd, V4L2_CID_SHARPNESS, ctrl->sharpness) == 0)
+            log_info("[CAM] sharpness=%d\n", ctrl->sharpness);
+    }
+    if (ctrl->set_mask & CAM_CTRL_GAIN) {
+        if (v4l2_set_ctrl(fd, V4L2_CID_GAIN, ctrl->gain) == 0)
+            log_info("[CAM] gain=%d\n", ctrl->gain);
+    }
+    if (ctrl->set_mask & CAM_CTRL_BACKLIGHT) {
+        if (v4l2_set_ctrl(fd, V4L2_CID_BACKLIGHT_COMPENSATION, ctrl->backlight_comp) == 0)
+            log_info("[CAM] backlight_comp=%d\n", ctrl->backlight_comp);
+    }
+    /* Set auto white balance first, then temperature only if manual mode */
+    if (ctrl->set_mask & CAM_CTRL_WB_AUTO) {
+        if (v4l2_set_ctrl(fd, V4L2_CID_AUTO_WHITE_BALANCE, ctrl->white_balance_auto) == 0)
+            log_info("[CAM] white_balance_auto=%d\n", ctrl->white_balance_auto);
+    }
+    if ((ctrl->set_mask & CAM_CTRL_WB_TEMP) && !ctrl->white_balance_auto) {
+        /* Only set temperature when auto white balance is disabled */
+        if (v4l2_set_ctrl(fd, V4L2_CID_WHITE_BALANCE_TEMPERATURE, ctrl->white_balance_temp) == 0)
+            log_info("[CAM] white_balance_temp=%d\n", ctrl->white_balance_temp);
+    }
+    /* Set auto exposure first, then absolute only if manual mode (1=manual, 3=auto) */
+    if (ctrl->set_mask & CAM_CTRL_EXPOSURE_AUTO) {
+        /* Only valid values are 1 (manual) or 3 (aperture priority auto) */
+        if (ctrl->exposure_auto == 1 || ctrl->exposure_auto == 3) {
+            if (v4l2_set_ctrl(fd, V4L2_CID_EXPOSURE_AUTO, ctrl->exposure_auto) == 0)
+                log_info("[CAM] exposure_auto=%d\n", ctrl->exposure_auto);
+        }
+    }
+    if ((ctrl->set_mask & CAM_CTRL_EXPOSURE_ABS) && ctrl->exposure_auto == 1) {
+        /* Only set absolute exposure when in manual mode */
+        if (v4l2_set_ctrl(fd, V4L2_CID_EXPOSURE_ABSOLUTE, ctrl->exposure_absolute) == 0)
+            log_info("[CAM] exposure_absolute=%d\n", ctrl->exposure_absolute);
+    }
+    if (ctrl->set_mask & CAM_CTRL_EXPOSURE_PRIO) {
+        if (v4l2_set_ctrl(fd, V4L2_CID_EXPOSURE_AUTO_PRIORITY, ctrl->exposure_auto_priority) == 0)
+            log_info("[CAM] exposure_auto_priority=%d\n", ctrl->exposure_auto_priority);
+    }
+    if (ctrl->set_mask & CAM_CTRL_POWER_LINE) {
+        if (v4l2_set_ctrl(fd, V4L2_CID_POWER_LINE_FREQUENCY, ctrl->power_line_freq) == 0)
+            log_info("[CAM] power_line_freq=%d\n", ctrl->power_line_freq);
+    }
+
+    /* Clear the set_mask after applying */
+    ctrl->set_mask = 0;
+}
+
+/* Read all current camera control values */
+static void v4l2_read_controls(int fd, CameraControls *ctrl) {
+    if (fd < 0 || !ctrl) return;
+
+    v4l2_get_ctrl(fd, V4L2_CID_BRIGHTNESS, &ctrl->brightness);
+    v4l2_get_ctrl(fd, V4L2_CID_CONTRAST, &ctrl->contrast);
+    v4l2_get_ctrl(fd, V4L2_CID_SATURATION, &ctrl->saturation);
+    v4l2_get_ctrl(fd, V4L2_CID_HUE, &ctrl->hue);
+    v4l2_get_ctrl(fd, V4L2_CID_GAMMA, &ctrl->gamma);
+    v4l2_get_ctrl(fd, V4L2_CID_SHARPNESS, &ctrl->sharpness);
+    v4l2_get_ctrl(fd, V4L2_CID_GAIN, &ctrl->gain);
+    v4l2_get_ctrl(fd, V4L2_CID_BACKLIGHT_COMPENSATION, &ctrl->backlight_comp);
+    v4l2_get_ctrl(fd, V4L2_CID_AUTO_WHITE_BALANCE, &ctrl->white_balance_auto);
+    v4l2_get_ctrl(fd, V4L2_CID_WHITE_BALANCE_TEMPERATURE, &ctrl->white_balance_temp);
+    v4l2_get_ctrl(fd, V4L2_CID_EXPOSURE_AUTO, &ctrl->exposure_auto);
+    v4l2_get_ctrl(fd, V4L2_CID_EXPOSURE_ABSOLUTE, &ctrl->exposure_absolute);
+    v4l2_get_ctrl(fd, V4L2_CID_EXPOSURE_AUTO_PRIORITY, &ctrl->exposure_auto_priority);
+    v4l2_get_ctrl(fd, V4L2_CID_POWER_LINE_FREQUENCY, &ctrl->power_line_freq);
+    ctrl->set_mask = 0;
 }
 
 /*
@@ -1694,6 +1916,12 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    /* Store fd globally for runtime camera control changes */
+    g_v4l2_fd = v4l2_fd;
+
+    /* Read current camera control values */
+    v4l2_read_controls(v4l2_fd, &g_cam_ctrl);
+
     /* Initialize VENC for H.264 encoding (also needed in server mode for FLV) */
     if (h264_available || cfg.server_mode) {
         if (init_venc(&cfg) != 0) {
@@ -1876,6 +2104,10 @@ int main(int argc, char *argv[]) {
         /* Periodically check control file */
         if (captured_count - last_ctrl_check >= CTRL_CHECK_INTERVAL) {
             read_ctrl_file();
+            /* Apply any camera control changes */
+            if (g_cam_ctrl.set_mask) {
+                v4l2_apply_controls(v4l2_fd, &g_cam_ctrl);
+            }
             last_ctrl_check = captured_count;
         }
 
@@ -2311,6 +2543,10 @@ int main(int argc, char *argv[]) {
             }
             /* Read before write to preserve Python-set values (display settings) */
             read_ctrl_file();
+            /* Apply any camera control changes */
+            if (g_cam_ctrl.set_mask) {
+                v4l2_apply_controls(v4l2_fd, &g_cam_ctrl);
+            }
             write_ctrl_file();
             last_stats_write = now;
         }

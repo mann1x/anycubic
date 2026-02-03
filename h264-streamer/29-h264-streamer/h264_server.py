@@ -2848,6 +2848,23 @@ class StreamerApp:
         self.camera_width = 1280
         self.camera_height = 720
 
+        # Camera V4L2 controls (loaded from config, can be modified via API)
+        self.cam_brightness = getattr(args, 'cam_brightness', 0)
+        self.cam_contrast = getattr(args, 'cam_contrast', 32)
+        self.cam_saturation = getattr(args, 'cam_saturation', 85)
+        self.cam_hue = getattr(args, 'cam_hue', 0)
+        self.cam_gamma = getattr(args, 'cam_gamma', 100)
+        self.cam_sharpness = getattr(args, 'cam_sharpness', 3)
+        self.cam_gain = getattr(args, 'cam_gain', 1)
+        self.cam_backlight = getattr(args, 'cam_backlight', 0)
+        self.cam_wb_auto = getattr(args, 'cam_wb_auto', 1)
+        self.cam_wb_temp = getattr(args, 'cam_wb_temp', 4000)
+        self.cam_exposure_auto = getattr(args, 'cam_exposure_auto', 3)
+        self.cam_exposure = getattr(args, 'cam_exposure', 156)
+        self.cam_exposure_priority = getattr(args, 'cam_exposure_priority', 0)
+        self.cam_power_line = getattr(args, 'cam_power_line', 1)
+        self.cam_controls_applied = False  # Track if initial controls have been applied
+
         # Control file (rkmpi mode only)
         self.ctrl_file = "/tmp/h264_ctrl"
 
@@ -2899,6 +2916,21 @@ class StreamerApp:
                 # Display capture settings
                 f.write(f"display_enabled={'1' if self.display_enabled else '0'}\n")
                 f.write(f"display_fps={self.display_fps}\n")
+                # Camera controls
+                f.write(f"cam_brightness={self.cam_brightness}\n")
+                f.write(f"cam_contrast={self.cam_contrast}\n")
+                f.write(f"cam_saturation={self.cam_saturation}\n")
+                f.write(f"cam_hue={self.cam_hue}\n")
+                f.write(f"cam_gamma={self.cam_gamma}\n")
+                f.write(f"cam_sharpness={self.cam_sharpness}\n")
+                f.write(f"cam_gain={self.cam_gain}\n")
+                f.write(f"cam_backlight={self.cam_backlight}\n")
+                f.write(f"cam_wb_auto={self.cam_wb_auto}\n")
+                f.write(f"cam_wb_temp={self.cam_wb_temp}\n")
+                f.write(f"cam_exposure_auto={self.cam_exposure_auto}\n")
+                f.write(f"cam_exposure={self.cam_exposure}\n")
+                f.write(f"cam_exposure_priority={self.cam_exposure_priority}\n")
+                f.write(f"cam_power_line={self.cam_power_line}\n")
         except Exception as e:
             print(f"Error writing control file: {e}", flush=True)
 
@@ -2940,6 +2972,49 @@ class StreamerApp:
                                 self.max_camera_fps = detected_fps
                         except ValueError:
                             pass
+                    # Camera controls (read from encoder)
+                    elif line.startswith('cam_brightness='):
+                        try: self.cam_brightness = int(line.split('=')[1])
+                        except ValueError: pass
+                    elif line.startswith('cam_contrast='):
+                        try: self.cam_contrast = int(line.split('=')[1])
+                        except ValueError: pass
+                    elif line.startswith('cam_saturation='):
+                        try: self.cam_saturation = int(line.split('=')[1])
+                        except ValueError: pass
+                    elif line.startswith('cam_hue='):
+                        try: self.cam_hue = int(line.split('=')[1])
+                        except ValueError: pass
+                    elif line.startswith('cam_gamma='):
+                        try: self.cam_gamma = int(line.split('=')[1])
+                        except ValueError: pass
+                    elif line.startswith('cam_sharpness='):
+                        try: self.cam_sharpness = int(line.split('=')[1])
+                        except ValueError: pass
+                    elif line.startswith('cam_gain='):
+                        try: self.cam_gain = int(line.split('=')[1])
+                        except ValueError: pass
+                    elif line.startswith('cam_backlight='):
+                        try: self.cam_backlight = int(line.split('=')[1])
+                        except ValueError: pass
+                    elif line.startswith('cam_wb_auto='):
+                        try: self.cam_wb_auto = int(line.split('=')[1])
+                        except ValueError: pass
+                    elif line.startswith('cam_wb_temp='):
+                        try: self.cam_wb_temp = int(line.split('=')[1])
+                        except ValueError: pass
+                    elif line.startswith('cam_exposure_auto='):
+                        try: self.cam_exposure_auto = int(line.split('=')[1])
+                        except ValueError: pass
+                    elif line.startswith('cam_exposure='):
+                        try: self.cam_exposure = int(line.split('=')[1])
+                        except ValueError: pass
+                    elif line.startswith('cam_exposure_priority='):
+                        try: self.cam_exposure_priority = int(line.split('=')[1])
+                        except ValueError: pass
+                    elif line.startswith('cam_power_line='):
+                        try: self.cam_power_line = int(line.split('=')[1])
+                        except ValueError: pass
         except Exception:
             pass
 
@@ -2972,6 +3047,22 @@ class StreamerApp:
             config['h264_resolution'] = self.h264_resolution
             config['display_enabled'] = 'true' if self.display_enabled else 'false'
             config['display_fps'] = str(self.display_fps)
+
+            # Camera controls
+            config['cam_brightness'] = str(self.cam_brightness)
+            config['cam_contrast'] = str(self.cam_contrast)
+            config['cam_saturation'] = str(self.cam_saturation)
+            config['cam_hue'] = str(self.cam_hue)
+            config['cam_gamma'] = str(self.cam_gamma)
+            config['cam_sharpness'] = str(self.cam_sharpness)
+            config['cam_gain'] = str(self.cam_gain)
+            config['cam_backlight'] = str(self.cam_backlight)
+            config['cam_wb_auto'] = str(self.cam_wb_auto)
+            config['cam_wb_temp'] = str(self.cam_wb_temp)
+            config['cam_exposure_auto'] = str(self.cam_exposure_auto)
+            config['cam_exposure'] = str(self.cam_exposure)
+            config['cam_exposure_priority'] = str(self.cam_exposure_priority)
+            config['cam_power_line'] = str(self.cam_power_line)
 
             # Advanced timelapse settings
             config['timelapse_enabled'] = 'true' if self.timelapse_enabled else 'false'
@@ -3277,6 +3368,10 @@ class StreamerApp:
 
             # Start stderr reader for logging only (not for frame data)
             threading.Thread(target=self._encoder_stderr_reader, daemon=True).start()
+
+            # Apply initial camera controls from saved config (after encoder starts)
+            # Give encoder a moment to initialize, then write all controls
+            threading.Thread(target=self._apply_initial_camera_controls, daemon=True).start()
 
             return True
         except Exception as e:
@@ -3707,6 +3802,22 @@ class StreamerApp:
                     if body_start != -1:
                         body = request[body_start+4:body_start+4+content_length]
                 self._handle_timelapse_settings(client, body)
+            # Camera controls API
+            elif path == '/api/camera/controls':
+                self._serve_camera_controls(client)
+            elif path == '/api/camera/reset' and method == 'POST':
+                self._handle_camera_reset(client)
+            elif path == '/api/camera/set' and method == 'POST':
+                content_length = 0
+                for line in request.split('\r\n'):
+                    if line.lower().startswith('content-length:'):
+                        content_length = int(line.split(':')[1].strip())
+                body = ''
+                if content_length > 0:
+                    body_start = request.find('\r\n\r\n')
+                    if body_start != -1:
+                        body = request[body_start+4:body_start+4+content_length]
+                self._handle_camera_set(client, body)
             else:
                 self._serve_404(client)
         except Exception:
@@ -4146,6 +4257,79 @@ class StreamerApp:
             color: #888;
             font-size: 14px;
         }}
+        /* Camera controls */
+        .camera-controls-section h2 {{
+            margin-bottom: 10px;
+        }}
+        .camera-controls-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 20px;
+        }}
+        .cam-ctrl-group {{
+            background: #252525;
+            padding: 15px;
+            border-radius: 6px;
+        }}
+        .cam-ctrl-group h3 {{
+            margin: 0 0 12px 0;
+            font-size: 14px;
+            color: #4CAF50;
+            border-bottom: 1px solid #444;
+            padding-bottom: 8px;
+        }}
+        .cam-ctrl {{
+            display: flex;
+            align-items: center;
+            margin-bottom: 10px;
+            gap: 10px;
+        }}
+        .cam-ctrl label {{
+            flex: 0 0 100px;
+            font-size: 12px;
+            color: #aaa;
+        }}
+        .cam-ctrl input[type="range"] {{
+            flex: 1;
+            height: 6px;
+            background: #444;
+            border-radius: 3px;
+            -webkit-appearance: none;
+            appearance: none;
+        }}
+        .cam-ctrl input[type="range"]::-webkit-slider-thumb {{
+            -webkit-appearance: none;
+            appearance: none;
+            width: 14px;
+            height: 14px;
+            background: #4CAF50;
+            border-radius: 50%;
+            cursor: pointer;
+        }}
+        .cam-ctrl input[type="range"]::-moz-range-thumb {{
+            width: 14px;
+            height: 14px;
+            background: #4CAF50;
+            border-radius: 50%;
+            cursor: pointer;
+            border: none;
+        }}
+        .cam-ctrl span {{
+            flex: 0 0 50px;
+            text-align: right;
+            font-size: 12px;
+            color: #888;
+            font-family: monospace;
+        }}
+        .cam-ctrl select {{
+            flex: 1;
+            padding: 6px;
+            border-radius: 4px;
+            border: 1px solid #555;
+            background: #333;
+            color: #fff;
+            font-size: 12px;
+        }}
     </style>
 </head>
 <body>
@@ -4202,6 +4386,110 @@ class StreamerApp:
                     <span style="color:#888;font-size:12px;margin-right:5px;">LED:</span>
                     <button onclick="controlLed(true)" style="padding:5px 12px;font-size:12px;">On</button>
                     <button onclick="controlLed(false)" class="secondary" style="padding:5px 12px;font-size:12px;">Off</button>
+                </div>
+            </div>
+        </div>
+
+        <div class="section camera-controls-section">
+            <h2 onclick="toggleCameraControls()" style="cursor:pointer;user-select:none;">
+                <span id="camera-controls-arrow">▶</span> Camera Controls
+                <span style="font-size:12px;color:#888;font-weight:normal;margin-left:10px;">(click to expand)</span>
+            </h2>
+            <div id="camera-controls-panel" style="display:none;">
+                <div class="camera-controls-grid">
+                    <div class="cam-ctrl-group">
+                        <h3>Image</h3>
+                        <div class="cam-ctrl">
+                            <label>Brightness</label>
+                            <input type="range" id="cam-brightness" min="0" max="255" value="0" oninput="setCameraControl('brightness', this.value)">
+                            <span id="cam-brightness-val">0</span>
+                        </div>
+                        <div class="cam-ctrl">
+                            <label>Contrast</label>
+                            <input type="range" id="cam-contrast" min="0" max="255" value="32" oninput="setCameraControl('contrast', this.value)">
+                            <span id="cam-contrast-val">32</span>
+                        </div>
+                        <div class="cam-ctrl">
+                            <label>Saturation</label>
+                            <input type="range" id="cam-saturation" min="0" max="132" value="85" oninput="setCameraControl('saturation', this.value)">
+                            <span id="cam-saturation-val">85</span>
+                        </div>
+                        <div class="cam-ctrl">
+                            <label>Hue</label>
+                            <input type="range" id="cam-hue" min="-180" max="180" value="0" oninput="setCameraControl('hue', this.value)">
+                            <span id="cam-hue-val">0</span>
+                        </div>
+                        <div class="cam-ctrl">
+                            <label>Gamma</label>
+                            <input type="range" id="cam-gamma" min="90" max="150" value="100" oninput="setCameraControl('gamma', this.value)">
+                            <span id="cam-gamma-val">100</span>
+                        </div>
+                        <div class="cam-ctrl">
+                            <label>Sharpness</label>
+                            <input type="range" id="cam-sharpness" min="0" max="30" value="3" oninput="setCameraControl('sharpness', this.value)">
+                            <span id="cam-sharpness-val">3</span>
+                        </div>
+                    </div>
+                    <div class="cam-ctrl-group">
+                        <h3>Exposure</h3>
+                        <div class="cam-ctrl">
+                            <label>Auto Exposure</label>
+                            <select id="cam-exposure-auto" onchange="setCameraControl('exposure_auto', this.value)">
+                                <option value="1">Manual</option>
+                                <option value="3" selected>Auto (Aperture Priority)</option>
+                            </select>
+                        </div>
+                        <div class="cam-ctrl">
+                            <label>Exposure</label>
+                            <input type="range" id="cam-exposure" min="10" max="2500" value="156" oninput="setCameraControl('exposure', this.value)">
+                            <span id="cam-exposure-val">156</span>
+                        </div>
+                        <div class="cam-ctrl">
+                            <label>Exposure Priority</label>
+                            <select id="cam-exposure-priority" onchange="setCameraControl('exposure_priority', this.value)">
+                                <option value="0" selected>Constant FPS</option>
+                                <option value="1">Variable FPS</option>
+                            </select>
+                        </div>
+                        <div class="cam-ctrl">
+                            <label>Gain</label>
+                            <select id="cam-gain" onchange="setCameraControl('gain', this.value)">
+                                <option value="0">Off</option>
+                                <option value="1" selected>On</option>
+                            </select>
+                        </div>
+                        <div class="cam-ctrl">
+                            <label>Backlight Comp</label>
+                            <input type="range" id="cam-backlight" min="0" max="7" value="0" oninput="setCameraControl('backlight', this.value)">
+                            <span id="cam-backlight-val">0</span>
+                        </div>
+                    </div>
+                    <div class="cam-ctrl-group">
+                        <h3>White Balance</h3>
+                        <div class="cam-ctrl">
+                            <label>Auto WB</label>
+                            <select id="cam-wb-auto" onchange="setCameraControl('wb_auto', this.value); updateWbTempState();">
+                                <option value="0">Manual</option>
+                                <option value="1" selected>Auto</option>
+                            </select>
+                        </div>
+                        <div class="cam-ctrl">
+                            <label>Temperature</label>
+                            <input type="range" id="cam-wb-temp" min="2800" max="6500" value="4000" oninput="setCameraControl('wb_temp', this.value)">
+                            <span id="cam-wb-temp-val">4000K</span>
+                        </div>
+                        <div class="cam-ctrl">
+                            <label>Power Line</label>
+                            <select id="cam-power-line" onchange="setCameraControl('power_line', this.value)">
+                                <option value="0">Disabled</option>
+                                <option value="1" selected>50 Hz</option>
+                                <option value="2">60 Hz</option>
+                            </select>
+                        </div>
+                    </div>
+                </div>
+                <div style="margin-top:15px;text-align:center;">
+                    <button type="button" onclick="resetCameraDefaults()" class="secondary" style="padding:8px 20px;">Reset to Defaults</button>
                 </div>
             </div>
         </div>
@@ -4906,6 +5194,98 @@ class StreamerApp:
                     console.log('LED:', data);
                 }})
                 .catch(e => console.error('LED error:', e));
+        }}
+
+        // Camera controls
+        let cameraControlsExpanded = false;
+        let cameraControlsLoaded = false;
+
+        function toggleCameraControls() {{
+            const panel = document.getElementById('camera-controls-panel');
+            const arrow = document.getElementById('camera-controls-arrow');
+            cameraControlsExpanded = !cameraControlsExpanded;
+            panel.style.display = cameraControlsExpanded ? 'block' : 'none';
+            arrow.textContent = cameraControlsExpanded ? '▼' : '▶';
+
+            if (cameraControlsExpanded && !cameraControlsLoaded) {{
+                loadCameraControls();
+            }}
+        }}
+
+        function loadCameraControls() {{
+            fetch('/api/camera/controls')
+                .then(r => r.json())
+                .then(data => {{
+                    // Update all sliders and selects with current values
+                    Object.keys(data).forEach(key => {{
+                        const ctrl = data[key];
+                        const el = document.getElementById('cam-' + key.replace(/_/g, '-'));
+                        const valEl = document.getElementById('cam-' + key.replace(/_/g, '-') + '-val');
+
+                        if (el) {{
+                            el.value = ctrl.value;
+                            if (valEl) {{
+                                if (key === 'wb_temp') {{
+                                    valEl.textContent = ctrl.value + 'K';
+                                }} else {{
+                                    valEl.textContent = ctrl.value;
+                                }}
+                            }}
+                        }}
+                    }});
+                    updateWbTempState();
+                    cameraControlsLoaded = true;
+                }})
+                .catch(e => console.error('Failed to load camera controls:', e));
+        }}
+
+        function setCameraControl(control, value) {{
+            // Update display value immediately
+            const valEl = document.getElementById('cam-' + control.replace(/_/g, '-') + '-val');
+            if (valEl) {{
+                if (control === 'wb_temp') {{
+                    valEl.textContent = value + 'K';
+                }} else {{
+                    valEl.textContent = value;
+                }}
+            }}
+
+            // Send to server
+            fetch('/api/camera/set', {{
+                method: 'POST',
+                headers: {{'Content-Type': 'application/json'}},
+                body: JSON.stringify({{control: control, value: parseInt(value)}})
+            }})
+            .then(r => r.json())
+            .then(data => {{
+                if (data.status !== 'ok') {{
+                    console.error('Camera control error:', data);
+                }}
+            }})
+            .catch(e => console.error('Camera control error:', e));
+        }}
+
+        function resetCameraDefaults() {{
+            if (!confirm('Reset all camera settings to defaults?')) return;
+
+            fetch('/api/camera/reset', {{method: 'POST'}})
+                .then(r => r.json())
+                .then(data => {{
+                    if (data.status === 'ok') {{
+                        cameraControlsLoaded = false;
+                        loadCameraControls();
+                    }}
+                }})
+                .catch(e => console.error('Reset error:', e));
+        }}
+
+        function updateWbTempState() {{
+            const wbAuto = document.getElementById('cam-wb-auto');
+            const wbTemp = document.getElementById('cam-wb-temp');
+            if (wbAuto && wbTemp) {{
+                wbTemp.disabled = wbAuto.value === '1';
+                wbTemp.style.opacity = wbAuto.value === '1' ? '0.5' : '1';
+            }}
         }}
 
         // Open FLV in fullscreen window
@@ -5742,6 +6122,191 @@ if(flvjs.isSupported()){{
             "\r\n"
         ) + body
         client.sendall(response.encode())
+
+    def _serve_camera_controls(self, client):
+        """Serve current camera control values as JSON"""
+        controls = {
+            'brightness': {'value': self.cam_brightness, 'min': 0, 'max': 255, 'default': 0},
+            'contrast': {'value': self.cam_contrast, 'min': 0, 'max': 255, 'default': 32},
+            'saturation': {'value': self.cam_saturation, 'min': 0, 'max': 132, 'default': 85},
+            'hue': {'value': self.cam_hue, 'min': -180, 'max': 180, 'default': 0},
+            'gamma': {'value': self.cam_gamma, 'min': 90, 'max': 150, 'default': 100},
+            'sharpness': {'value': self.cam_sharpness, 'min': 0, 'max': 30, 'default': 3},
+            'gain': {'value': self.cam_gain, 'min': 0, 'max': 1, 'default': 1},
+            'backlight': {'value': self.cam_backlight, 'min': 0, 'max': 7, 'default': 0},
+            'wb_auto': {'value': self.cam_wb_auto, 'min': 0, 'max': 1, 'default': 1},
+            'wb_temp': {'value': self.cam_wb_temp, 'min': 2800, 'max': 6500, 'default': 4000},
+            'exposure_auto': {'value': self.cam_exposure_auto, 'min': 1, 'max': 3, 'default': 3,
+                              'options': {1: 'Manual', 3: 'Auto'}},
+            'exposure': {'value': self.cam_exposure, 'min': 10, 'max': 2500, 'default': 156},
+            'exposure_priority': {'value': self.cam_exposure_priority, 'min': 0, 'max': 1, 'default': 0},
+            'power_line': {'value': self.cam_power_line, 'min': 0, 'max': 2, 'default': 1,
+                           'options': {0: 'Disabled', 1: '50 Hz', 2: '60 Hz'}},
+        }
+        body = json.dumps(controls)
+        response = (
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        ) + body
+        client.sendall(response.encode())
+
+    def _handle_camera_reset(self, client):
+        """Reset all camera controls to their default values"""
+        # Default values for all controls
+        defaults = {
+            'cam_brightness': 0,
+            'cam_contrast': 32,
+            'cam_saturation': 85,
+            'cam_hue': 0,
+            'cam_gamma': 100,
+            'cam_sharpness': 3,
+            'cam_gain': 1,
+            'cam_backlight': 0,
+            'cam_wb_auto': 1,
+            'cam_wb_temp': 4000,
+            'cam_exposure_auto': 3,
+            'cam_exposure': 156,
+            'cam_exposure_priority': 0,
+            'cam_power_line': 1,
+        }
+
+        # Apply all defaults
+        for attr, value in defaults.items():
+            setattr(self, attr, value)
+            self._write_camera_ctrl(attr, value)
+
+        # Save to config
+        self.save_config()
+
+        body = json.dumps({'status': 'ok', 'message': 'Camera controls reset to defaults'})
+        response = (
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        ) + body
+        client.sendall(response.encode())
+
+    def _handle_camera_set(self, client, body: str):
+        """Handle camera control change - writes to ctrl file for immediate effect"""
+        try:
+            data = json.loads(body) if body else {}
+            control = data.get('control')
+            value = data.get('value')
+
+            if control is None or value is None:
+                raise ValueError("Missing control or value")
+
+            # Map control names to ctrl file keys and instance vars
+            control_map = {
+                'brightness': ('cam_brightness', 'cam_brightness', 0, 255),
+                'contrast': ('cam_contrast', 'cam_contrast', 0, 255),
+                'saturation': ('cam_saturation', 'cam_saturation', 0, 132),
+                'hue': ('cam_hue', 'cam_hue', -180, 180),
+                'gamma': ('cam_gamma', 'cam_gamma', 90, 150),
+                'sharpness': ('cam_sharpness', 'cam_sharpness', 0, 30),
+                'gain': ('cam_gain', 'cam_gain', 0, 1),
+                'backlight': ('cam_backlight', 'cam_backlight', 0, 7),
+                'wb_auto': ('cam_wb_auto', 'cam_wb_auto', 0, 1),
+                'wb_temp': ('cam_wb_temp', 'cam_wb_temp', 2800, 6500),
+                'exposure_auto': ('cam_exposure_auto', 'cam_exposure_auto', 1, 3),
+                'exposure': ('cam_exposure', 'cam_exposure', 10, 2500),
+                'exposure_priority': ('cam_exposure_priority', 'cam_exposure_priority', 0, 1),
+                'power_line': ('cam_power_line', 'cam_power_line', 0, 2),
+            }
+
+            if control not in control_map:
+                raise ValueError(f"Unknown control: {control}")
+
+            ctrl_key, attr_name, min_val, max_val = control_map[control]
+            value = int(value)
+            value = max(min_val, min(max_val, value))
+
+            # Update instance variable
+            setattr(self, attr_name, value)
+
+            # Write to ctrl file for rkmpi_enc to apply
+            self._write_camera_ctrl(ctrl_key, value)
+
+            # Save to config for persistence
+            self.save_config()
+
+            result = {'status': 'ok', 'control': control, 'value': value}
+        except Exception as e:
+            result = {'status': 'error', 'message': str(e)}
+
+        body = json.dumps(result)
+        response = (
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        ) + body
+        client.sendall(response.encode())
+
+    def _write_camera_ctrl(self, ctrl_key: str, value: int):
+        """Write a single camera control to the ctrl file for rkmpi_enc to apply"""
+        try:
+            # Read existing content
+            try:
+                with open(self.ctrl_file, 'r') as f:
+                    lines = f.readlines()
+            except FileNotFoundError:
+                lines = []
+
+            # Update or add the control line
+            found = False
+            for i, line in enumerate(lines):
+                if line.startswith(f"{ctrl_key}="):
+                    lines[i] = f"{ctrl_key}={value}\n"
+                    found = True
+                    break
+
+            if not found:
+                lines.append(f"{ctrl_key}={value}\n")
+
+            # Write back
+            with open(self.ctrl_file, 'w') as f:
+                f.writelines(lines)
+        except Exception as e:
+            print(f"Failed to write camera ctrl: {e}", flush=True)
+
+    def _apply_initial_camera_controls(self):
+        """Apply saved camera controls when encoder starts"""
+        import time
+        time.sleep(2)  # Wait for encoder to be ready
+
+        if not self.cam_controls_applied:
+            print("Applying saved camera controls...", flush=True)
+            # Write all camera controls to ctrl file
+            controls = [
+                ('cam_brightness', self.cam_brightness),
+                ('cam_contrast', self.cam_contrast),
+                ('cam_saturation', self.cam_saturation),
+                ('cam_hue', self.cam_hue),
+                ('cam_gamma', self.cam_gamma),
+                ('cam_sharpness', self.cam_sharpness),
+                ('cam_gain', self.cam_gain),
+                ('cam_backlight', self.cam_backlight),
+                ('cam_wb_auto', self.cam_wb_auto),
+                ('cam_wb_temp', self.cam_wb_temp),
+                ('cam_exposure_auto', self.cam_exposure_auto),
+                ('cam_exposure', self.cam_exposure),
+                ('cam_exposure_priority', self.cam_exposure_priority),
+                ('cam_power_line', self.cam_power_line),
+            ]
+            for key, value in controls:
+                self._write_camera_ctrl(key, value)
+            self.cam_controls_applied = True
+            print("Camera controls applied", flush=True)
 
     def _handle_touch(self, client, body: str):
         """Handle touch injection request"""
@@ -7663,6 +8228,22 @@ def main():
     # Display capture settings (disabled by default)
     args.display_enabled = saved_config.get('display_enabled', 'false') == 'true'
     args.display_fps = max(1, min(10, int(saved_config.get('display_fps', 5))))
+
+    # Camera controls (loaded from config, applied on startup)
+    args.cam_brightness = int(saved_config.get('cam_brightness', 0))
+    args.cam_contrast = int(saved_config.get('cam_contrast', 32))
+    args.cam_saturation = int(saved_config.get('cam_saturation', 85))
+    args.cam_hue = int(saved_config.get('cam_hue', 0))
+    args.cam_gamma = int(saved_config.get('cam_gamma', 100))
+    args.cam_sharpness = int(saved_config.get('cam_sharpness', 3))
+    args.cam_gain = int(saved_config.get('cam_gain', 1))
+    args.cam_backlight = int(saved_config.get('cam_backlight', 0))
+    args.cam_wb_auto = int(saved_config.get('cam_wb_auto', 1))
+    args.cam_wb_temp = int(saved_config.get('cam_wb_temp', 4000))
+    args.cam_exposure_auto = int(saved_config.get('cam_exposure_auto', 3))
+    args.cam_exposure = int(saved_config.get('cam_exposure', 156))
+    args.cam_exposure_priority = int(saved_config.get('cam_exposure_priority', 0))
+    args.cam_power_line = int(saved_config.get('cam_power_line', 1))
 
     # Advanced timelapse settings (Moonraker integration)
     args.timelapse_enabled = saved_config.get('timelapse_enabled', 'false') == 'true'
