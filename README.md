@@ -101,10 +101,12 @@ Protocol documentation, research notes, and captures.
 
 Pre-built binaries and SWU packages are available on the [Releases](https://github.com/mann1x/anycubic/releases) page.
 
+See [CHANGELOG.md](CHANGELOG.md) for detailed release notes.
+
 | Component | Latest Release | Assets |
 |-----------|---------------|--------|
-| rkmpi-encoder | [v1.1.0](https://github.com/mann1x/anycubic/releases/tag/rkmpi-encoder/v1.1.0) | `rkmpi_enc` binary |
-| h264-streamer | [v1.2.0](https://github.com/mann1x/anycubic/releases/tag/h264-streamer/v1.2.0) | SWU packages for all models |
+| rkmpi-encoder | [v1.2.0](https://github.com/mann1x/anycubic/releases/tag/rkmpi-encoder/v1.2.0) | `rkmpi_enc` binary |
+| h264-streamer | [v1.3.0](https://github.com/mann1x/anycubic/releases/tag/h264-streamer/v1.3.0) | SWU packages for all models |
 | fb-status | [v1.0.0](https://github.com/mann1x/anycubic/releases/tag/fb-status/v1.0.0) | `fb_status` binary |
 
 ### Creating a Release

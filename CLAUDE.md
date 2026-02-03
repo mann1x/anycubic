@@ -125,6 +125,60 @@ sshpass -p 'rockchip' ssh root@$PRINTER_IP '/tmp/binary'
 
 ---
 
+## Deployment
+
+### Deploy h264-streamer to Printer
+
+```bash
+PRINTER_IP=192.168.178.43
+APP_DIR=/useremain/home/rinkhals/apps/29-h264-streamer
+
+# 1. Build encoder
+cd rkmpi-encoder
+make dynamic
+
+# 2. Stop h264-streamer
+sshpass -p 'rockchip' ssh root@$PRINTER_IP "$APP_DIR/app.sh stop"
+
+# 3. Deploy files
+sshpass -p 'rockchip' scp rkmpi_enc root@$PRINTER_IP:$APP_DIR/rkmpi_enc
+sshpass -p 'rockchip' scp ../h264-streamer/29-h264-streamer/h264_server.py root@$PRINTER_IP:$APP_DIR/h264_server.py
+
+# 4. Start h264-streamer
+sshpass -p 'rockchip' ssh root@$PRINTER_IP "$APP_DIR/app.sh start"
+
+# 5. Check status and logs
+sshpass -p 'rockchip' ssh root@$PRINTER_IP "$APP_DIR/app.sh status"
+sshpass -p 'rockchip' ssh root@$PRINTER_IP "tail -20 /tmp/rinkhals/app-h264-streamer.log"
+```
+
+### Important Paths on Printer
+
+| Path | Description |
+|------|-------------|
+| `/useremain/home/rinkhals/apps/29-h264-streamer/` | h264-streamer app directory |
+| `/useremain/home/rinkhals/apps/29-h264-streamer.config` | Persistent config file (JSON) |
+| `/tmp/h264_ctrl` | Runtime control file (encoder ↔ Python) |
+| `/tmp/rinkhals/app-h264-streamer.log` | Application log file |
+
+### Control File Format
+
+The `/tmp/h264_ctrl` file is used for bidirectional communication:
+
+**Written by h264_server.py:**
+- `h264=0|1` - Enable/disable H.264 encoding
+- `display_enabled=0|1` - Enable/disable display capture
+- `display_fps=N` - Display capture frame rate
+
+**Written by rkmpi_enc:**
+- `mjpeg_fps=N.N` - Current MJPEG output FPS
+- `h264_fps=N.N` - Current H.264 output FPS
+- `mjpeg_clients=N` - Connected MJPEG clients
+- `flv_clients=N` - Connected FLV clients
+- `camera_max_fps=N` - Detected camera max FPS
+
+---
+
 ## ⛔ Critical Warnings
 
 ### Never Kill Python Processes
@@ -259,12 +313,15 @@ fb-status/VERSION        # e.g., "1.0.0"
 # 1. Update version
 echo "1.0.1" > h264-streamer/VERSION
 
-# 2. Commit and push
-git add h264-streamer/VERSION
+# 2. Update CHANGELOG.md with release notes (REQUIRED)
+# Add entry under the component section with version and date
+
+# 3. Commit and push
+git add h264-streamer/VERSION CHANGELOG.md
 git commit -m "Bump h264-streamer to 1.0.1"
 git push
 
-# 3. Tag and push (triggers CI)
+# 4. Tag and push (triggers CI)
 git tag h264-streamer/v1.0.1
 git push origin h264-streamer/v1.0.1
 ```
@@ -276,6 +333,26 @@ git tag release/2024-02-02
 git push origin release/2024-02-02
 ```
 The workflow checks existing releases and only builds components with new versions.
+
+### Changelog Requirements
+
+**IMPORTANT:** Always update `CHANGELOG.md` before creating a release tag.
+
+The changelog follows [Keep a Changelog](https://keepachangelog.com/) format:
+- Group changes under: Added, Changed, Fixed, Removed
+- List user-facing changes, not internal refactoring
+- Include the release date in ISO format (YYYY-MM-DD)
+
+Example entry:
+```markdown
+### [1.2.0] - 2025-02-03
+
+#### Added
+- New feature description
+
+#### Fixed
+- Bug fix description
+```
 
 ### GitHub Actions Workflow
 The `.github/workflows/release.yml` workflow:
