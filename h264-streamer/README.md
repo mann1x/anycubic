@@ -52,7 +52,11 @@ Download the SWU package for your printer model from [Releases](https://github.c
 | `/control` | Web UI with settings and preview |
 | `/timelapse` | Timelapse management page |
 | `/api/stats` | JSON stats (FPS, CPU, settings) |
+| `/api/config` | JSON full running configuration |
 | `/api/touch` | POST touch events to printer |
+| `/api/camera/controls` | GET camera controls with values/ranges |
+| `/api/camera/set` | POST to set a camera control |
+| `/api/camera/reset` | POST to reset camera to defaults |
 | `/api/timelapse/list` | JSON list of recordings |
 | `/api/timelapse/thumb/<name>` | Thumbnail image |
 | `/api/timelapse/video/<name>` | MP4 video (supports range requests) |
@@ -92,6 +96,48 @@ The server automatically transforms coordinates based on printer model orientati
 | KS1, KS1M | 800x480 | `(800-x, 480-y)` |
 | K3, K2P, K3V2 | 480x800 | `(y, 480-x)` |
 | K3M | 480x800 | `(800-y, x)` |
+
+## Camera Controls
+
+Real-time USB camera V4L2 control via a collapsible panel on the control page.
+
+### Features
+
+- **Real-time adjustment** - Changes apply immediately without "Apply" button
+- **Persistent settings** - Camera settings saved and restored on restart
+- **Reset to Defaults** - One-click restore of all camera defaults
+- **Auto-disable controls** - White balance temp disabled when auto is on, exposure disabled when auto is on
+
+### Available Controls
+
+| Control | Range | Default | Notes |
+|---------|-------|---------|-------|
+| Brightness | 0-255 | 0 | |
+| Contrast | 0-255 | 32 | |
+| Saturation | 0-132 | 85 | |
+| Hue | -180 to 180 | 0 | |
+| Gamma | 90-150 | 100 | |
+| Sharpness | 0-30 | 3 | |
+| Gain | On/Off | On | |
+| Backlight Compensation | 0-7 | 0 | |
+| Auto White Balance | On/Off | On | |
+| White Balance Temperature | 2800-6500K | 4000K | Only when auto is off |
+| Auto Exposure | Manual/Auto | Auto | |
+| Exposure | 10-2500 | 156 | Only when manual mode |
+| Exposure Priority | Constant FPS/Variable | Constant | |
+| Power Line Frequency | Off/50Hz/60Hz | 50Hz | Anti-flicker |
+
+### API Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/camera/controls` | GET | Get all controls with current values and ranges |
+| `/api/camera/set` | POST | Set a single control: `{"control": "contrast", "value": 50}` |
+| `/api/camera/reset` | POST | Reset all controls to defaults |
+
+### JPEG Quality
+
+**Note**: USB cameras don't support V4L2 JPEG quality control. In rkmpi-yuyv mode, JPEG quality is controlled via the "JPEG Quality" slider in the main settings panel (1-100, default 85).
 
 ## Timelapse Recording
 

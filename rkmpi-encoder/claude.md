@@ -486,3 +486,56 @@ Ensure LD_LIBRARY_PATH includes `/oem/usr/lib`
 ### No video device
 - Check USB camera connected: `ls /dev/video*`
 - Check V4L2 devices: `ls /dev/v4l/by-id/`
+
+---
+
+## USB Camera V4L2 Controls
+
+The encoder supports real-time control of USB camera settings via V4L2.
+
+### Supported Controls
+
+| Control | Range | Default | Notes |
+|---------|-------|---------|-------|
+| Brightness | 0-255 | 0 | |
+| Contrast | 0-255 | 32 | |
+| Saturation | 0-132 | 85 | |
+| Hue | -180 to 180 | 0 | |
+| Gamma | 90-150 | 100 | |
+| Sharpness | 0-30 | 3 | |
+| Gain | 0-1 | 1 | On/Off |
+| Backlight Compensation | 0-7 | 0 | |
+| White Balance Auto | 0-1 | 1 | |
+| White Balance Temperature | 2800-6500 | 4000 | Only when auto=0 |
+| Exposure Auto | 1,3 | 3 | 1=Manual, 3=Auto |
+| Exposure Absolute | 10-2500 | 156 | Only when auto=1 |
+| Exposure Auto Priority | 0-1 | 0 | Constant vs variable FPS |
+| Power Line Frequency | 0-2 | 1 | 0=Off, 1=50Hz, 2=60Hz |
+
+### Control File Interface
+
+Camera controls are read from `/tmp/h264_ctrl`:
+
+```
+cam_brightness=0
+cam_contrast=32
+cam_saturation=85
+cam_wb_auto=1
+cam_exposure_auto=3
+...
+```
+
+The encoder reads these values and applies them to the camera via `VIDIOC_S_CTRL`.
+
+### JPEG Quality
+
+USB cameras typically don't support V4L2 JPEG quality control. In YUYV mode, JPEG quality is controlled by the `--jpeg-quality` parameter (1-100, default 85) which sets the hardware VENC quality.
+
+### JPEG Frame Validation
+
+To prevent corrupt/white frames, the encoder validates JPEG output:
+- Checks for valid 0xFFD8 header
+- Requires minimum 100 byte size
+- Logs and skips invalid frames: `[JPEG] Bad frame detected`
+
+See also: `knowledge/USB_CAMERA_CONTROLS.md`
