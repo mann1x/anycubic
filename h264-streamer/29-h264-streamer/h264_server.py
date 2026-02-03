@@ -2738,10 +2738,15 @@ class StreamerApp:
         self.gkcam_pid = None  # Tracked for CPU monitoring in gkcam mode
 
         # Operating mode: 'go-klipper' or 'vanilla-klipper'
-        self.mode = getattr(args, 'mode', 'go-klipper')
+        # Sanitize to remove any invisible Unicode characters
+        raw_mode = getattr(args, 'mode', 'go-klipper')
+        sanitized_mode = ''.join(c for c in str(raw_mode) if c.isascii() and c.isprintable())
+        self.mode = sanitized_mode if sanitized_mode in ('go-klipper', 'vanilla-klipper') else 'go-klipper'
 
         # Encoder mode: 'gkcam', 'rkmpi', or 'rkmpi-yuyv'
-        self.encoder_type = getattr(args, 'encoder_type', 'rkmpi-yuyv')
+        raw_encoder = getattr(args, 'encoder_type', 'rkmpi-yuyv')
+        sanitized_encoder = ''.join(c for c in str(raw_encoder) if c.isascii() and c.isprintable())
+        self.encoder_type = sanitized_encoder if sanitized_encoder in ('gkcam', 'rkmpi', 'rkmpi-yuyv') else 'rkmpi-yuyv'
 
         # Server ports - consistent layout for all modes:
         # - streaming_port (8080): /stream, /snapshot (rkmpi_enc in rkmpi mode, Python in gkcam mode)
@@ -7619,8 +7624,15 @@ def main():
 
     # Map hyphenated args to underscored attrs
     # Use saved config values if available, otherwise use defaults
-    args.mode = saved_config.get('mode', getattr(args, 'mode', 'go-klipper'))
-    args.encoder_type = saved_config.get('encoder_type', getattr(args, 'encoder_type', 'gkcam'))
+    # Sanitize mode to remove any invisible Unicode characters (e.g., U+2069)
+    raw_mode = saved_config.get('mode', getattr(args, 'mode', 'go-klipper'))
+    # Keep only ASCII printable chars and validate
+    sanitized_mode = ''.join(c for c in str(raw_mode) if c.isascii() and c.isprintable())
+    args.mode = sanitized_mode if sanitized_mode in ('go-klipper', 'vanilla-klipper') else 'go-klipper'
+    # Sanitize encoder_type similarly
+    raw_encoder = saved_config.get('encoder_type', getattr(args, 'encoder_type', 'gkcam'))
+    sanitized_encoder = ''.join(c for c in str(raw_encoder) if c.isascii() and c.isprintable())
+    args.encoder_type = sanitized_encoder if sanitized_encoder in ('gkcam', 'rkmpi', 'rkmpi-yuyv') else 'gkcam'
     args.gkcam_all_frames = saved_config.get('gkcam_all_frames', 'false') == 'true' if 'gkcam_all_frames' in saved_config else getattr(args, 'gkcam_all_frames', False)
     # Default: autolanmode enabled (from config or command line)
     if 'autolanmode' in saved_config:
