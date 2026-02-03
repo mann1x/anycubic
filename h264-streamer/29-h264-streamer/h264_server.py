@@ -4392,7 +4392,7 @@ class StreamerApp:
 
         <div class="section camera-controls-section">
             <h2 onclick="toggleCameraControls()" style="cursor:pointer;user-select:none;">
-                <span id="camera-controls-arrow">▶</span> Camera Controls
+                <span id="camera-controls-arrow">&#9654;</span> CAMERA CONTROLS
                 <span style="font-size:12px;color:#888;font-weight:normal;margin-left:10px;">(click to expand)</span>
             </h2>
             <div id="camera-controls-panel" style="display:none;">
@@ -5205,7 +5205,7 @@ class StreamerApp:
             const arrow = document.getElementById('camera-controls-arrow');
             cameraControlsExpanded = !cameraControlsExpanded;
             panel.style.display = cameraControlsExpanded ? 'block' : 'none';
-            arrow.textContent = cameraControlsExpanded ? '▼' : '▶';
+            arrow.innerHTML = cameraControlsExpanded ? '&#9660;' : '&#9654;';
 
             if (cameraControlsExpanded && !cameraControlsLoaded) {{
                 loadCameraControls();
