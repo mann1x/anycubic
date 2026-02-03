@@ -19,7 +19,7 @@
 #define TIMELAPSE_FFMPEG_CMD    "LD_LIBRARY_PATH=" TIMELAPSE_FFMPEG_LIBS ":$LD_LIBRARY_PATH " TIMELAPSE_FFMPEG_PATH
 
 /* Maximum path lengths */
-#define TIMELAPSE_PATH_MAX      512
+#define TIMELAPSE_PATH_MAX      1024
 #define TIMELAPSE_NAME_MAX      256
 
 /* Timelapse configuration */

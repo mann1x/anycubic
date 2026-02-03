@@ -167,7 +167,8 @@ const FrameData *frame_buffer_get_current(FrameBuffer *fb) {
 }
 
 size_t frame_buffer_copy(FrameBuffer *fb, uint8_t *dst, size_t dst_size,
-                         uint64_t *sequence_out, int *is_keyframe_out) {
+                         uint64_t *sequence_out, uint64_t *timestamp_out,
+                         int *is_keyframe_out) {
     size_t copied = 0;
 
     pthread_mutex_lock(&fb->mutex);
@@ -180,6 +181,9 @@ size_t frame_buffer_copy(FrameBuffer *fb, uint8_t *dst, size_t dst_size,
 
         if (sequence_out) {
             *sequence_out = frame->sequence;
+        }
+        if (timestamp_out) {
+            *timestamp_out = frame->timestamp;
         }
         if (is_keyframe_out) {
             *is_keyframe_out = frame->is_keyframe;

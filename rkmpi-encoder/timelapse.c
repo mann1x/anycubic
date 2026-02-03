@@ -5,6 +5,9 @@
  * them into MP4 video using ffmpeg.
  */
 
+/* Disable format-truncation warnings - snprintf truncation is intentional and safe */
+#pragma GCC diagnostic ignored "-Wformat-truncation"
+
 #include "timelapse.h"
 #include "frame_buffer.h"
 #include <stdio.h>
@@ -351,7 +354,7 @@ int timelapse_capture_frame(void) {
     uint64_t sequence;
     size_t jpeg_size = frame_buffer_copy(&g_jpeg_buffer, jpeg_buf,
                                           FRAME_BUFFER_MAX_JPEG,
-                                          &sequence, NULL);
+                                          &sequence, NULL, NULL);
 
     if (jpeg_size == 0) {
         timelapse_log("Frame %d: no JPEG data available\n", g_timelapse.frame_count);

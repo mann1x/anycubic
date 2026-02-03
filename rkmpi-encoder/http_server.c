@@ -404,35 +404,6 @@ static void http_send_mjpeg_headers(int fd) {
     http_send(fd, headers, len);
 }
 
-/* Send single JPEG snapshot from a buffer */
-static void http_send_snapshot_from_buffer(int fd, FrameBuffer *buffer, size_t max_size) {
-    uint8_t *jpeg_buf = malloc(max_size);
-    if (!jpeg_buf) {
-        http_send_404(fd);
-        return;
-    }
-
-    uint64_t seq;
-    size_t jpeg_size = frame_buffer_copy(buffer, jpeg_buf, max_size, &seq, NULL);
-
-    if (jpeg_size > 0) {
-        char headers[256];
-        int hlen = snprintf(headers, sizeof(headers),
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Type: image/jpeg\r\n"
-            "Content-Length: %zu\r\n"
-            "Cache-Control: no-cache\r\n"
-            "Connection: close\r\n"
-            "\r\n", jpeg_size);
-        http_send(fd, headers, hlen);
-        http_send(fd, jpeg_buf, jpeg_size);
-    } else {
-        http_send_404(fd);
-    }
-
-    free(jpeg_buf);
-}
-
 /* External functions from rkmpi_enc.c for snapshot support */
 extern void request_camera_snapshot(void);
 extern int is_snapshot_pending(void);
@@ -452,7 +423,7 @@ static void http_send_snapshot(int fd) {
     }
 
     size_t jpeg_size = frame_buffer_copy(&g_jpeg_buffer, jpeg_buf,
-                                          FRAME_BUFFER_MAX_JPEG, NULL, &cur_ts);
+                                          FRAME_BUFFER_MAX_JPEG, NULL, &cur_ts, NULL);
 
     /* If we have a recent frame (< 2 seconds old), use it */
     uint64_t now = get_time_us();
@@ -486,7 +457,7 @@ static void http_send_snapshot(int fd) {
         uint64_t new_seq = frame_buffer_get_sequence(&g_jpeg_buffer);
         if (new_seq > cur_seq) {
             jpeg_size = frame_buffer_copy(&g_jpeg_buffer, jpeg_buf,
-                                          FRAME_BUFFER_MAX_JPEG, NULL, NULL);
+                                          FRAME_BUFFER_MAX_JPEG, NULL, NULL, NULL);
             if (jpeg_size > 0) break;
         }
     }
@@ -542,7 +513,7 @@ static void http_send_display_snapshot(int fd) {
         if (cur_seq > start_seq) {
             /* New frame available - copy it */
             jpeg_size = frame_buffer_copy(&g_display_buffer, jpeg_buf,
-                                         FRAME_BUFFER_MAX_DISPLAY, NULL, NULL);
+                                         FRAME_BUFFER_MAX_DISPLAY, NULL, NULL, NULL);
             if (jpeg_size > 0) break;
         }
     }
@@ -765,7 +736,7 @@ static void *mjpeg_server_thread(void *arg) {
 
                     uint64_t seq;
                     HTTP_TIMING_START(fb_copy_time);
-                    size_t jpeg_size = frame_buffer_copy(buffer, buf, buf_size, &seq, NULL);
+                    size_t jpeg_size = frame_buffer_copy(buffer, buf, buf_size, &seq, NULL, NULL);
                     HTTP_TIMING_END(&g_mjpeg_timing, fb_copy_time);
 
                     if (jpeg_size > 0) {
@@ -939,7 +910,7 @@ static void *flv_server_thread(void *arg) {
                     int is_keyframe;
                     HTTP_TIMING_START(fb_copy_time);
                     size_t h264_size = frame_buffer_copy(&g_h264_buffer, h264_buf,
-                                                         FRAME_BUFFER_MAX_H264, &seq, &is_keyframe);
+                                                         FRAME_BUFFER_MAX_H264, &seq, NULL, &is_keyframe);
                     HTTP_TIMING_END(&g_flv_timing, fb_copy_time);
 
                     if (h264_size > 0) {

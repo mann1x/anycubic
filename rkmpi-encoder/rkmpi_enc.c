@@ -62,6 +62,7 @@
 #include "mqtt_client.h"
 #include "rpc_client.h"
 #include "display_capture.h"
+#include "timelapse.h"
 
 /* Forward declarations */
 static void log_info(const char *fmt, ...);
@@ -1252,34 +1253,6 @@ static void cleanup_turbojpeg_decoder(void) {
         g_yuv_buffer = NULL;
         g_yuv_buffer_size = 0;
     }
-}
-
-/*
- * Ensure pre-allocated YUV buffer is large enough
- */
-static int ensure_yuv_buffer(int width, int height) {
-    size_t y_size = width * height;
-    size_t uv_size = (width / 2) * (height / 2);
-    size_t needed = y_size + uv_size * 2;
-
-    if (g_yuv_buffer && g_yuv_buffer_size >= needed) {
-        return 0;  /* Already allocated */
-    }
-
-    if (g_yuv_buffer) {
-        free(g_yuv_buffer);
-    }
-
-    g_yuv_buffer = malloc(needed);
-    if (!g_yuv_buffer) {
-        log_error("Failed to allocate YUV buffer (%zu bytes)\n", needed);
-        g_yuv_buffer_size = 0;
-        return -1;
-    }
-
-    g_yuv_buffer_size = needed;
-    log_info("Allocated YUV buffer: %zu bytes\n", needed);
-    return 0;
 }
 
 /*

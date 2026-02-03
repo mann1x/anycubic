@@ -59,9 +59,14 @@ int frame_buffer_wait(FrameBuffer *fb, uint64_t last_sequence, int timeout_ms);
 /* Get current frame data (caller must hold lock or call between wait/release) */
 const FrameData *frame_buffer_get_current(FrameBuffer *fb);
 
-/* Copy frame data to user buffer, returns bytes copied */
+/* Copy frame data to user buffer, returns bytes copied
+ * sequence_out: frame sequence number (optional)
+ * timestamp_out: frame timestamp in microseconds (optional)
+ * is_keyframe_out: 1 if H.264 keyframe (optional)
+ */
 size_t frame_buffer_copy(FrameBuffer *fb, uint8_t *dst, size_t dst_size,
-                         uint64_t *sequence_out, int *is_keyframe_out);
+                         uint64_t *sequence_out, uint64_t *timestamp_out,
+                         int *is_keyframe_out);
 
 /* Get current sequence number without waiting */
 uint64_t frame_buffer_get_sequence(FrameBuffer *fb);
