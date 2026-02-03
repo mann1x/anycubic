@@ -3614,6 +3614,8 @@ class StreamerApp:
                 self._serve_status(client)
             elif path == '/api/stats':
                 self._serve_api_stats(client)
+            elif path == '/api/config':
+                self._serve_api_config(client)
             elif path == '/api/restart':
                 self._handle_restart(client)
             elif path == '/api/led/on':
@@ -5570,6 +5572,72 @@ if(flvjs.isSupported()){{
             "HTTP/1.1 200 OK\r\n"
             "Content-Type: application/json\r\n"
             f"Content-Length: {len(body)}\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        ) + body
+        client.sendall(response.encode())
+
+    def _serve_api_config(self, client):
+        """Serve full running configuration as JSON for external tools (e.g., ACProxyCam)"""
+        config = {
+            # Encoder configuration
+            'encoder_type': self.encoder_type,
+            'streaming_port': self.streaming_port,
+            'control_port': self.control_port,
+
+            # H.264 settings
+            'h264_enabled': self.h264_enabled,
+            'h264_resolution': self.h264_resolution,
+            'h264_bitrate': self.bitrate,
+
+            # MJPEG settings
+            'mjpeg_fps': self.mjpeg_fps_target,
+            'jpeg_quality': self.jpeg_quality,
+
+            # Auto-skip / CPU settings
+            'skip_ratio': self.skip_ratio,
+            'auto_skip': self.auto_skip,
+            'target_cpu': self.target_cpu,
+
+            # Display capture
+            'display_enabled': self.display_enabled,
+            'display_fps': self.display_fps,
+
+            # LAN mode
+            'autolanmode': self.autolanmode,
+
+            # Camera info
+            'device': self.camera_device,
+            'width': self.camera_width,
+            'height': self.camera_height,
+
+            # Operating mode
+            'mode': self.mode,
+
+            # Timelapse settings
+            'timelapse_enabled': self.timelapse_enabled,
+            'timelapse_mode': self.timelapse_mode,
+            'timelapse_hyperlapse_interval': self.timelapse_hyperlapse_interval,
+            'timelapse_storage': self.timelapse_storage,
+            'timelapse_usb_path': self.timelapse_usb_path,
+            'timelapse_output_fps': self.timelapse_output_fps,
+            'timelapse_variable_fps': self.timelapse_variable_fps,
+            'timelapse_target_length': self.timelapse_target_length,
+            'timelapse_crf': self.timelapse_crf,
+            'timelapse_duplicate_last_frame': self.timelapse_duplicate_last_frame,
+            'timelapse_stream_delay': self.timelapse_stream_delay,
+            'timelapse_flip_x': self.timelapse_flip_x,
+            'timelapse_flip_y': self.timelapse_flip_y,
+
+            # Session info
+            'session_id': self.session_id,
+        }
+        body = json.dumps(config)
+        response = (
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
             "Connection: close\r\n"
             "\r\n"
         ) + body
