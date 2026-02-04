@@ -1150,6 +1150,181 @@ def find_camera_device(internal_usb_port=None):
     return None
 
 
+MAX_CAMERAS = 4  # Maximum number of supported cameras
+
+
+def find_all_cameras(internal_usb_port='1.3'):
+    """Find all USB cameras and return list with info.
+
+    Cameras are sorted with internal camera first, then by USB port.
+    Returns max MAX_CAMERAS cameras with streaming port allocation.
+
+    Args:
+        internal_usb_port: USB port for internal camera (default '1.3')
+
+    Returns:
+        List of dicts with camera info including streaming ports
+    """
+    cameras = []
+    by_id_path = "/dev/v4l/by-id"
+    by_path = "/dev/v4l/by-path"
+
+    if not os.path.exists(by_id_path):
+        return cameras
+
+    try:
+        # Build USB port mapping from by-path
+        usb_port_map = {}  # device -> usb_port
+        by_id_map = {}  # device -> by_id_name (for unique_id)
+        if os.path.exists(by_path):
+            for entry in os.listdir(by_path):
+                if 'video-index0' in entry:
+                    device = os.path.realpath(os.path.join(by_path, entry))
+                    # Extract USB port from pattern like: usb-0:1.3:1.0 or usb-0:1.4.3:1.0
+                    match = re.search(r'usb-0:([0-9.]+):', entry)
+                    if match:
+                        usb_port_map[device] = match.group(1)
+
+        # Find all cameras from by-id
+        for entry in sorted(os.listdir(by_id_path)):
+            if 'video-index0' not in entry.lower():
+                continue
+
+            device = os.path.realpath(os.path.join(by_id_path, entry))
+            by_id_map[device] = entry
+
+            # Extract camera name from by-id entry
+            # Format: usb-Vendor_Product_Serial-video-index0
+            name_match = re.match(r'usb-(.+)-video-index0', entry)
+            if name_match:
+                raw_name = name_match.group(1)
+                # Clean up name: replace underscores, remove serial numbers
+                name_parts = raw_name.split('_')
+                # Take vendor and product, skip serial-like parts
+                clean_parts = []
+                for part in name_parts:
+                    # Skip parts that look like serials (long alphanumeric)
+                    if len(part) > 10 and part.isalnum():
+                        continue
+                    clean_parts.append(part)
+                name = ' '.join(clean_parts[:3])  # Max 3 parts for brevity
+            else:
+                name = entry
+
+            usb_port = usb_port_map.get(device, 'unknown')
+
+            cameras.append({
+                'name': name,
+                'device': device,
+                'usb_port': usb_port,
+                'by_id_name': entry
+            })
+
+        # Sort: internal camera (by USB port) first, then by USB port
+        cameras.sort(key=lambda c: (0 if c['usb_port'] == internal_usb_port else 1, c['usb_port']))
+
+        # Limit to MAX_CAMERAS
+        cameras = cameras[:MAX_CAMERAS]
+
+        # Assign IDs and streaming ports after sorting
+        # Port allocation: CAM#1=8080, CAM#2=8082, CAM#3=8083, CAM#4=8084
+        for i, cam in enumerate(cameras):
+            cam['id'] = i + 1
+            cam['unique_id'] = cam.get('by_id_name', f"camera_{cam['device'].replace('/', '_')}")
+            cam['enabled'] = (i == 0)  # Only CAM#1 enabled by default
+            cam['is_primary'] = (i == 0)  # Only CAM#1 is primary (has FLV/H264 encoding)
+            cam['streaming_port'] = 8080 if i == 0 else 8080 + i + 1  # 8080, 8082, 8083, 8084
+            # Detect supported resolutions for secondary cameras (YUYV mode)
+            if not cam['is_primary']:
+                cam['supported_resolutions'] = detect_camera_resolutions(cam['device'], 'YUYV')
+            else:
+                cam['supported_resolutions'] = detect_camera_resolutions(cam['device'], 'MJPG')
+            print(f"Found camera #{cam['id']}: {cam['name']} at {cam['device']} "
+                  f"(USB port {cam['usb_port']}, port {cam['streaming_port']}"
+                  f"{', primary' if cam['is_primary'] else ''}, "
+                  f"resolutions: {cam['supported_resolutions'][:3]}...)", flush=True)
+
+    except Exception as e:
+        print(f"Error scanning for cameras: {e}", flush=True)
+
+    return cameras
+
+
+def detect_camera_resolutions(device, pixel_format='YUYV'):
+    """Detect all supported resolutions for a camera using V4L2 ioctls.
+
+    Args:
+        device: V4L2 device path (e.g., /dev/video12)
+        pixel_format: Pixel format to query ('YUYV' or 'MJPG')
+
+    Returns:
+        List of (width, height) tuples, sorted by resolution (highest first)
+    """
+    import fcntl
+    import struct
+
+    # V4L2 constants
+    VIDIOC_ENUM_FRAMESIZES = 0xc02c564a
+    V4L2_FRMSIZE_TYPE_DISCRETE = 1
+    V4L2_FRMSIZE_TYPE_STEPWISE = 2
+    V4L2_FRMSIZE_TYPE_CONTINUOUS = 3
+
+    # Pixel format fourcc
+    if pixel_format == 'YUYV':
+        fourcc = 0x56595559  # 'YUYV'
+    elif pixel_format == 'MJPG':
+        fourcc = 0x47504a4d  # 'MJPG'
+    else:
+        fourcc = 0x56595559  # Default to YUYV
+
+    resolutions = []
+
+    try:
+        fd = os.open(device, os.O_RDWR)
+        try:
+            index = 0
+            while True:
+                # struct v4l2_frmsizeenum (44 bytes on 32-bit)
+                # __u32 index, __u32 pixel_format, __u32 type, union { discrete, stepwise }
+                buf = struct.pack('II36x', index, fourcc)
+
+                try:
+                    result = fcntl.ioctl(fd, VIDIOC_ENUM_FRAMESIZES, buf)
+                    data = struct.unpack('II I II 24x', result[:44])
+                    idx, pix_fmt, frmsize_type, width, height = data
+
+                    if frmsize_type == V4L2_FRMSIZE_TYPE_DISCRETE:
+                        resolutions.append((width, height))
+                    elif frmsize_type in (V4L2_FRMSIZE_TYPE_STEPWISE, V4L2_FRMSIZE_TYPE_CONTINUOUS):
+                        # For stepwise/continuous, add common resolutions
+                        # struct has: min_width, max_width, step_width, min_height, max_height, step_height
+                        step_data = struct.unpack('II I IIIIII', result[:36])
+                        min_w, max_w, step_w, min_h, max_h, step_h = step_data[3:9]
+                        for w, h in [(1280, 720), (800, 600), (640, 480), (320, 240)]:
+                            if min_w <= w <= max_w and min_h <= h <= max_h:
+                                resolutions.append((w, h))
+                        break
+
+                    index += 1
+                except OSError:
+                    # No more frame sizes
+                    break
+        finally:
+            os.close(fd)
+    except Exception as e:
+        print(f"Failed to enumerate resolutions for {device}: {e}", flush=True)
+
+    # Remove duplicates and sort by resolution (highest first)
+    resolutions = list(set(resolutions))
+    resolutions.sort(key=lambda x: x[0] * x[1], reverse=True)
+
+    # If no resolutions found, return common defaults
+    if not resolutions:
+        resolutions = [(1280, 720), (640, 480), (320, 240)]
+
+    return resolutions
+
+
 def detect_camera_resolution(device):
     """Detect camera's best MJPEG resolution"""
     # Default resolution (common USB camera resolution)
@@ -2921,6 +3096,13 @@ class StreamerApp:
         self.camera_device = None
         self.camera_width = 1280
         self.camera_height = 720
+        self.cameras = []  # List of discovered cameras
+        self.active_camera_id = 1  # Currently active camera ID (for UI preview)
+
+        # Multi-camera encoder management
+        self.encoder_processes = {}  # camera_id -> subprocess
+        self.camera_settings = {}  # unique_id -> {settings dict} for per-camera config
+        self.camera_status = {}  # camera_id -> {status, error, last_update}
 
         # Camera V4L2 controls (loaded from config, can be modified via API)
         self.cam_brightness = getattr(args, 'cam_brightness', 0)
@@ -3166,6 +3348,9 @@ class StreamerApp:
             config['timelapse_flip_y'] = 'true' if self.timelapse_flip_y else 'false'
             config['timelapse_end_delay'] = str(self.timelapse_end_delay)
 
+            # Per-camera settings (keyed by unique_id)
+            config['cameras'] = self.camera_settings
+
             # Write back with explicit flush and sync
             with open(config_path, 'w') as f:
                 json.dump(config, f, indent=2)
@@ -3176,6 +3361,47 @@ class StreamerApp:
             print(f"Settings saved to {config_path}", flush=True)
         except Exception as e:
             print(f"Error saving config: {e}", flush=True)
+
+    def _load_camera_settings(self):
+        """Load per-camera settings from config file."""
+        config_path = "/useremain/home/rinkhals/apps/29-h264-streamer.config"
+        try:
+            with open(config_path, 'r') as f:
+                config = json.load(f)
+
+            # Load cameras section
+            cameras_config = config.get('cameras', {})
+            if isinstance(cameras_config, dict):
+                self.camera_settings = cameras_config
+                print(f"Loaded settings for {len(self.camera_settings)} camera(s)", flush=True)
+            else:
+                self.camera_settings = {}
+
+        except FileNotFoundError:
+            print("No config file found, using defaults", flush=True)
+            self.camera_settings = {}
+        except Exception as e:
+            print(f"Error loading camera settings: {e}", flush=True)
+            self.camera_settings = {}
+
+    def _save_camera_enabled(self, camera_id, enabled):
+        """Save camera enabled state to per-camera settings."""
+        cam = self.get_camera_by_id(camera_id)
+        if not cam:
+            return
+
+        unique_id = cam.get('unique_id')
+        if not unique_id:
+            return
+
+        # Initialize settings for this camera if not exists
+        if unique_id not in self.camera_settings:
+            self.camera_settings[unique_id] = {}
+
+        self.camera_settings[unique_id]['enabled'] = enabled
+
+        # Save to config file
+        self.save_config()
 
     def start(self):
         """Start the streamer"""
@@ -3315,35 +3541,75 @@ class StreamerApp:
             start_camera_stream()
             time.sleep(2)
 
-        # Find camera (prioritize internal camera by USB port)
-        self.camera_device = find_camera_device(self.internal_usb_port)
-        if not self.camera_device:
+        # Discover all cameras
+        self.cameras = find_all_cameras(self.internal_usb_port)
+        if not self.cameras:
+            # Fallback to single camera detection
+            device = find_camera_device(self.internal_usb_port)
+            if device:
+                self.cameras = [{
+                    'id': 1,
+                    'name': 'Camera',
+                    'device': device,
+                    'usb_port': 'unknown',
+                    'unique_id': f"camera_{device.replace('/', '_')}",
+                    'enabled': True,
+                    'is_primary': True,
+                    'streaming_port': 8080
+                }]
+
+        if not self.cameras:
             print("ERROR: No camera found!", flush=True)
             return False
 
-        # Detect resolution
-        self.camera_width, self.camera_height = detect_camera_resolution(self.camera_device)
+        print(f"Discovered {len(self.cameras)} camera(s)", flush=True)
 
-        # Detect max camera FPS at this resolution
-        self.max_camera_fps = detect_camera_max_fps(self.camera_device, self.camera_width, self.camera_height)
+        # Load per-camera settings from config (if available)
+        self._load_camera_settings()
 
-        # Validate mjpeg_fps_target against camera capabilities
-        if self.mjpeg_fps_target > self.max_camera_fps:
-            print(f"MJPEG FPS target ({self.mjpeg_fps_target}) exceeds camera max ({self.max_camera_fps}), clamping", flush=True)
-            self.mjpeg_fps_target = self.max_camera_fps
-        elif self.mjpeg_fps_target < 2:
-            self.mjpeg_fps_target = 2
-        print(f"MJPEG target FPS: {self.mjpeg_fps_target} (max: {self.max_camera_fps})", flush=True)
+        # Apply enabled state from settings to cameras
+        for cam in self.cameras:
+            unique_id = cam.get('unique_id')
+            if unique_id and unique_id in self.camera_settings:
+                cam['enabled'] = self.camera_settings[unique_id].get('enabled', cam.get('enabled', cam['id'] == 1))
 
-        # Initialize FLV muxer
-        self.flv_muxer = FLVMuxer(self.camera_width, self.camera_height, 10)
+        # Select active camera for UI preview (first enabled camera, preferring primary)
+        self.active_camera_id = 1
+        for cam in self.cameras:
+            if cam.get('enabled', False):
+                self.active_camera_id = cam['id']
+                break
+
+        # Get primary camera info for main settings
+        primary_cam = self.get_camera_by_id(1)
+        if primary_cam:
+            self.camera_device = primary_cam['device']
+            self.camera_width, self.camera_height = detect_camera_resolution(self.camera_device)
+            self.max_camera_fps = detect_camera_max_fps(self.camera_device, self.camera_width, self.camera_height)
+
+            # Validate mjpeg_fps_target against camera capabilities
+            if self.mjpeg_fps_target > self.max_camera_fps:
+                print(f"MJPEG FPS target ({self.mjpeg_fps_target}) exceeds camera max ({self.max_camera_fps}), clamping", flush=True)
+                self.mjpeg_fps_target = self.max_camera_fps
+            elif self.mjpeg_fps_target < 2:
+                self.mjpeg_fps_target = 2
+            print(f"MJPEG target FPS: {self.mjpeg_fps_target} (max: {self.max_camera_fps})", flush=True)
+
+            # Initialize FLV muxer with primary camera resolution
+            self.flv_muxer = FLVMuxer(self.camera_width, self.camera_height, 10)
 
         # Write control file BEFORE starting encoder (so encoder reads correct settings)
         self.write_ctrl_file()
 
-        # Start encoder process
-        if not self.start_encoder():
-            print("ERROR: Failed to start encoder!", flush=True)
+        # Start encoder for all enabled cameras
+        started_any = False
+        for cam in self.cameras:
+            if cam.get('enabled', False):
+                if self.start_camera_encoder(cam['id']):
+                    started_any = True
+
+        if not started_any:
+            print("ERROR: Failed to start any encoder!", flush=True)
             return False
 
         return True
@@ -3457,10 +3723,302 @@ class StreamerApp:
             # Give encoder a moment to initialize, then write all controls
             threading.Thread(target=self._apply_initial_camera_controls, daemon=True).start()
 
+            # Track in encoder_processes for multi-camera support
+            self.encoder_processes[1] = self.encoder_process
+
             return True
         except Exception as e:
             print(f"Failed to start encoder: {e}", flush=True)
             return False
+
+    def stop_encoder(self):
+        """Stop the primary encoder process."""
+        self.stop_camera_encoder(1)
+
+    def get_camera_by_id(self, camera_id):
+        """Get camera info by ID."""
+        for cam in self.cameras:
+            if cam['id'] == camera_id:
+                return cam
+        return None
+
+    def get_camera_settings(self, camera):
+        """Get settings for a camera, using per-camera storage or defaults."""
+        unique_id = camera.get('unique_id', f"camera_{camera['id']}")
+        if unique_id in self.camera_settings:
+            return self.camera_settings[unique_id]
+        # Return default settings
+        return {
+            'enabled': camera.get('enabled', camera['id'] == 1),
+            'mjpeg_fps': self.mjpeg_fps_target,
+            'resolution': f"{self.camera_width}x{self.camera_height}",
+        }
+
+    def start_camera_encoder(self, camera_id):
+        """Start encoder for a specific camera.
+
+        Args:
+            camera_id: Camera ID (1-4)
+
+        Returns:
+            True if encoder started successfully
+        """
+        cam = self.get_camera_by_id(camera_id)
+        if not cam:
+            print(f"Camera #{camera_id} not found", flush=True)
+            return False
+
+        if not cam.get('enabled', False):
+            print(f"Camera #{camera_id} is disabled, not starting encoder", flush=True)
+            return False
+
+        is_primary = cam.get('is_primary', camera_id == 1)
+        settings = self.get_camera_settings(cam)
+
+        encoder_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'rkmpi_enc')
+        if not os.path.exists(encoder_path):
+            print(f"Encoder not found: {encoder_path}", flush=True)
+            return False
+
+        os.chmod(encoder_path, 0o755)
+
+        # Get camera resolution
+        cam_w, cam_h = detect_camera_resolution(cam['device'])
+
+        # Get FPS from settings or default
+        fps = settings.get('mjpeg_fps', self.mjpeg_fps_target)
+
+        # Build command
+        cmd = [
+            encoder_path,
+            '-S',  # Server mode
+            '-N',  # No stdout
+            '-d', cam['device'],
+            '-w', str(cam_w),
+            '-h', str(cam_h),
+            '-f', str(fps),
+            '-v',  # Verbose logging
+            '--streaming-port', str(cam['streaming_port']),
+            '--control-port', str(self.control_port)
+        ]
+
+        if is_primary:
+            # Primary camera: full features
+            if self.encoder_type == 'rkmpi-yuyv':
+                effective_skip = 1
+                effective_auto_skip = False
+                cmd.extend(['-y', '-j', str(self.jpeg_quality)])
+            else:
+                effective_skip = self.skip_ratio
+                effective_auto_skip = self.auto_skip
+                if self.h264_resolution and self.h264_resolution != '1280x720':
+                    cmd.extend(['--h264-resolution', self.h264_resolution])
+
+            cmd.extend([
+                '-s', str(effective_skip),
+                '-b', str(self.bitrate),
+                '-t', str(self.target_cpu),
+                '-q',  # VBR mode
+                '--mode', self.mode,
+            ])
+
+            if effective_auto_skip:
+                cmd.append('-a')
+
+            if not self.h264_enabled:
+                cmd.append('-n')
+
+            # Enable display capture for primary camera only
+            cmd.append('--display')
+            cmd.extend(['--display-fps', str(self.display_fps)])
+        else:
+            # Secondary camera: Use YUYV mode at low resolution to reduce USB bandwidth
+            # Get configured resolution or use 640x480 default for bandwidth savings
+            sec_resolution = settings.get('resolution', '640x480')
+            try:
+                cam_w, cam_h = map(int, sec_resolution.split('x'))
+            except:
+                cam_w, cam_h = 640, 480
+
+            # Override resolution in cmd (replace earlier -w and -h)
+            cmd = [
+                encoder_path,
+                '-S',  # Server mode
+                '-N',  # No stdout
+                '-d', cam['device'],
+                '-w', str(cam_w),
+                '-h', str(cam_h),
+                '-f', str(fps),
+                '-v',  # Verbose logging
+                '--streaming-port', str(cam['streaming_port']),
+                '--control-port', str(self.control_port),
+                '--no-flv',
+                '-y',  # YUYV mode (lower USB bandwidth than MJPEG)
+                '-j', str(self.jpeg_quality),
+                '-s', '1',  # No skipping
+                '-b', str(self.bitrate),
+                '-n',  # No H.264 encoding
+                '--mode', 'vanilla-klipper',  # Skip MQTT/RPC
+            ]
+
+        # Add per-camera command/control files to avoid interference between encoders
+        cam_cmd_file = f"/tmp/h264_cmd_{camera_id}" if camera_id > 1 else "/tmp/h264_cmd"
+        cam_ctrl_file = f"/tmp/h264_ctrl_{camera_id}" if camera_id > 1 else "/tmp/h264_ctrl"
+        cmd.extend(['--cmd-file', cam_cmd_file, '--ctrl-file', cam_ctrl_file])
+
+        print(f"Starting camera #{camera_id} encoder: {' '.join(cmd)}", flush=True)
+
+        # Initialize status
+        self.camera_status[camera_id] = {
+            'status': 'starting',
+            'error': None,
+            'resolution': f"{cam_w}x{cam_h}",
+            'mode': 'YUYV' if not is_primary or self.encoder_type == 'rkmpi-yuyv' else 'MJPEG',
+            'last_update': time.time()
+        }
+
+        try:
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                bufsize=0
+            )
+            self.encoder_processes[camera_id] = process
+
+            print(f"Camera #{camera_id} encoder started (PID {process.pid}) on port {cam['streaming_port']}", flush=True)
+
+            # Start stderr reader for this encoder (also monitors for errors)
+            threading.Thread(
+                target=self._camera_encoder_stderr_reader,
+                args=(camera_id, process),
+                daemon=True
+            ).start()
+
+            # For primary camera, keep backward compatibility
+            if is_primary:
+                self.encoder_process = process
+                self.encoder_pid = process.pid
+                self.camera_device = cam['device']
+                self.camera_width = cam_w
+                self.camera_height = cam_h
+
+                # Apply initial camera controls
+                threading.Thread(target=self._apply_initial_camera_controls, daemon=True).start()
+
+            return True
+        except Exception as e:
+            print(f"Failed to start camera #{camera_id} encoder: {e}", flush=True)
+            return False
+
+    def _camera_encoder_stderr_reader(self, camera_id, process):
+        """Read and log encoder stderr for a specific camera, monitoring for errors."""
+        capture_started = False
+        while self.running and process.poll() is None:
+            try:
+                line = process.stderr.readline()
+                if not line:
+                    break
+                line_str = line.decode('utf-8', errors='ignore').rstrip()
+                print(f"[encoder #{camera_id}] {line_str}", flush=True)
+
+                # Monitor for status changes and errors
+                if 'V4L2 capture started' in line_str or 'Starting capture loop' in line_str:
+                    capture_started = True
+                    self.camera_status[camera_id] = {
+                        'status': 'running',
+                        'error': None,
+                        'resolution': self.camera_status.get(camera_id, {}).get('resolution', 'unknown'),
+                        'mode': self.camera_status.get(camera_id, {}).get('mode', 'unknown'),
+                        'last_update': time.time()
+                    }
+                elif 'VIDIOC_STREAMON failed' in line_str:
+                    # Check for bandwidth error
+                    if 'No space left on device' in line_str:
+                        error_msg = 'USB bandwidth exhausted - try lower resolution or disconnect other USB devices'
+                    else:
+                        error_msg = f'Camera stream failed: {line_str}'
+                    self.camera_status[camera_id] = {
+                        'status': 'error',
+                        'error': error_msg,
+                        'resolution': self.camera_status.get(camera_id, {}).get('resolution', 'unknown'),
+                        'mode': self.camera_status.get(camera_id, {}).get('mode', 'unknown'),
+                        'last_update': time.time()
+                    }
+                    print(f"Camera #{camera_id} error: {error_msg}", flush=True)
+                elif 'Failed to' in line_str or 'Error' in line_str:
+                    # Generic error detection
+                    if camera_id in self.camera_status and self.camera_status[camera_id].get('status') != 'error':
+                        self.camera_status[camera_id]['last_update'] = time.time()
+            except Exception:
+                break
+
+        # Process ended - check if it was an error
+        exit_code = process.poll()
+        if exit_code is not None and exit_code != 0 and not capture_started:
+            if camera_id in self.camera_status:
+                if self.camera_status[camera_id].get('status') != 'error':
+                    self.camera_status[camera_id] = {
+                        'status': 'error',
+                        'error': f'Encoder exited with code {exit_code}',
+                        'resolution': self.camera_status.get(camera_id, {}).get('resolution', 'unknown'),
+                        'mode': self.camera_status.get(camera_id, {}).get('mode', 'unknown'),
+                        'last_update': time.time()
+                    }
+
+    def stop_camera_encoder(self, camera_id):
+        """Stop encoder for a specific camera.
+
+        Args:
+            camera_id: Camera ID (1-4)
+        """
+        if camera_id not in self.encoder_processes:
+            return
+
+        process = self.encoder_processes[camera_id]
+        print(f"Stopping camera #{camera_id} encoder (PID {process.pid})...", flush=True)
+
+        try:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=2)
+        except Exception as e:
+            print(f"Error stopping camera #{camera_id} encoder: {e}", flush=True)
+
+        del self.encoder_processes[camera_id]
+
+        # Clear status
+        if camera_id in self.camera_status:
+            self.camera_status[camera_id] = {
+                'status': 'stopped',
+                'error': None,
+                'resolution': self.camera_status[camera_id].get('resolution', 'unknown'),
+                'mode': self.camera_status[camera_id].get('mode', 'unknown'),
+                'last_update': time.time()
+            }
+
+        # Clear primary encoder reference if this was the primary
+        if camera_id == 1:
+            self.encoder_process = None
+            self.encoder_pid = None
+
+    def stop_all_encoders(self):
+        """Stop all encoder processes."""
+        for cam_id in list(self.encoder_processes.keys()):
+            self.stop_camera_encoder(cam_id)
+
+    def restart_encoders(self):
+        """Restart all enabled camera encoders."""
+        print("Restarting all encoders...", flush=True)
+        self.stop_all_encoders()
+        time.sleep(1)
+
+        for cam in self.cameras:
+            if cam.get('enabled', False):
+                self.start_camera_encoder(cam['id'])
 
     def _mjpeg_reader(self):
         """Read MJPEG frames from encoder stdout (optimized with bytearray)"""
@@ -3906,6 +4464,52 @@ class StreamerApp:
                     if body_start != -1:
                         body = request[body_start+4:body_start+4+content_length]
                 self._handle_camera_set(client, body)
+            elif path == '/api/cameras':
+                self._serve_cameras(client)
+            elif path == '/api/camera/enable' and method == 'POST':
+                content_length = 0
+                for line in request.split('\r\n'):
+                    if line.lower().startswith('content-length:'):
+                        content_length = int(line.split(':')[1].strip())
+                body = ''
+                if content_length > 0:
+                    body_start = request.find('\r\n\r\n')
+                    if body_start != -1:
+                        body = request[body_start+4:body_start+4+content_length]
+                self._handle_camera_enable(client, body)
+            elif path == '/api/camera/disable' and method == 'POST':
+                content_length = 0
+                for line in request.split('\r\n'):
+                    if line.lower().startswith('content-length:'):
+                        content_length = int(line.split(':')[1].strip())
+                body = ''
+                if content_length > 0:
+                    body_start = request.find('\r\n\r\n')
+                    if body_start != -1:
+                        body = request[body_start+4:body_start+4+content_length]
+                self._handle_camera_disable(client, body)
+            elif path == '/api/camera/switch' and method == 'POST':
+                content_length = 0
+                for line in request.split('\r\n'):
+                    if line.lower().startswith('content-length:'):
+                        content_length = int(line.split(':')[1].strip())
+                body = ''
+                if content_length > 0:
+                    body_start = request.find('\r\n\r\n')
+                    if body_start != -1:
+                        body = request[body_start+4:body_start+4+content_length]
+                self._handle_camera_switch(client, body)
+            elif path == '/api/camera/settings' and method == 'POST':
+                content_length = 0
+                for line in request.split('\r\n'):
+                    if line.lower().startswith('content-length:'):
+                        content_length = int(line.split(':')[1].strip())
+                body = ''
+                if content_length > 0:
+                    body_start = request.find('\r\n\r\n')
+                    if body_start != -1:
+                        body = request[body_start+4:body_start+4+content_length]
+                self._handle_camera_settings(client, body)
             else:
                 self._serve_404(client)
         except Exception:
@@ -4300,6 +4904,17 @@ class StreamerApp:
         .tabs {{ display: flex; gap: 5px; margin-bottom: 10px; }}
         .tabs button {{ flex: 1; }}
         .tabs button.active {{ background: #4CAF50; }}
+        .tabs button.active::before {{ content: '\\25CF'; margin-right: 6px; }}
+        .camera-selector {{ display: flex; gap: 5px; margin: 10px 0; flex-wrap: wrap; }}
+        .camera-selector button {{ padding: 4px 10px; font-size: 12px; background: #2563eb; border: none; border-radius: 4px; color: #fff; cursor: pointer; }}
+        .camera-selector button:hover {{ background: #1d4ed8; }}
+        .camera-selector button.active {{ background: #1e40af; box-shadow: 0 0 0 2px #60a5fa; }}
+        .camera-selector button.active::before {{ content: '\\25CF'; margin-right: 4px; }}
+        .camera-selector button:disabled {{ background: #555; cursor: not-allowed; opacity: 0.6; }}
+        .camera-selector button:disabled:hover {{ background: #555; }}
+        .cam-enable-toggle {{ font-size: 10px; vertical-align: middle; margin-left: 3px; cursor: pointer; padding: 2px 4px; border-radius: 2px; background: #333; color: #888; }}
+        .cam-enable-toggle:hover {{ background: #444; color: #fff; }}
+        .cam-enable-toggle.enabled {{ background: #1a472a; color: #4CAF50; }}
         .tab-content {{ display: none; }}
         .tab-content.active {{ display: block; }}
         .stats-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }}
@@ -4434,6 +5049,8 @@ class StreamerApp:
         <div class="section">
             <h2 style="display:inline;">Live Preview</h2>
             <span style="color:#f44;font-size:12px;margin-left:15px;background:#411;padding:4px 8px;border-radius:4px;">WARNING: Debug tool - increases CPU usage, do not leave open!</span>
+            <div id="camera-selector" class="camera-selector" style="display:none;"></div>
+            <div id="camera-status-panel" style="display:none;background:#1a1a1a;padding:8px;border-radius:4px;margin:5px 0;"></div>
             <div class="tabs">
                 <button class="active" onclick="switchTab('snapshot')">Snapshot</button>
                 <button onclick="switchTab('mjpeg')">MJPEG Stream</button>
@@ -5022,29 +5639,246 @@ class StreamerApp:
         const streamingPort = {streaming_port};
         const streamBase = (streamingPort == location.port || !streamingPort) ? '' : 'http://' + location.hostname + ':' + streamingPort;
 
+        // Dynamic URL variables that update when switching cameras
+        let snapshotUrl = streamBase + '/snapshot';
+        let mjpegUrl = streamBase + '/stream';
+        let flvUrl = 'http://' + location.hostname + ':{self.FLV_PORT}/flv';
+        let displayUrl = streamBase + '/display';
+
         // Initialize stream URLs on page load
         function initStreamUrls() {{
-            if (!streamBase) return;  // Same port, no changes needed
+            if (!streamBase) {{
+                // Same port, use relative URLs
+                snapshotUrl = '/snapshot';
+                mjpegUrl = '/stream';
+                displayUrl = '/display';
+            }}
 
             // Update preview image
             const previewImg = document.getElementById('preview-img');
             if (previewImg) {{
-                previewImg.src = streamBase + '/snapshot';
-                previewImg.onclick = function() {{ this.src = streamBase + '/snapshot?' + Date.now(); }};
+                previewImg.src = snapshotUrl;
+                previewImg.onclick = function() {{ this.src = snapshotUrl + '?' + Date.now(); }};
             }}
 
             // Update links
             document.querySelectorAll('a[href="/stream"]').forEach(a => {{
-                a.href = streamBase + '/stream';
+                a.href = mjpegUrl;
             }});
             document.querySelectorAll('a[href="/snapshot"]').forEach(a => {{
-                a.href = streamBase + '/snapshot';
+                a.href = snapshotUrl;
             }});
             document.querySelectorAll('a[href="/display"]').forEach(a => {{
-                a.href = streamBase + '/display';
+                a.href = displayUrl;
             }});
         }}
         document.addEventListener('DOMContentLoaded', initStreamUrls);
+
+        // Camera selector
+        let cameras = [];
+        let activeCameraId = 1;
+
+        function loadCameras() {{
+            fetch('/api/cameras')
+                .then(r => r.json())
+                .then(data => {{
+                    cameras = data.cameras || [];
+                    activeCameraId = data.active_camera_id || 1;
+                    renderCameraSelector();
+                }})
+                .catch(err => console.log('Camera load error:', err));
+        }}
+
+        function renderCameraSelector() {{
+            const container = document.getElementById('camera-selector');
+            if (!container) return;
+
+            // Only show if more than one camera
+            if (cameras.length <= 1) {{
+                container.style.display = 'none';
+                updateCameraStatusPanel();
+                return;
+            }}
+
+            container.style.display = 'flex';
+            container.innerHTML = cameras.map(cam => {{
+                const isActive = cam.id === activeCameraId;
+                const isEnabled = cam.enabled;
+                const isPrimary = cam.is_primary;
+                const hasError = cam.error != null;
+                const title = `${{cam.name}} (${{cam.resolution}} ${{cam.mode}}, port ${{cam.streaming_port}})${{isEnabled ? '' : ' - disabled'}}${{hasError ? ' - ERROR' : ''}}`;
+
+                // Primary camera button (cannot be disabled)
+                if (isPrimary) {{
+                    return `<button class="${{isActive ? 'active' : ''}}" onclick="switchCamera(${{cam.id}})" title="${{title}}">CAM#${{cam.id}}</button>`;
+                }}
+
+                // Secondary cameras: show with enable/disable toggle and error indicator
+                const toggleClass = isEnabled ? 'enabled' : '';
+                const toggleTitle = isEnabled ? 'Click to disable' : 'Click to enable';
+                const errorIndicator = hasError ? '<span style="color:#f44;margin-left:2px;">!</span>' : '';
+                return `<button class="${{isActive ? 'active' : ''}}" ${{isEnabled && !hasError ? '' : 'disabled'}} onclick="switchCamera(${{cam.id}})" title="${{title}}">CAM#${{cam.id}}${{errorIndicator}}</button><span class="cam-enable-toggle ${{toggleClass}}" title="${{toggleTitle}}" onclick="toggleCameraEnabled(${{cam.id}}, ${{!isEnabled}})">${{isEnabled ? '&bull;' : 'o'}}</span>`;
+            }}).join('');
+
+            updateCameraStatusPanel();
+        }}
+
+        function updateCameraStatusPanel() {{
+            const panel = document.getElementById('camera-status-panel');
+            if (!panel) return;
+
+            // Show status for non-primary cameras
+            const secondaryCams = cameras.filter(c => !c.is_primary);
+            if (secondaryCams.length === 0) {{
+                panel.style.display = 'none';
+                return;
+            }}
+
+            panel.style.display = 'block';
+            let html = '<div style="font-size:12px;color:#888;margin-bottom:8px;">Additional Cameras Settings:</div>';
+            secondaryCams.forEach(cam => {{
+                const statusColor = cam.error ? '#f44' : (cam.status === 'running' ? '#4CAF50' : '#888');
+                const statusText = cam.error ? 'Error' : (cam.status === 'running' ? 'Running' : (cam.enabled ? 'Starting...' : 'Disabled'));
+                const enabledChecked = cam.enabled ? 'checked' : '';
+                const res = cam.resolution || '640x480';
+                const fps = cam.mjpeg_fps || 10;
+
+                html += `<div style="background:#222;padding:8px;margin-bottom:8px;border-radius:4px;">`;
+                html += `<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">`;
+                html += `<span><strong>CAM#${{cam.id}}</strong>: ${{cam.name.substring(0,25)}}</span>`;
+                html += `<span style="color:${{statusColor}};">&bull; ${{statusText}}</span>`;
+                html += `</div>`;
+
+                if (cam.error) {{
+                    html += `<div style="color:#f44;font-size:11px;background:#411;padding:4px 6px;border-radius:3px;margin-bottom:6px;">${{cam.error}}</div>`;
+                }}
+
+                // Settings row
+                html += `<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;font-size:11px;">`;
+                // Enable toggle
+                html += `<label style="display:flex;align-items:center;gap:4px;cursor:pointer;">`;
+                html += `<input type="checkbox" ${{enabledChecked}} onchange="toggleCameraEnabled(${{cam.id}}, this.checked)"> Enable`;
+                html += `</label>`;
+                // Resolution (dynamically populated from camera capabilities)
+                html += `<label style="display:flex;align-items:center;gap:4px;">Res:`;
+                html += `<select id="cam${{cam.id}}-res" style="font-size:11px;padding:2px;" ${{cam.enabled ? '' : 'disabled'}}>`;
+                const supportedRes = cam.supported_resolutions || ['640x480'];
+                supportedRes.forEach(r => {{
+                    html += `<option value="${{r}}" ${{res === r ? 'selected' : ''}}>${{r}}</option>`;
+                }});
+                html += `</select></label>`;
+                // FPS
+                html += `<label style="display:flex;align-items:center;gap:4px;">FPS:`;
+                html += `<input type="number" id="cam${{cam.id}}-fps" value="${{fps}}" min="1" max="15" style="width:40px;font-size:11px;padding:2px;" ${{cam.enabled ? '' : 'disabled'}}>`;
+                html += `</label>`;
+                // Apply button (highlighted)
+                html += `<button onclick="applySecondaryCamera(${{cam.id}})" style="font-size:11px;padding:2px 8px;background:#2563eb;color:white;border:none;border-radius:3px;cursor:pointer;" ${{cam.enabled ? '' : 'disabled'}}>Apply</button>`;
+                html += `</div>`;
+                html += `</div>`;
+            }});
+            panel.innerHTML = html;
+        }}
+
+        function applySecondaryCamera(camId) {{
+            const res = document.getElementById(`cam${{camId}}-res`).value;
+            const fps = parseInt(document.getElementById(`cam${{camId}}-fps`).value) || 10;
+            showStatus(`Applying ${{res}} @ ${{fps}}fps to CAM#${{camId}}...`);
+            fetch('/api/camera/settings', {{
+                method: 'POST',
+                headers: {{'Content-Type': 'application/json'}},
+                body: JSON.stringify({{id: camId, resolution: res, mjpeg_fps: fps}})
+            }})
+            .then(r => r.json())
+            .then(data => {{
+                if (data.status === 'ok') {{
+                    showStatus(`CAM#${{camId}}: Restarting at ${{res}}...`);
+                    // Wait longer for encoder to start and potentially report errors
+                    setTimeout(() => {{
+                        loadCameras();
+                        showStatus(`CAM#${{camId}}: Settings applied (${{res}} @ ${{fps}}fps)`);
+                    }}, 3500);
+                }} else {{
+                    showStatus('Error: ' + (data.message || 'Unknown error'), 'error');
+                }}
+            }})
+            .catch(e => showStatus('Error: ' + e, 'error'));
+        }}
+
+        function switchCamera(id) {{
+            const cam = cameras.find(c => c.id === id);
+            if (!cam || !cam.enabled) return;
+            if (id === activeCameraId) return;
+
+            // Update UI immediately
+            activeCameraId = id;
+            renderCameraSelector();
+
+            // Update stream URLs to point to this camera's port
+            const host = location.hostname;
+            const port = cam.streaming_port;
+            const baseUrl = `http://${{host}}:${{port}}`;
+
+            // Update preview sources
+            snapshotUrl = `${{baseUrl}}/snapshot`;
+            mjpegUrl = `${{baseUrl}}/stream`;
+
+            // FLV only available for primary camera
+            const flvTab = document.querySelector('.tabs button:nth-child(3)');
+            if (cam.is_primary) {{
+                flvUrl = `http://${{host}}:{self.FLV_PORT}/flv`;
+                if (flvTab) {{
+                    flvTab.disabled = false;
+                    flvTab.style.opacity = '1';
+                    flvTab.title = 'H.264 FLV stream';
+                }}
+            }} else {{
+                flvUrl = null;
+                if (flvTab) {{
+                    flvTab.disabled = true;
+                    flvTab.style.opacity = '0.5';
+                    flvTab.title = 'H.264 FLV only available for primary camera';
+                }}
+                // If FLV tab is active, switch to snapshot
+                if (currentTab === 'flv') {{
+                    switchTab('snapshot');
+                }}
+            }}
+
+            // Refresh preview with new camera
+            refreshPreview();
+        }}
+
+        function toggleCameraEnabled(id, enabled) {{
+            const endpoint = enabled ? '/api/camera/enable' : '/api/camera/disable';
+
+            fetch(endpoint, {{
+                method: 'POST',
+                headers: {{'Content-Type': 'application/json'}},
+                body: JSON.stringify({{id: id}})
+            }})
+            .then(r => r.json())
+            .then(data => {{
+                if (data.status === 'ok') {{
+                    // Reload camera list to get updated state
+                    loadCameras();
+                }} else {{
+                    alert('Camera toggle failed: ' + data.message);
+                }}
+            }})
+            .catch(err => alert('Camera toggle error: ' + err));
+        }}
+
+        function refreshPreview() {{
+            const previewImg = document.getElementById('preview-img');
+            if (previewImg && currentTab === 'snapshot') {{
+                previewImg.src = snapshotUrl + '?' + Date.now();
+            }} else if (currentTab === 'mjpeg') {{
+                const mjpegImg = document.getElementById('mjpeg-stream');
+                if (mjpegImg) mjpegImg.src = mjpegUrl + '?' + Date.now();
+            }}
+        }}
+
+        document.addEventListener('DOMContentLoaded', loadCameras);
 
         // Show/hide settings based on encoder type
         function updateEncoderVisibility() {{
@@ -5180,7 +6014,10 @@ class StreamerApp:
         }}
 
         // Tab switching
+        let currentTab = 'snapshot';
+
         function switchTab(tab) {{
+            currentTab = tab;
             document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
             document.querySelectorAll('.tabs button').forEach(el => el.classList.remove('active'));
             document.getElementById('tab-' + tab).classList.add('active');
@@ -5190,7 +6027,7 @@ class StreamerApp:
             if (tab === 'snapshot') {{
                 // Refresh snapshot when switching to tab
                 const img = document.getElementById('preview-img');
-                img.src = streamBase + '/snapshot?' + Date.now();
+                img.src = snapshotUrl + '?' + Date.now();
             }} else if (tab === 'mjpeg') {{
                 startMjpegStream();
             }} else {{
@@ -5210,7 +6047,7 @@ class StreamerApp:
         // MJPEG stream
         function startMjpegStream() {{
             const img = document.getElementById('mjpeg-stream');
-            img.src = streamBase + '/stream';
+            img.src = mjpegUrl;
             img.style.display = 'block';
             mjpegActive = true;
         }}
@@ -5228,7 +6065,7 @@ class StreamerApp:
 
         function startDisplayStream() {{
             const img = document.getElementById('display-stream');
-            img.src = streamBase + '/display';
+            img.src = displayUrl;
             img.style.display = 'block';
             img.style.cursor = 'crosshair';
             displayActive = true;
@@ -5338,11 +6175,11 @@ class StreamerApp:
                 }}
             }}
 
-            // Send to server
+            // Send to server with active camera ID
             fetch('/api/camera/set', {{
                 method: 'POST',
                 headers: {{'Content-Type': 'application/json'}},
-                body: JSON.stringify({{control: control, value: parseInt(value)}})
+                body: JSON.stringify({{control: control, value: parseInt(value), camera_id: activeCameraId}})
             }})
             .then(r => r.json())
             .then(data => {{
@@ -5577,10 +6414,10 @@ if(flvjs.isSupported()){{
                 .then(data => {{
                     const statusEl = document.getElementById('usb_status');
                     if (data.usb_mounted) {{
-                        statusEl.textContent = '● Mounted';
+                        statusEl.innerHTML = '&bull; Mounted';
                         statusEl.style.color = '#4CAF50';
                     }} else {{
-                        statusEl.textContent = '○ Not detected';
+                        statusEl.innerHTML = 'o Not detected';
                         statusEl.style.color = '#888';
                     }}
                 }})
@@ -5597,19 +6434,19 @@ if(flvjs.isSupported()){{
                 .then(data => {{
                     const statusEl = document.getElementById('moonraker_status');
                     if (data.connected) {{
-                        statusEl.textContent = '● Connected';
+                        statusEl.innerHTML = '&bull; Connected';
                         statusEl.style.color = '#4CAF50';
                         if (data.print_state && data.print_state !== 'standby') {{
-                            statusEl.textContent += ' (' + data.print_state + ')';
+                            statusEl.innerHTML += ' (' + data.print_state + ')';
                         }}
                     }} else {{
-                        statusEl.textContent = '○ Disconnected';
+                        statusEl.innerHTML = 'o Disconnected';
                         statusEl.style.color = '#888';
                     }}
                 }})
                 .catch(() => {{
                     const statusEl = document.getElementById('moonraker_status');
-                    statusEl.textContent = '? Unknown';
+                    statusEl.innerHTML = '? Unknown';
                     statusEl.style.color = '#f90';
                 }});
         }}
@@ -6369,11 +7206,12 @@ addStream('Display Snapshot',streamBase+'/display/snapshot');
         client.sendall(response.encode())
 
     def _handle_camera_set(self, client, body: str):
-        """Handle camera control change - writes to ctrl file for immediate effect"""
+        """Handle camera control change - writes to cmd file for immediate effect"""
         try:
             data = json.loads(body) if body else {}
             control = data.get('control')
             value = data.get('value')
+            camera_id = data.get('camera_id', self.active_camera_id)
 
             if control is None or value is None:
                 raise ValueError("Missing control or value")
@@ -6403,16 +7241,15 @@ addStream('Display Snapshot',streamBase+'/display/snapshot');
             value = int(value)
             value = max(min_val, min(max_val, value))
 
-            # Update instance variable
-            setattr(self, attr_name, value)
+            # Write to the correct camera's cmd file
+            self._write_camera_ctrl(ctrl_key, value, camera_id)
 
-            # Write to ctrl file for rkmpi_enc to apply
-            self._write_camera_ctrl(ctrl_key, value)
+            # For primary camera, also update instance variable and save config
+            if camera_id == 1:
+                setattr(self, attr_name, value)
+                self.save_config()
 
-            # Save to config for persistence
-            self.save_config()
-
-            result = {'status': 'ok', 'control': control, 'value': value}
+            result = {'status': 'ok', 'control': control, 'value': value, 'camera_id': camera_id}
         except Exception as e:
             result = {'status': 'error', 'message': str(e)}
 
@@ -6427,16 +7264,309 @@ addStream('Display Snapshot',streamBase+'/display/snapshot');
         ) + body
         client.sendall(response.encode())
 
-    def _write_camera_ctrl(self, ctrl_key: str, value: int):
+    def _serve_cameras(self, client):
+        """Serve list of all discovered cameras with streaming info"""
+        cameras = []
+        for cam in self.cameras:
+            cam_id = cam['id']
+            status_info = self.camera_status.get(cam_id, {})
+            # Get saved settings for this camera
+            unique_id = cam.get('unique_id', f"camera_{cam_id}")
+            saved_settings = self.camera_settings.get(unique_id, {})
+            cameras.append({
+                'id': cam_id,
+                'name': cam['name'],
+                'device': cam['device'],
+                'usb_port': cam['usb_port'],
+                'unique_id': unique_id,
+                'enabled': cam.get('enabled', cam_id == 1),
+                'is_primary': cam.get('is_primary', cam_id == 1),
+                'streaming_port': cam.get('streaming_port', 8080 if cam_id == 1 else 8080 + cam_id + 1),
+                'active': cam_id == self.active_camera_id,
+                'running': cam_id in self.encoder_processes,
+                'status': status_info.get('status', 'stopped'),
+                'error': status_info.get('error'),
+                'resolution': status_info.get('resolution', saved_settings.get('resolution', '640x480' if cam_id > 1 else f'{self.camera_width}x{self.camera_height}')),
+                'mode': status_info.get('mode', 'YUYV' if cam_id > 1 else 'MJPEG'),
+                'mjpeg_fps': saved_settings.get('mjpeg_fps', 10 if cam_id > 1 else self.mjpeg_fps_target),
+                'supported_resolutions': [f"{w}x{h}" for w, h in cam.get('supported_resolutions', [(640, 480)])],
+            })
+        body = json.dumps({
+            'cameras': cameras,
+            'active_camera_id': self.active_camera_id,
+            'max_cameras': MAX_CAMERAS
+        })
+        response = (
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        ) + body
+        client.sendall(response.encode())
+
+    def _handle_camera_enable(self, client, body: str):
+        """Enable a camera and start its encoder"""
+        try:
+            data = json.loads(body) if body else {}
+            camera_id = data.get('id')
+
+            if camera_id is None:
+                raise ValueError("Missing camera id")
+
+            camera_id = int(camera_id)
+            cam = self.get_camera_by_id(camera_id)
+
+            if not cam:
+                raise ValueError(f"Camera #{camera_id} not found")
+
+            if cam.get('enabled', False):
+                result = {'status': 'ok', 'message': f'Camera #{camera_id} already enabled'}
+            else:
+                print(f"Enabling camera #{camera_id}: {cam['name']}", flush=True)
+
+                # Update camera state
+                cam['enabled'] = True
+
+                # Save to persistent settings
+                self._save_camera_enabled(camera_id, True)
+
+                # Start encoder for this camera
+                if self.start_camera_encoder(camera_id):
+                    result = {
+                        'status': 'ok',
+                        'message': f'Camera #{camera_id} enabled',
+                        'streaming_port': cam.get('streaming_port', 8080 + camera_id + 1)
+                    }
+                else:
+                    result = {'status': 'error', 'message': f'Failed to start camera #{camera_id} encoder'}
+
+        except Exception as e:
+            result = {'status': 'error', 'message': str(e)}
+
+        body = json.dumps(result)
+        response = (
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        ) + body
+        client.sendall(response.encode())
+
+    def _handle_camera_disable(self, client, body: str):
+        """Disable a camera and stop its encoder"""
+        try:
+            data = json.loads(body) if body else {}
+            camera_id = data.get('id')
+
+            if camera_id is None:
+                raise ValueError("Missing camera id")
+
+            camera_id = int(camera_id)
+
+            # Cannot disable primary camera
+            if camera_id == 1:
+                raise ValueError("Cannot disable primary camera")
+
+            cam = self.get_camera_by_id(camera_id)
+            if not cam:
+                raise ValueError(f"Camera #{camera_id} not found")
+
+            if not cam.get('enabled', False):
+                result = {'status': 'ok', 'message': f'Camera #{camera_id} already disabled'}
+            else:
+                print(f"Disabling camera #{camera_id}: {cam['name']}", flush=True)
+
+                # Update camera state
+                cam['enabled'] = False
+
+                # Save to persistent settings
+                self._save_camera_enabled(camera_id, False)
+
+                # Stop encoder for this camera
+                self.stop_camera_encoder(camera_id)
+
+                result = {'status': 'ok', 'message': f'Camera #{camera_id} disabled'}
+
+        except Exception as e:
+            result = {'status': 'error', 'message': str(e)}
+
+        body = json.dumps(result)
+        response = (
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        ) + body
+        client.sendall(response.encode())
+
+    def _handle_camera_settings(self, client, body: str):
+        """Update settings for a secondary camera"""
+        try:
+            data = json.loads(body) if body else {}
+            camera_id = data.get('id')
+
+            if camera_id is None:
+                raise ValueError("Missing camera id")
+
+            camera_id = int(camera_id)
+
+            # Cannot change primary camera settings via this endpoint
+            if camera_id == 1:
+                raise ValueError("Use main settings for primary camera")
+
+            cam = self.get_camera_by_id(camera_id)
+            if not cam:
+                raise ValueError(f"Camera #{camera_id} not found")
+
+            # Get new settings
+            resolution = data.get('resolution', '640x480')
+            mjpeg_fps = int(data.get('mjpeg_fps', 10))
+
+            # Validate resolution against camera's supported resolutions
+            supported_res = [f"{w}x{h}" for w, h in cam.get('supported_resolutions', [(640, 480)])]
+            if resolution not in supported_res:
+                resolution = supported_res[0] if supported_res else '640x480'
+            mjpeg_fps = max(1, min(30, mjpeg_fps))
+
+            # Save to persistent settings
+            unique_id = cam.get('unique_id', f"camera_{camera_id}")
+            if unique_id not in self.camera_settings:
+                self.camera_settings[unique_id] = {}
+            self.camera_settings[unique_id]['resolution'] = resolution
+            self.camera_settings[unique_id]['mjpeg_fps'] = mjpeg_fps
+            self.save_config()
+
+            print(f"Updated camera #{camera_id} settings: {resolution} @ {mjpeg_fps}fps", flush=True)
+
+            # Restart encoder if camera is enabled
+            if cam.get('enabled', False):
+                self.stop_camera_encoder(camera_id)
+                import time
+                time.sleep(1)
+                self.start_camera_encoder(camera_id)
+                result = {'status': 'ok', 'message': f'Camera #{camera_id} settings applied and restarted'}
+            else:
+                result = {'status': 'ok', 'message': f'Camera #{camera_id} settings saved'}
+
+        except Exception as e:
+            result = {'status': 'error', 'message': str(e)}
+
+        body = json.dumps(result)
+        response = (
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        ) + body
+        client.sendall(response.encode())
+
+    def _handle_camera_switch(self, client, body: str):
+        """Switch to a different camera"""
+        try:
+            data = json.loads(body) if body else {}
+            camera_id = data.get('id')
+
+            if camera_id is None:
+                raise ValueError("Missing camera id")
+
+            camera_id = int(camera_id)
+
+            # Find the camera
+            target_cam = None
+            for cam in self.cameras:
+                if cam['id'] == camera_id:
+                    target_cam = cam
+                    break
+
+            if not target_cam:
+                raise ValueError(f"Camera #{camera_id} not found")
+
+            if camera_id == self.active_camera_id:
+                result = {'status': 'ok', 'message': f'Camera #{camera_id} already active'}
+            else:
+                # Switch camera - stop encoder, update device, restart
+                print(f"Switching to camera #{camera_id}: {target_cam['name']} ({target_cam['device']})", flush=True)
+
+                self.stop_encoder()
+                time.sleep(1)
+
+                self.camera_device = target_cam['device']
+                self.active_camera_id = camera_id
+
+                # Detect new camera's resolution and FPS
+                self.camera_width, self.camera_height = detect_camera_resolution(self.camera_device)
+                self.max_camera_fps = detect_camera_max_fps(self.camera_device, self.camera_width, self.camera_height)
+
+                # Clamp FPS target if needed
+                if self.mjpeg_fps_target > self.max_camera_fps:
+                    self.mjpeg_fps_target = self.max_camera_fps
+
+                # Reinitialize FLV muxer with new resolution
+                self.flv_muxer = FLVMuxer(self.camera_width, self.camera_height, 10)
+                self.cached_sps = None
+                self.cached_pps = None
+
+                # Write ctrl file and restart encoder
+                self.write_ctrl_file()
+                if self.start_encoder():
+                    result = {
+                        'status': 'ok',
+                        'message': f'Switched to camera #{camera_id}',
+                        'camera': target_cam['name'],
+                        'resolution': f'{self.camera_width}x{self.camera_height}'
+                    }
+                else:
+                    result = {'status': 'error', 'message': 'Failed to restart encoder'}
+
+        except Exception as e:
+            result = {'status': 'error', 'message': str(e)}
+
+        body = json.dumps(result)
+        response = (
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        ) + body
+        client.sendall(response.encode())
+
+    def _get_camera_cmd_file(self, camera_id=None):
+        """Get the command file path for a specific camera."""
+        if camera_id is None:
+            camera_id = self.active_camera_id
+        if camera_id == 1:
+            return "/tmp/h264_cmd"
+        return f"/tmp/h264_cmd_{camera_id}"
+
+    def _get_camera_ctrl_file(self, camera_id=None):
+        """Get the control/stats file path for a specific camera."""
+        if camera_id is None:
+            camera_id = self.active_camera_id
+        if camera_id == 1:
+            return "/tmp/h264_ctrl"
+        return f"/tmp/h264_ctrl_{camera_id}"
+
+    def _write_camera_ctrl(self, ctrl_key: str, value: int, camera_id: int = None):
         """Write a single camera control to the cmd file for rkmpi_enc to apply.
 
         Uses cmd_file (append-only) to avoid race conditions.
         """
+        cmd_file = self._get_camera_cmd_file(camera_id)
         try:
-            with open(self.cmd_file, 'a') as f:
+            with open(cmd_file, 'a') as f:
                 f.write(f"{ctrl_key}={value}\n")
         except Exception as e:
-            print(f"Failed to write camera ctrl: {e}", flush=True)
+            print(f"Failed to write camera ctrl to {cmd_file}: {e}", flush=True)
 
     def _apply_initial_camera_controls(self):
         """Apply saved camera controls when encoder starts"""

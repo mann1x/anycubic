@@ -195,6 +195,10 @@ typedef struct {
 
 static EncoderStats g_stats = {0};
 
+/* Runtime file paths (set from config, defaults to defines) */
+static char g_cmd_file[256] = CMD_FILE;
+static char g_ctrl_file[256] = CTRL_FILE;
+
 /* Check if H.264 encoding is enabled (called from http_server.c) */
 int is_h264_enabled(void) {
     return g_ctrl.h264_enabled;
@@ -429,6 +433,10 @@ typedef struct {
     /* Display capture */
     int display_capture;  /* 1=enable display framebuffer capture */
     int display_fps;      /* Display capture FPS (default: 5) */
+    /* Multi-camera support */
+    int no_flv;           /* 1=disable FLV server (for secondary cameras) */
+    char cmd_file[256];   /* Command file path (default: /tmp/h264_cmd) */
+    char ctrl_file[256];  /* Control/stats file path (default: /tmp/h264_ctrl) */
 } EncoderConfig;
 
 static void log_info(const char *fmt, ...) {
@@ -489,7 +497,7 @@ static void read_ctrl_file(void) {
  * All settings and commands written to /tmp/h264_cmd will be processed exactly once.
  */
 static void read_cmd_file(void) {
-    FILE *f = fopen(CMD_FILE, "r");
+    FILE *f = fopen(g_cmd_file, "r");
     if (!f) return;
 
     char line[512];
@@ -659,7 +667,7 @@ static void read_cmd_file(void) {
 
     /* Truncate the file to prevent reprocessing */
     if (got_cmd) {
-        f = fopen(CMD_FILE, "w");
+        f = fopen(g_cmd_file, "w");
         if (f) fclose(f);
     }
 }
@@ -673,7 +681,7 @@ static void read_cmd_file(void) {
  * not overwrite it.
  */
 static void write_ctrl_file(void) {
-    FILE *f = fopen(CTRL_FILE, "w");
+    FILE *f = fopen(g_ctrl_file, "w");
     if (!f) return;
     fprintf(f, "h264=%d\n", g_ctrl.h264_enabled);
     /* Only write skip when auto_skip is enabled (encoder controls it) */
@@ -1650,6 +1658,7 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "                       Lower resolution reduces TurboJPEG decode CPU usage\n");
     fprintf(stderr, "  --display            Enable display framebuffer capture (server mode)\n");
     fprintf(stderr, "  --display-fps <n>    Display capture FPS (default: %d)\n", DISPLAY_DEFAULT_FPS);
+    fprintf(stderr, "  --no-flv             Disable FLV server (for secondary cameras)\n");
     fprintf(stderr, "  -v, --verbose        Verbose output to stderr\n");
     fprintf(stderr, "  -V, --version        Show version and exit\n");
     fprintf(stderr, "  --help               Show this help\n");
@@ -1693,6 +1702,8 @@ int main(int argc, char *argv[]) {
         .display_fps = DISPLAY_DEFAULT_FPS
     };
     strncpy(cfg.device, DEFAULT_DEVICE, sizeof(cfg.device) - 1);
+    strncpy(cfg.cmd_file, CMD_FILE, sizeof(cfg.cmd_file) - 1);
+    strncpy(cfg.ctrl_file, CTRL_FILE, sizeof(cfg.ctrl_file) - 1);
     cfg.h264_output[0] = '\0';
 
     static struct option long_options[] = {
@@ -1721,6 +1732,9 @@ int main(int argc, char *argv[]) {
         {"h264-resolution", required_argument, 0, 'R'},
         {"display",      no_argument,       0, 'D'},
         {"display-fps",  required_argument, 0, 'F'},
+        {"no-flv",       no_argument,       0, 'X'},
+        {"cmd-file",     required_argument, 0, 1001},
+        {"ctrl-file",    required_argument, 0, 1002},
         {0, 0, 0, 0}
     };
 
@@ -1762,12 +1776,19 @@ int main(int argc, char *argv[]) {
                 break;
             case 'D': cfg.display_capture = 1; break;
             case 'F': cfg.display_fps = atoi(optarg); break;
+            case 'X': cfg.no_flv = 1; break;
+            case 1001: strncpy(cfg.cmd_file, optarg, sizeof(cfg.cmd_file) - 1); break;
+            case 1002: strncpy(cfg.ctrl_file, optarg, sizeof(cfg.ctrl_file) - 1); break;
             case 'H':
             case '?':
                 print_usage(argv[0]);
                 return (opt == 'H') ? 0 : 1;
         }
     }
+
+    /* Copy file paths to globals (used by read_cmd_file/write_ctrl_file) */
+    strncpy(g_cmd_file, cfg.cmd_file, sizeof(g_cmd_file) - 1);
+    strncpy(g_ctrl_file, cfg.ctrl_file, sizeof(g_ctrl_file) - 1);
 
     /* If no-stdout is set, disable stdout output */
     if (cfg.no_stdout) {
@@ -1822,8 +1843,9 @@ int main(int argc, char *argv[]) {
     }
 
     /* Check if we have H.264 output configured (or server mode which needs H.264 for FLV) */
+    /* Skip H.264 for secondary cameras (--no-flv) to avoid VENC resource conflicts */
     int h264_fd = -1;
-    int h264_available = (cfg.h264_output[0] != '\0') || cfg.server_mode;
+    int h264_available = (cfg.h264_output[0] != '\0') || (cfg.server_mode && !cfg.no_flv);
 
     /* Only open file if we have a path - server mode sends H.264 via HTTP */
     if (cfg.h264_output[0] != '\0') {
@@ -1950,8 +1972,8 @@ int main(int argc, char *argv[]) {
     /* Read current camera control values */
     v4l2_read_controls(v4l2_fd, &g_cam_ctrl);
 
-    /* Initialize VENC for H.264 encoding (also needed in server mode for FLV) */
-    if (h264_available || cfg.server_mode) {
+    /* Initialize VENC for H.264 encoding (needed for server mode FLV, but not for --no-flv) */
+    if (h264_available) {
         if (init_venc(&cfg) != 0) {
             log_error("VENC H.264 init failed, H.264 disabled\n");
             h264_available = 0;
@@ -2020,7 +2042,7 @@ int main(int argc, char *argv[]) {
     /* Allocate stream pack for H.264 encoder output */
     VENC_STREAM_S stStream;
     memset(&stStream, 0, sizeof(stStream));
-    if (h264_available || cfg.server_mode) {
+    if (h264_available) {
         stStream.pstPack = (VENC_PACK_S *)malloc(sizeof(VENC_PACK_S));
         if (!stStream.pstPack) {
             log_error("Failed to allocate H.264 stream pack\n");
@@ -2081,15 +2103,19 @@ int main(int argc, char *argv[]) {
         }
 
         /* Start FLV HTTP server (use h264 dimensions for the stream) */
-        if (flv_server_start(h264_w, h264_h, g_mjpeg_ctrl.target_fps) == 0) {
-            flv_server_initialized = 1;
-            log_info("  FLV server: http://0.0.0.0:%d/flv\n", HTTP_FLV_PORT);
+        if (!cfg.no_flv) {
+            if (flv_server_start(h264_w, h264_h, g_mjpeg_ctrl.target_fps) == 0) {
+                flv_server_initialized = 1;
+                log_info("  FLV server: http://0.0.0.0:%d/flv\n", HTTP_FLV_PORT);
+            } else {
+                log_error("  FLV server: failed to start\n");
+            }
         } else {
-            log_error("  FLV server: failed to start\n");
+            log_info("  FLV server: disabled (--no-flv)\n");
         }
 
-        /* Start MQTT/RPC responders (go-klipper mode only) */
-        if (!cfg.vanilla_klipper) {
+        /* Start MQTT/RPC responders (go-klipper mode only, primary camera only) */
+        if (!cfg.vanilla_klipper && !cfg.no_flv) {
             /* Start MQTT video responder */
             if (mqtt_client_start() == 0) {
                 mqtt_initialized = 1;
@@ -2105,6 +2131,8 @@ int main(int argc, char *argv[]) {
             } else {
                 log_error("  RPC responder: failed to start\n");
             }
+        } else if (cfg.no_flv) {
+            log_info("  MQTT/RPC: disabled (secondary camera)\n");
         } else {
             log_info("  MQTT/RPC: disabled (vanilla-klipper mode)\n");
         }
@@ -2367,7 +2395,7 @@ skip_jpeg_output:
              * Encode to H.264 (hardware) - always at full speed in YUYV mode
              * No skip ratio needed since HW encoding has minimal CPU impact
              */
-            if (h264_available || cfg.server_mode) {
+            if (h264_available) {
                 TIMING_START(venc_h264);
                 ret = RK_MPI_VENC_SendFrame(VENC_CHN_H264, &stEncFrame, 1000);
                 if (ret == RK_SUCCESS) {
@@ -2711,8 +2739,9 @@ skip_jpeg_output:
         frame_buffers_cleanup();
     }
 
-    /* Remove control file */
-    unlink(CTRL_FILE);
+    /* Remove control files */
+    unlink(g_ctrl_file);
+    unlink(g_cmd_file);
 
     log_info("Streamer stopped\n");
     return 0;
