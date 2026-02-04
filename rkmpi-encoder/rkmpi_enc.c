@@ -463,16 +463,45 @@ static void signal_handler(int sig) {
  *   auto_skip=1
  *   target_cpu=60
  */
+/*
+ * Read control file - DEPRECATED for Python→encoder communication.
+ *
+ * All settings/commands should now come from CMD_FILE (/tmp/h264_cmd).
+ * This function is kept for backward compatibility during transition.
+ * ctrl_file (/tmp/h264_ctrl) is now encoder→Python stats ONLY.
+ */
 static void read_ctrl_file(void) {
-    FILE *f = fopen(CTRL_FILE, "r");
+    /* No-op: All Python→encoder communication now uses CMD_FILE.
+     * ctrl_file is for encoder→Python stats only (written by write_ctrl_file). */
+    (void)CTRL_FILE;  /* Suppress unused warning */
+}
+
+/*
+ * Read command file for ALL Python→encoder communication.
+ * File is truncated after reading to prevent reprocessing.
+ *
+ * This eliminates race conditions - ctrl_file is for encoder→Python stats ONLY.
+ * All settings and commands written to /tmp/h264_cmd will be processed exactly once.
+ */
+static void read_cmd_file(void) {
+    FILE *f = fopen(CMD_FILE, "r");
     if (!f) return;
 
-    char line[512];  /* Larger buffer for timelapse commands with paths */
+    char line[512];
+    int val;
+    int got_cmd = 0;
+
     while (fgets(line, sizeof(line), f)) {
-        int val;
         /* Remove trailing newline */
         line[strcspn(line, "\n")] = 0;
+        if (strlen(line) == 0) continue;
 
+        got_cmd = 1;
+        if (g_verbose) {
+            log_info("[CMD] Processing: %s\n", line);
+        }
+
+        /* === Encoder settings === */
         if (sscanf(line, "h264=%d", &val) == 1) {
             if (val != g_ctrl.h264_enabled) {
                 g_ctrl.h264_enabled = val;
@@ -493,13 +522,14 @@ static void read_ctrl_file(void) {
                 g_ctrl.target_cpu = val;
                 log_info("Target CPU set to %d%%\n", val);
             }
-        } else if (sscanf(line, "display_enabled=%d", &val) == 1) {
+        }
+        /* === Display settings === */
+        else if (sscanf(line, "display_enabled=%d", &val) == 1) {
             display_set_enabled(val);
         } else if (sscanf(line, "display_fps=%d", &val) == 1) {
             display_set_fps(val);
         }
-        /* Camera controls - cam_<control>=<value>
-         * Only set mask if value actually changed (prevents log spam) */
+        /* === Camera controls === */
         else if (sscanf(line, "cam_brightness=%d", &val) == 1) {
             if (g_cam_ctrl.brightness != val) {
                 g_cam_ctrl.brightness = val;
@@ -571,85 +601,8 @@ static void read_ctrl_file(void) {
                 g_cam_ctrl.set_mask |= CAM_CTRL_POWER_LINE;
             }
         }
-        /* Timelapse commands */
+        /* === Timelapse commands === */
         else if (strncmp(line, "timelapse_init:", 15) == 0) {
-            /* Format: timelapse_init:<gcode_name> or timelapse_init:<gcode_name>:<output_path> */
-            char *args = line + 15;
-            char *colon = strchr(args, ':');
-            if (colon) {
-                *colon = '\0';
-                const char *gcode_name = args;
-                const char *output_path = colon + 1;
-                timelapse_init(gcode_name, output_path);
-            } else if (strlen(args) > 0) {
-                /* No output path specified, use default */
-                timelapse_init(args, NULL);
-            }
-        } else if (strcmp(line, "timelapse_capture") == 0) {
-            timelapse_capture_frame();
-        } else if (strcmp(line, "timelapse_finalize") == 0) {
-            timelapse_finalize();
-        } else if (strcmp(line, "timelapse_cancel") == 0) {
-            timelapse_cancel();
-        } else if (sscanf(line, "timelapse_fps:%d", &val) == 1) {
-            timelapse_set_fps(val);
-        } else if (sscanf(line, "timelapse_crf:%d", &val) == 1) {
-            timelapse_set_crf(val);
-        } else if (strncmp(line, "timelapse_variable_fps:", 23) == 0) {
-            /* Format: timelapse_variable_fps:<min>:<max>:<target_length> */
-            int min_fps, max_fps, target_len;
-            if (sscanf(line + 23, "%d:%d:%d", &min_fps, &max_fps, &target_len) == 3) {
-                timelapse_set_variable_fps(min_fps, max_fps, target_len);
-            }
-        } else if (sscanf(line, "timelapse_duplicate_last:%d", &val) == 1) {
-            timelapse_set_duplicate_last(val);
-        } else if (strncmp(line, "timelapse_flip:", 15) == 0) {
-            /* Format: timelapse_flip:<x>:<y> */
-            int flip_x, flip_y;
-            if (sscanf(line + 15, "%d:%d", &flip_x, &flip_y) == 2) {
-                timelapse_set_flip(flip_x, flip_y);
-            }
-        } else if (sscanf(line, "timelapse_custom_mode:%d", &val) == 1) {
-            /* Enable/disable custom timelapse mode (ignores Anycubic RPC timelapse) */
-            timelapse_set_custom_mode(val);
-        } else if (strncmp(line, "timelapse_temp_dir:", 19) == 0) {
-            /* Set temp directory for timelapse frames */
-            timelapse_set_temp_dir(line + 19);
-        } else if (sscanf(line, "timelapse_use_venc:%d", &val) == 1) {
-            /* Enable/disable hardware VENC encoding (1=VENC, 0=ffmpeg) */
-            timelapse_set_use_venc(val);
-        }
-    }
-    fclose(f);
-}
-
-/*
- * Read command file for one-shot commands (timelapse, etc.)
- * File is truncated after reading to prevent reprocessing.
- *
- * This is separate from the control file to avoid race conditions.
- * Commands written to /tmp/h264_cmd will be processed exactly once.
- */
-static void read_cmd_file(void) {
-    FILE *f = fopen(CMD_FILE, "r");
-    if (!f) return;
-
-    char line[512];
-    int val;
-    int got_cmd = 0;
-
-    while (fgets(line, sizeof(line), f)) {
-        /* Remove trailing newline */
-        line[strcspn(line, "\n")] = 0;
-        if (strlen(line) == 0) continue;
-
-        got_cmd = 1;
-        if (g_verbose) {
-            log_info("[CMD] Processing: %s\n", line);
-        }
-
-        /* Timelapse commands */
-        if (strncmp(line, "timelapse_init:", 15) == 0) {
             /* Format: timelapse_init:<gcode_name> or timelapse_init:<gcode_name>:<output_path> */
             char *args = line + 15;
             char *colon = strchr(args, ':');
@@ -700,8 +653,10 @@ static void read_cmd_file(void) {
     fclose(f);
 
     /* Truncate the file to prevent reprocessing */
-    f = fopen(CMD_FILE, "w");
-    if (f) fclose(f);
+    if (got_cmd) {
+        f = fopen(CMD_FILE, "w");
+        if (f) fclose(f);
+    }
 }
 
 /*

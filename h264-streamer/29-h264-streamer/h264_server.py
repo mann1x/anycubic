@@ -2936,9 +2936,13 @@ class StreamerApp:
                     last_keepalive = now
 
     def write_ctrl_file(self):
-        """Write control file for encoder"""
+        """Write settings to command file for encoder.
+
+        All Python→encoder communication goes to cmd_file (/tmp/h264_cmd).
+        ctrl_file (/tmp/h264_ctrl) is for encoder→Python stats only.
+        """
         try:
-            with open(self.ctrl_file, 'w') as f:
+            with open(self.cmd_file, 'a') as f:
                 # For rkmpi-yuyv, H.264 is always enabled (no CPU impact, all HW)
                 if self.encoder_type == 'rkmpi-yuyv':
                     f.write("h264=1\n")
@@ -2966,7 +2970,7 @@ class StreamerApp:
                 f.write(f"cam_exposure_priority={self.cam_exposure_priority}\n")
                 f.write(f"cam_power_line={self.cam_power_line}\n")
         except Exception as e:
-            print(f"Error writing control file: {e}", flush=True)
+            print(f"Error writing command file: {e}", flush=True)
 
     def read_ctrl_file(self):
         """Read control file to get encoder's current stats (skip_ratio, FPS, clients)"""
@@ -6381,29 +6385,13 @@ addStream('Display Snapshot',streamBase+'/display/snapshot');
         client.sendall(response.encode())
 
     def _write_camera_ctrl(self, ctrl_key: str, value: int):
-        """Write a single camera control to the ctrl file for rkmpi_enc to apply"""
+        """Write a single camera control to the cmd file for rkmpi_enc to apply.
+
+        Uses cmd_file (append-only) to avoid race conditions.
+        """
         try:
-            # Read existing content
-            try:
-                with open(self.ctrl_file, 'r') as f:
-                    lines = f.readlines()
-            except FileNotFoundError:
-                lines = []
-
-            # Update or add the control line
-            found = False
-            for i, line in enumerate(lines):
-                if line.startswith(f"{ctrl_key}="):
-                    lines[i] = f"{ctrl_key}={value}\n"
-                    found = True
-                    break
-
-            if not found:
-                lines.append(f"{ctrl_key}={value}\n")
-
-            # Write back
-            with open(self.ctrl_file, 'w') as f:
-                f.writelines(lines)
+            with open(self.cmd_file, 'a') as f:
+                f.write(f"{ctrl_key}={value}\n")
         except Exception as e:
             print(f"Failed to write camera ctrl: {e}", flush=True)
 
