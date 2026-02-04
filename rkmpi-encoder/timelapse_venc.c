@@ -19,9 +19,13 @@
 #include <unistd.h>
 #include <errno.h>
 
-/* Enable minimp4 implementation */
+/* Enable minimp4 implementation - suppress warnings in third-party header */
 #define MINIMP4_IMPLEMENTATION
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-variable"
+#pragma GCC diagnostic ignored "-Wunused-function"
 #include "minimp4.h"
+#pragma GCC diagnostic pop
 
 /* VENC channel for timelapse - use channel 2 to avoid conflicts */
 #define VENC_CHN_TIMELAPSE  3  /* Channel 0=H.264, 1=JPEG, 2=Display, 3=Timelapse */
@@ -150,7 +154,7 @@ typedef struct {
 
     /* Temp file for MP4 during encoding */
     FILE *temp_file;
-    char temp_path[512];
+    char temp_path[1088];  /* TIMELAPSE_PATH_MAX (1024) + "/timelapse.mp4.tmp" + padding */
 
     /* minimp4 muxer */
     MP4E_mux_t *mp4_mux;
