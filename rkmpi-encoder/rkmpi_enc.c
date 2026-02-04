@@ -155,6 +155,7 @@ void __stack_chk_fail(void) {
 
 /* Control file for runtime configuration */
 #define CTRL_FILE          "/tmp/h264_ctrl"
+#define CMD_FILE           "/tmp/h264_cmd"   /* One-shot command file (timelapse, etc.) */
 #define STATS_FILE         "/tmp/rkmpi_enc.stats"
 #define CTRL_CHECK_INTERVAL 30     /* Check control file every N frames */
 
@@ -572,7 +573,7 @@ static void read_ctrl_file(void) {
         }
         /* Timelapse commands */
         else if (strncmp(line, "timelapse_init:", 15) == 0) {
-            /* Format: timelapse_init:<gcode_name>:<output_path> */
+            /* Format: timelapse_init:<gcode_name> or timelapse_init:<gcode_name>:<output_path> */
             char *args = line + 15;
             char *colon = strchr(args, ':');
             if (colon) {
@@ -580,6 +581,9 @@ static void read_ctrl_file(void) {
                 const char *gcode_name = args;
                 const char *output_path = colon + 1;
                 timelapse_init(gcode_name, output_path);
+            } else if (strlen(args) > 0) {
+                /* No output path specified, use default */
+                timelapse_init(args, NULL);
             }
         } else if (strcmp(line, "timelapse_capture") == 0) {
             timelapse_capture_frame();
@@ -617,6 +621,87 @@ static void read_ctrl_file(void) {
         }
     }
     fclose(f);
+}
+
+/*
+ * Read command file for one-shot commands (timelapse, etc.)
+ * File is truncated after reading to prevent reprocessing.
+ *
+ * This is separate from the control file to avoid race conditions.
+ * Commands written to /tmp/h264_cmd will be processed exactly once.
+ */
+static void read_cmd_file(void) {
+    FILE *f = fopen(CMD_FILE, "r");
+    if (!f) return;
+
+    char line[512];
+    int val;
+    int got_cmd = 0;
+
+    while (fgets(line, sizeof(line), f)) {
+        /* Remove trailing newline */
+        line[strcspn(line, "\n")] = 0;
+        if (strlen(line) == 0) continue;
+
+        got_cmd = 1;
+        if (g_verbose) {
+            log_info("[CMD] Processing: %s\n", line);
+        }
+
+        /* Timelapse commands */
+        if (strncmp(line, "timelapse_init:", 15) == 0) {
+            /* Format: timelapse_init:<gcode_name> or timelapse_init:<gcode_name>:<output_path> */
+            char *args = line + 15;
+            char *colon = strchr(args, ':');
+            if (colon) {
+                *colon = '\0';
+                const char *gcode_name = args;
+                const char *output_path = colon + 1;
+                timelapse_init(gcode_name, output_path);
+            } else if (strlen(args) > 0) {
+                /* No output path specified, use default */
+                timelapse_init(args, NULL);
+            }
+        } else if (strcmp(line, "timelapse_capture") == 0) {
+            timelapse_capture_frame();
+        } else if (strcmp(line, "timelapse_finalize") == 0) {
+            timelapse_finalize();
+        } else if (strcmp(line, "timelapse_cancel") == 0) {
+            timelapse_cancel();
+        } else if (sscanf(line, "timelapse_fps:%d", &val) == 1) {
+            timelapse_set_fps(val);
+        } else if (sscanf(line, "timelapse_crf:%d", &val) == 1) {
+            timelapse_set_crf(val);
+        } else if (strncmp(line, "timelapse_variable_fps:", 23) == 0) {
+            /* Format: timelapse_variable_fps:<min>:<max>:<target_length> */
+            int min_fps, max_fps, target_len;
+            if (sscanf(line + 23, "%d:%d:%d", &min_fps, &max_fps, &target_len) == 3) {
+                timelapse_set_variable_fps(min_fps, max_fps, target_len);
+            }
+        } else if (sscanf(line, "timelapse_duplicate_last:%d", &val) == 1) {
+            timelapse_set_duplicate_last(val);
+        } else if (strncmp(line, "timelapse_flip:", 15) == 0) {
+            /* Format: timelapse_flip:<x>:<y> */
+            int flip_x, flip_y;
+            if (sscanf(line + 15, "%d:%d", &flip_x, &flip_y) == 2) {
+                timelapse_set_flip(flip_x, flip_y);
+            }
+        } else if (sscanf(line, "timelapse_custom_mode:%d", &val) == 1) {
+            /* Enable/disable custom timelapse mode (ignores Anycubic RPC timelapse) */
+            timelapse_set_custom_mode(val);
+        } else if (strncmp(line, "timelapse_temp_dir:", 19) == 0) {
+            /* Set temp directory for timelapse frames */
+            timelapse_set_temp_dir(line + 19);
+        } else if (sscanf(line, "timelapse_use_venc:%d", &val) == 1) {
+            /* Enable/disable hardware VENC encoding (1=VENC, 0=ffmpeg) */
+            timelapse_set_use_venc(val);
+        }
+    }
+    fclose(f);
+
+    /* Truncate the file to prevent reprocessing */
+    f = fopen(CMD_FILE, "w");
+    if (f) fclose(f);
 }
 
 /*
@@ -1804,7 +1889,8 @@ int main(int argc, char *argv[]) {
     signal(SIGTERM, signal_handler);
     signal(SIGPIPE, SIG_IGN);
 
-    /* Read control file first (Python may have written settings) then write */
+    /* Read control files first (Python may have written settings) then write */
+    read_cmd_file();  /* One-shot commands */
     read_ctrl_file();
     write_ctrl_file();
 
@@ -2086,8 +2172,9 @@ int main(int argc, char *argv[]) {
     while (g_running) {
         TIMING_START(total_frame);
 
-        /* Periodically check control file */
+        /* Periodically check control files */
         if (captured_count - last_ctrl_check >= CTRL_CHECK_INTERVAL) {
+            read_cmd_file();  /* One-shot commands */
             read_ctrl_file();
             /* Apply any camera control changes */
             if (g_cam_ctrl.set_mask) {
@@ -2109,7 +2196,8 @@ int main(int argc, char *argv[]) {
             /* Idle mode - no clients, sleep longer (unless snapshot or timelapse pending) */
             if (cfg.server_mode && !cfg.mjpeg_stdout && total_clients == 0 &&
                 !g_snapshot_pending && !timelapse_is_active()) {
-                /* Still check control file periodically in idle mode */
+                /* Still check control files periodically in idle mode */
+                read_cmd_file();  /* One-shot commands */
                 read_ctrl_file();
                 usleep(500000);  /* 500ms sleep when fully idle */
                 continue;
@@ -2185,7 +2273,8 @@ int main(int argc, char *argv[]) {
 
             if (cfg.server_mode && total_clients == 0 && !g_snapshot_pending && !timelapse_is_active()) {
                 /* Idle mode - no clients, requeue and sleep */
-                /* Still check control file periodically in idle mode */
+                /* Still check control files periodically in idle mode */
+                read_cmd_file();  /* One-shot commands */
                 read_ctrl_file();
                 ioctl(v4l2_fd, VIDIOC_QBUF, &buf);
                 usleep(500000);  /* 500ms sleep when fully idle */
@@ -2590,6 +2679,8 @@ skip_jpeg_output:
                 g_stats.mjpeg_clients = mjpeg_server_client_count();
                 g_stats.flv_clients = flv_server_client_count();
             }
+            /* Read command file first (one-shot commands like timelapse) */
+            read_cmd_file();
             /* Read before write to preserve Python-set values (display settings) */
             read_ctrl_file();
             /* Apply any camera control changes */

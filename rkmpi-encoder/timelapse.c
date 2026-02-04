@@ -243,6 +243,14 @@ int timelapse_init(const char *gcode_name, const char *output_dir) {
         timelapse_cancel();
     }
 
+    /* Apply defaults for any unset config values (0 means not configured) */
+    if (g_timelapse.config.output_fps <= 0) {
+        g_timelapse.config.output_fps = DEFAULT_OUTPUT_FPS;
+    }
+    if (g_timelapse.config.crf <= 0) {
+        g_timelapse.config.crf = DEFAULT_CRF;
+    }
+
     /* This is a custom timelapse init from h264_server */
     g_timelapse.custom_mode = 1;
 
@@ -322,6 +330,14 @@ int timelapse_init_legacy(const char *gcode_filepath) {
         timelapse_cancel();
     }
 
+    /* Apply defaults for any unset config values (0 means not configured) */
+    if (g_timelapse.config.output_fps <= 0) {
+        g_timelapse.config.output_fps = DEFAULT_OUTPUT_FPS;
+    }
+    if (g_timelapse.config.crf <= 0) {
+        g_timelapse.config.crf = DEFAULT_CRF;
+    }
+
     /* Copy gcode name */
     strncpy(g_timelapse.gcode_name, name, TIMELAPSE_NAME_MAX - 1);
     g_timelapse.gcode_name[TIMELAPSE_NAME_MAX - 1] = '\0';
@@ -379,6 +395,8 @@ int timelapse_capture_frame(void) {
          * The frame should be recent since we're in the encoder loop.
          */
         uint64_t sequence;
+        static uint64_t last_sequence = 0;
+
         size_t jpeg_size = frame_buffer_copy(&g_jpeg_buffer, jpeg_buf,
                                               FRAME_BUFFER_MAX_JPEG,
                                               &sequence, NULL, NULL);
@@ -388,6 +406,15 @@ int timelapse_capture_frame(void) {
             free(jpeg_buf);
             return -1;
         }
+
+        /* Check if we're getting the same frame again (stale data) */
+        if (sequence == last_sequence) {
+            timelapse_log("Frame %d: skipping duplicate (seq %llu)\n",
+                          g_timelapse.frame_count, (unsigned long long)sequence);
+            free(jpeg_buf);
+            return -1;  /* Skip duplicate frame */
+        }
+        last_sequence = sequence;
 
         /* Initialize VENC on first frame (need dimensions from JPEG header) */
         if (!g_timelapse.venc_initialized) {

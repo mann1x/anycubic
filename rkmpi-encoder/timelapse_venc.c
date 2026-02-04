@@ -6,6 +6,7 @@
  */
 
 #include "timelapse_venc.h"
+#include "timelapse.h"   /* For g_timelapse.temp_dir */
 #include "turbojpeg.h"
 #include "rk_mpi_sys.h"
 #include "rk_mpi_venc.h"
@@ -295,9 +296,11 @@ int timelapse_venc_init(int width, int height, int fps) {
         return -1;
     }
 
-    /* Create temp file for MP4 */
+    /* Create temp file for MP4 in the same directory as frames
+     * (avoids /tmp which may be in RAM and run out of space for long timelapses) */
+    const char *temp_dir = g_timelapse.temp_dir[0] ? g_timelapse.temp_dir : "/tmp";
     snprintf(g_state.temp_path, sizeof(g_state.temp_path),
-             "/tmp/timelapse_%d.mp4.tmp", (int)getpid());
+             "%s/timelapse.mp4.tmp", temp_dir);
     g_state.temp_file = fopen(g_state.temp_path, "wb+");
     if (!g_state.temp_file) {
         TL_LOG("Failed to create temp file: %s\n", strerror(errno));
@@ -485,9 +488,9 @@ int timelapse_venc_add_frame(const uint8_t *jpeg_data, size_t jpeg_size) {
                 TL_LOG("First frame: size=%d bytes (keyframe)\n", size);
             }
 
-            /* Write NAL to MP4 */
+            /* Write NAL to MP4 with constant frame duration (not accumulating timestamp) */
             int mp4_ret = mp4_h26x_write_nal(&g_state.mp4_writer, data, size,
-                                              g_state.timestamp + g_state.frame_duration);
+                                              g_state.frame_duration);
             if (mp4_ret != MP4E_STATUS_OK) {
                 TL_LOG("mp4_h26x_write_nal failed: %d\n", mp4_ret);
             }
@@ -498,8 +501,6 @@ int timelapse_venc_add_frame(const uint8_t *jpeg_data, size_t jpeg_size) {
     RK_MPI_VENC_ReleaseStream(VENC_CHN_TIMELAPSE, &stream);
     free(stream.pstPack);
 
-    /* Update timestamp */
-    g_state.timestamp += g_state.frame_duration;
     g_state.frame_count++;
 
     if (g_state.frame_count % 10 == 0) {
