@@ -363,17 +363,24 @@ int timelapse_venc_add_frame(const uint8_t *jpeg_data, size_t jpeg_size) {
 
     int tj_width, tj_height, tj_subsamp, tj_colorspace;
 
-    /* Get JPEG header info */
+    /* Pre-validate JPEG header before full decompression
+     * This catches many corrupt JPEGs without crashing the decoder */
     if (tjDecompressHeader3(g_state.tj_handle, jpeg_data, jpeg_size,
                             &tj_width, &tj_height, &tj_subsamp, &tj_colorspace) != 0) {
-        TL_LOG("tjDecompressHeader3 failed: %s\n", tjGetErrorStr());
+        TL_LOG("JPEG header invalid: %s\n", tjGetErrorStr());
         return -1;
     }
 
-    /* Verify dimensions match */
+    /* Verify dimensions match expected values */
     if (tj_width != g_state.width || tj_height != g_state.height) {
         TL_LOG("Frame size mismatch: got %dx%d, expected %dx%d\n",
                tj_width, tj_height, g_state.width, g_state.height);
+        return -1;
+    }
+
+    /* Verify subsamp is valid (YUV420 or similar) */
+    if (tj_subsamp != TJSAMP_420 && tj_subsamp != TJSAMP_422 && tj_subsamp != TJSAMP_444) {
+        TL_LOG("Unsupported JPEG subsampling: %d\n", tj_subsamp);
         return -1;
     }
 
