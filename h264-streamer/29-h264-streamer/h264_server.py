@@ -2897,8 +2897,10 @@ class StreamerApp:
         self.cam_power_line = getattr(args, 'cam_power_line', 1)
         self.cam_controls_applied = False  # Track if initial controls have been applied
 
-        # Control file (rkmpi mode only)
+        # Control file (rkmpi mode only) - bidirectional settings/stats
         self.ctrl_file = "/tmp/h264_ctrl"
+        # Command file - one-shot commands (timelapse, etc.)
+        self.cmd_file = "/tmp/h264_cmd"
 
         # IP address
         self.current_ip = None
@@ -7623,9 +7625,13 @@ addStream('Display Snapshot',streamBase+'/display/snapshot');
         return TIMELAPSE_DIR
 
     def _send_timelapse_command(self, command):
-        """Send a timelapse command to rkmpi_enc via control file"""
+        """Send a timelapse command to rkmpi_enc via command file.
+
+        Uses separate cmd_file (/tmp/h264_cmd) instead of ctrl_file to avoid
+        race conditions - ctrl_file is periodically overwritten with settings/stats.
+        """
         try:
-            with open(self.ctrl_file, 'a') as f:
+            with open(self.cmd_file, 'a') as f:
                 f.write(f"{command}\n")
         except Exception as e:
             print(f"Error sending timelapse command: {e}", flush=True)
