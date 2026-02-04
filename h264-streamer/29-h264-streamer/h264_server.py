@@ -1728,40 +1728,60 @@ class MoonrakerClient:
         return req_id
 
     def _subscribe_print_stats(self):
-        """Subscribe to print_stats object updates"""
-        # Subscribe to print_stats with all fields
+        """Subscribe to print_stats and virtual_sdcard object updates"""
+        # Subscribe to both print_stats and virtual_sdcard
+        # On Anycubic printers, layer info comes from virtual_sdcard
         self._send_jsonrpc("printer.objects.subscribe", {
             "objects": {
-                "print_stats": None  # None = all fields
+                "print_stats": None,  # None = all fields
+                "virtual_sdcard": ["current_layer", "total_layer"]
             }
         })
 
     def _handle_status_update(self, data):
         """Handle notify_status_update notifications from Moonraker"""
-        if 'print_stats' not in data:
-            return
-
-        stats = data['print_stats']
         old_state = self.print_state
         old_layer = self.current_layer
 
-        # Update state
-        if 'state' in stats:
-            self.print_state = stats['state']
+        # Handle print_stats updates
+        if 'print_stats' in data:
+            stats = data['print_stats']
 
-        if 'filename' in stats:
-            self.filename = stats['filename']
+            # Update state
+            if 'state' in stats:
+                self.print_state = stats['state']
 
-        if 'print_duration' in stats:
-            self.print_duration = stats['print_duration']
+            if 'filename' in stats:
+                self.filename = stats['filename']
 
-        # Layer info is nested in 'info' dict
-        if 'info' in stats and stats['info']:
-            info = stats['info']
-            if 'current_layer' in info:
-                self.current_layer = info['current_layer'] or 0
-            if 'total_layer' in info:
-                self.total_layers = info['total_layer'] or 0
+            if 'print_duration' in stats:
+                self.print_duration = stats['print_duration']
+
+            # Layer info may be nested in 'info' dict (standard Klipper)
+            if 'info' in stats and stats['info']:
+                info = stats['info']
+                if 'current_layer' in info and info['current_layer']:
+                    new_layer = info['current_layer']
+                    if new_layer != self.current_layer:
+                        print(f"MoonrakerClient: Layer changed (print_stats) {self.current_layer} -> {new_layer}", flush=True)
+                    self.current_layer = new_layer
+                if 'total_layer' in info and info['total_layer']:
+                    self.total_layers = info['total_layer']
+
+        # Handle virtual_sdcard updates (Anycubic printers have layer info here)
+        if 'virtual_sdcard' in data:
+            vsd = data['virtual_sdcard']
+            if 'current_layer' in vsd and vsd['current_layer']:
+                new_layer = vsd['current_layer']
+                if new_layer != self.current_layer:
+                    print(f"MoonrakerClient: Layer changed (virtual_sdcard) {self.current_layer} -> {new_layer}", flush=True)
+                self.current_layer = new_layer
+            if 'total_layer' in vsd and vsd['total_layer']:
+                self.total_layers = vsd['total_layer']
+
+        # Skip if no relevant data
+        if 'print_stats' not in data and 'virtual_sdcard' not in data:
+            return
 
         # Trigger callbacks based on state changes
         if old_state != 'printing' and self.print_state == 'printing':
@@ -1772,24 +1792,28 @@ class MoonrakerClient:
                 except Exception as e:
                     print(f"MoonrakerClient: on_print_start callback error: {e}", flush=True)
 
-        elif self.print_state == 'printing' and self.current_layer != old_layer:
+        # Layer change - use separate if, not elif, so it can trigger after print start
+        if self.print_state == 'printing' and self.current_layer != old_layer:
             # Layer changed
+            print(f"MoonrakerClient: Triggering layer change callback: {old_layer} -> {self.current_layer}", flush=True)
             if self.on_layer_change:
                 try:
                     self.on_layer_change(self.current_layer, self.total_layers)
                 except Exception as e:
                     print(f"MoonrakerClient: on_layer_change callback error: {e}", flush=True)
+            else:
+                print(f"MoonrakerClient: on_layer_change callback not set!", flush=True)
 
-        elif old_state == 'printing' and self.print_state == 'complete':
-            # Print completed
+        # Print completed - separate if to not interfere with layer change
+        if old_state == 'printing' and self.print_state == 'complete':
             if self.on_print_complete:
                 try:
                     self.on_print_complete(self.filename)
                 except Exception as e:
                     print(f"MoonrakerClient: on_print_complete callback error: {e}", flush=True)
 
-        elif old_state == 'printing' and self.print_state in ('cancelled', 'error'):
-            # Print cancelled or errored
+        # Print cancelled or errored - separate if to not interfere with layer change
+        if old_state == 'printing' and self.print_state in ('cancelled', 'error'):
             if self.on_print_cancel:
                 try:
                     self.on_print_cancel(self.filename, self.print_state)
