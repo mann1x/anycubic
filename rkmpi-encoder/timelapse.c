@@ -367,20 +367,28 @@ int timelapse_capture_frame(void) {
         return -1;
     }
 
-    /* Copy current JPEG frame from encoder buffer */
-    uint64_t sequence;
-    size_t jpeg_size = frame_buffer_copy(&g_jpeg_buffer, jpeg_buf,
-                                          FRAME_BUFFER_MAX_JPEG,
-                                          &sequence, NULL, NULL);
-
-    if (jpeg_size == 0) {
-        timelapse_log("Frame %d: no JPEG data available\n", g_timelapse.frame_count);
-        free(jpeg_buf);
-        return -1;
-    }
-
     /* VENC path: encode directly to H.264 */
     if (g_timelapse.use_venc) {
+        /*
+         * NOTE: timelapse_capture_frame() is called from the encoder's main loop
+         * during control file parsing. We CANNOT use frame_buffer_wait() here
+         * because that would block the encoder thread from writing new frames,
+         * causing a deadlock.
+         *
+         * Instead, we simply copy whatever is currently in the buffer.
+         * The frame should be recent since we're in the encoder loop.
+         */
+        uint64_t sequence;
+        size_t jpeg_size = frame_buffer_copy(&g_jpeg_buffer, jpeg_buf,
+                                              FRAME_BUFFER_MAX_JPEG,
+                                              &sequence, NULL, NULL);
+
+        if (jpeg_size == 0) {
+            timelapse_log("Frame %d: no JPEG data available\n", g_timelapse.frame_count);
+            free(jpeg_buf);
+            return -1;
+        }
+
         /* Initialize VENC on first frame (need dimensions from JPEG header) */
         if (!g_timelapse.venc_initialized) {
             tjhandle tj = tjInitDecompress();
@@ -398,32 +406,53 @@ int timelapse_capture_frame(void) {
                     } else {
                         timelapse_log("VENC init failed, falling back to ffmpeg\n");
                         g_timelapse.use_venc = 0;
+                        tjDestroy(tj);
+                        /* Fall through to ffmpeg path below */
                     }
                 } else {
                     timelapse_log("Failed to parse JPEG header: %s\n", tjGetErrorStr());
-                    g_timelapse.use_venc = 0;
+                    tjDestroy(tj);
+                    free(jpeg_buf);
+                    return -1;  /* Skip this frame */
                 }
                 tjDestroy(tj);
             } else {
                 timelapse_log("tjInitDecompress failed, falling back to ffmpeg\n");
                 g_timelapse.use_venc = 0;
+                /* Fall through to ffmpeg path below */
             }
         }
 
         /* Encode frame with VENC if initialized */
         if (g_timelapse.venc_initialized) {
-            if (timelapse_venc_add_frame(jpeg_buf, jpeg_size) == 0) {
+            int ret = timelapse_venc_add_frame(jpeg_buf, jpeg_size);
+            free(jpeg_buf);
+
+            if (ret == 0) {
                 g_timelapse.frame_count++;
                 if (g_timelapse.frame_count % 10 == 0) {
                     timelapse_log("VENC frame %d encoded\n", g_timelapse.frame_count);
                 }
-                free(jpeg_buf);
                 return 0;
             } else {
-                timelapse_log("VENC encode failed for frame %d\n", g_timelapse.frame_count);
-                /* Continue to save JPEG as fallback */
+                /* Frame decode/encode failed - skip this frame */
+                timelapse_log("VENC frame skipped (decode/encode error)\n");
+                return -1;
             }
         }
+        /* Fall through to ffmpeg path if VENC not initialized */
+    }
+
+    /* Copy JPEG for ffmpeg path (if not already copied in VENC path) */
+    uint64_t sequence;
+    size_t jpeg_size = frame_buffer_copy(&g_jpeg_buffer, jpeg_buf,
+                                          FRAME_BUFFER_MAX_JPEG,
+                                          &sequence, NULL, NULL);
+
+    if (jpeg_size == 0) {
+        timelapse_log("Frame %d: no JPEG data available\n", g_timelapse.frame_count);
+        free(jpeg_buf);
+        return -1;
     }
 
     /* FFmpeg path: save JPEG to disk for later encoding */

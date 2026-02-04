@@ -28,6 +28,106 @@
 /* Logging */
 #define TL_LOG(fmt, ...) fprintf(stderr, "[TIMELAPSE_VENC] " fmt, ##__VA_ARGS__)
 
+/*
+ * Validate JPEG data before decoding.
+ * Returns 1 if valid, 0 if corrupt.
+ *
+ * Performs thorough validation to catch internally corrupt JPEGs:
+ * - Check SOI/EOI markers
+ * - Scan for multiple SOI markers (indicates concatenated frames)
+ * - Verify no premature EOI markers
+ */
+static int validate_jpeg(const uint8_t *data, size_t size) {
+    /* Minimum JPEG size: SOI (2) + APP0/JFIF minimum + SOF + EOI */
+    if (!data || size < 100) {
+        TL_LOG("Invalid JPEG: too small (%zu bytes)\n", size);
+        return 0;
+    }
+
+    /* Check SOI marker (Start of Image): FFD8 */
+    if (data[0] != 0xFF || data[1] != 0xD8) {
+        TL_LOG("Invalid JPEG: bad SOI (0x%02x%02x)\n", data[0], data[1]);
+        return 0;
+    }
+
+    /* Check EOI marker (End of Image): FFD9 at end */
+    if (data[size - 2] != 0xFF || data[size - 1] != 0xD9) {
+        TL_LOG("Invalid JPEG: bad EOI at end (0x%02x%02x)\n",
+               data[size - 2], data[size - 1]);
+        return 0;
+    }
+
+    /* Scan for multiple SOI/SOF markers - indicates concatenated/corrupt data
+     * SOI = FFD8 (Start of Image)
+     * SOF = FFC0-FFCF (Start of Frame, various types)
+     * EOI = FFD9 (End of Image)
+     */
+    int soi_count = 0;
+    int sof_count = 0;
+    int eoi_count = 0;
+
+    for (size_t i = 0; i < size - 1; i++) {
+        if (data[i] == 0xFF) {
+            uint8_t marker = data[i + 1];
+
+            if (marker == 0xD8) {
+                /* SOI - Start of Image */
+                soi_count++;
+                if (soi_count > 1) {
+                    TL_LOG("Invalid JPEG: multiple SOI markers (%d at offset %zu)\n",
+                           soi_count, i);
+                    return 0;
+                }
+            } else if (marker >= 0xC0 && marker <= 0xCF && marker != 0xC4 && marker != 0xC8 && marker != 0xCC) {
+                /* SOF markers: C0-C3 (baseline/extended/progressive/lossless)
+                 * C5-C7, C9-CB, CD-CF (differential variants)
+                 * Exclude C4 (DHT), C8 (JPG), CC (DAC) which are not SOF */
+                sof_count++;
+                if (sof_count > 1) {
+                    TL_LOG("Invalid JPEG: multiple SOF markers (%d at offset %zu, type=0x%02x)\n",
+                           sof_count, i, marker);
+                    return 0;
+                }
+            } else if (marker == 0xD9) {
+                /* EOI - End of Image */
+                eoi_count++;
+                /* EOI should only appear at the very end */
+                if (i < size - 2) {
+                    TL_LOG("Invalid JPEG: premature EOI at offset %zu (size=%zu)\n",
+                           i, size);
+                    return 0;
+                }
+            }
+            /* Skip over marker payload to avoid false positives in data */
+            if (marker >= 0xC0 && marker <= 0xFE && marker != 0xD8 && marker != 0xD9 &&
+                !(marker >= 0xD0 && marker <= 0xD7)) {  /* Skip RST markers */
+                /* Markers with length field (2 bytes big-endian) */
+                if (i + 3 < size) {
+                    uint16_t len = (data[i + 2] << 8) | data[i + 3];
+                    if (len >= 2 && i + 1 + len < size) {
+                        i += len;  /* Skip marker payload */
+                    }
+                }
+            }
+        }
+    }
+
+    if (soi_count != 1) {
+        TL_LOG("Invalid JPEG: SOI count=%d\n", soi_count);
+        return 0;
+    }
+    if (sof_count != 1) {
+        TL_LOG("Invalid JPEG: SOF count=%d\n", sof_count);
+        return 0;
+    }
+    if (eoi_count != 1) {
+        TL_LOG("Invalid JPEG: EOI count=%d\n", eoi_count);
+        return 0;
+    }
+
+    return 1;
+}
+
 /* State for VENC-based encoding */
 typedef struct {
     int initialized;
@@ -221,7 +321,7 @@ int timelapse_venc_init(int width, int height, int fps) {
         return -1;
     }
 
-    /* Initialize H.264 writer */
+    /* Initialize H.264 writer - use h264 codec (not h265) */
     if (mp4_h26x_write_init(&g_state.mp4_writer, g_state.mp4_mux, width, height, 0) != MP4E_STATUS_OK) {
         TL_LOG("mp4_h26x_write_init failed\n");
         MP4E_close(g_state.mp4_mux);
@@ -234,6 +334,7 @@ int timelapse_venc_init(int width, int height, int fps) {
         return -1;
     }
 
+    TL_LOG("MP4 writer initialized, temp file: %s\n", g_state.temp_path);
     g_state.initialized = 1;
     g_state.frame_count = 0;
     g_state.timestamp = 0;
@@ -245,6 +346,15 @@ int timelapse_venc_init(int width, int height, int fps) {
 int timelapse_venc_add_frame(const uint8_t *jpeg_data, size_t jpeg_size) {
     if (!g_state.initialized) {
         TL_LOG("Not initialized\n");
+        return -1;
+    }
+
+    /* Validate JPEG data before processing */
+    if (!validate_jpeg(jpeg_data, jpeg_size)) {
+        TL_LOG("Invalid JPEG data (size=%zu, starts=%02x%02x)\n",
+               jpeg_size,
+               jpeg_size > 0 ? jpeg_data[0] : 0,
+               jpeg_size > 1 ? jpeg_data[1] : 0);
         return -1;
     }
 
@@ -313,6 +423,10 @@ int timelapse_venc_add_frame(const uint8_t *jpeg_data, size_t jpeg_size) {
 
     /* Copy NV12 to RKMPI memory block */
     void *mb_vaddr = RK_MPI_MB_Handle2VirAddr(g_state.mb_blk);
+    if (!mb_vaddr) {
+        TL_LOG("RK_MPI_MB_Handle2VirAddr returned NULL\n");
+        return -1;
+    }
     memcpy(mb_vaddr, g_state.nv12_buffer, g_state.nv12_size);
 
     /* Sync memory for hardware access */
@@ -336,13 +450,19 @@ int timelapse_venc_add_frame(const uint8_t *jpeg_data, size_t jpeg_size) {
         return -1;
     }
 
-    /* Get encoded H.264 stream */
+    /* Get encoded H.264 stream - MUST allocate pstPack before calling GetStream */
     VENC_STREAM_S stream;
     memset(&stream, 0, sizeof(stream));
+    stream.pstPack = malloc(sizeof(VENC_PACK_S));
+    if (!stream.pstPack) {
+        TL_LOG("Failed to allocate stream pack\n");
+        return -1;
+    }
 
     ret = RK_MPI_VENC_GetStream(VENC_CHN_TIMELAPSE, &stream, 1000);
     if (ret != RK_SUCCESS) {
         TL_LOG("RK_MPI_VENC_GetStream failed: 0x%x\n", ret);
+        free(stream.pstPack);
         return -1;
     }
 
@@ -350,8 +470,20 @@ int timelapse_venc_add_frame(const uint8_t *jpeg_data, size_t jpeg_size) {
     if (stream.pstPack && stream.u32PackCount > 0) {
         for (RK_U32 i = 0; i < stream.u32PackCount; i++) {
             VENC_PACK_S *pack = &stream.pstPack[i];
-            uint8_t *data = (uint8_t *)RK_MPI_MB_Handle2VirAddr(pack->pMbBlk) + pack->u32Offset;
+
+            /* Get data pointer - use base address directly (not offset) like main encoder */
+            void *pData = RK_MPI_MB_Handle2VirAddr(pack->pMbBlk);
             int size = pack->u32Len;
+
+            /* Invalidate cache to ensure we read the encoder's output */
+            RK_MPI_SYS_MmzFlushCache(pack->pMbBlk, RK_TRUE);  /* RK_TRUE = invalidate (read) */
+
+            uint8_t *data = (uint8_t *)pData;
+
+            /* Log first frame (keyframe with SPS/PPS) and every 10th frame */
+            if (g_state.frame_count == 0) {
+                TL_LOG("First frame: size=%d bytes (keyframe)\n", size);
+            }
 
             /* Write NAL to MP4 */
             int mp4_ret = mp4_h26x_write_nal(&g_state.mp4_writer, data, size,
@@ -364,6 +496,7 @@ int timelapse_venc_add_frame(const uint8_t *jpeg_data, size_t jpeg_size) {
 
     /* Release stream buffer */
     RK_MPI_VENC_ReleaseStream(VENC_CHN_TIMELAPSE, &stream);
+    free(stream.pstPack);
 
     /* Update timestamp */
     g_state.timestamp += g_state.frame_duration;
@@ -382,18 +515,38 @@ int timelapse_venc_finish(const char *output_path) {
         return -1;
     }
 
-    TL_LOG("Finishing timelapse: %d frames\n", g_state.frame_count);
+    TL_LOG("Finishing timelapse: %d frames, output=%s\n", g_state.frame_count, output_path);
+
+    /* Check temp file size before close */
+    long temp_size = 0;
+    if (g_state.temp_file) {
+        fflush(g_state.temp_file);
+        fseek(g_state.temp_file, 0, SEEK_END);
+        temp_size = ftell(g_state.temp_file);
+        TL_LOG("Temp file size before close: %ld bytes\n", temp_size);
+    }
 
     /* Close MP4 writer and muxer */
+    TL_LOG("Closing MP4 writer...\n");
     mp4_h26x_write_close(&g_state.mp4_writer);
 
+    TL_LOG("Closing MP4 muxer...\n");
     int mp4_ret = MP4E_close(g_state.mp4_mux);
     if (mp4_ret != MP4E_STATUS_OK) {
         TL_LOG("MP4E_close failed: %d\n", mp4_ret);
     }
     g_state.mp4_mux = NULL;
 
+    /* Check temp file size after MP4 close */
+    if (g_state.temp_file) {
+        fflush(g_state.temp_file);
+        fseek(g_state.temp_file, 0, SEEK_END);
+        long final_size = ftell(g_state.temp_file);
+        TL_LOG("Temp file size after MP4 close: %ld bytes\n", final_size);
+    }
+
     /* Close temp file */
+    TL_LOG("Closing temp file...\n");
     fclose(g_state.temp_file);
     g_state.temp_file = NULL;
 

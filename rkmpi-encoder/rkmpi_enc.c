@@ -2106,8 +2106,11 @@ int main(int argc, char *argv[]) {
             int flv_clients = cfg.server_mode ? flv_server_client_count() : 0;
             int total_clients = mjpeg_clients + flv_clients;
 
-            /* Idle mode - no clients, sleep longer (unless snapshot pending) */
-            if (cfg.server_mode && !cfg.mjpeg_stdout && total_clients == 0 && !g_snapshot_pending) {
+            /* Idle mode - no clients, sleep longer (unless snapshot or timelapse pending) */
+            if (cfg.server_mode && !cfg.mjpeg_stdout && total_clients == 0 &&
+                !g_snapshot_pending && !timelapse_is_active()) {
+                /* Still check control file periodically in idle mode */
+                read_ctrl_file();
                 usleep(500000);  /* 500ms sleep when fully idle */
                 continue;
             }
@@ -2180,8 +2183,10 @@ int main(int argc, char *argv[]) {
             int flv_clients = cfg.server_mode ? flv_server_client_count() : 0;
             int total_clients = mjpeg_clients + flv_clients;
 
-            if (cfg.server_mode && total_clients == 0 && !g_snapshot_pending) {
+            if (cfg.server_mode && total_clients == 0 && !g_snapshot_pending && !timelapse_is_active()) {
                 /* Idle mode - no clients, requeue and sleep */
+                /* Still check control file periodically in idle mode */
+                read_ctrl_file();
                 ioctl(v4l2_fd, VIDIOC_QBUF, &buf);
                 usleep(500000);  /* 500ms sleep when fully idle */
                 continue;
@@ -2383,12 +2388,37 @@ skip_jpeg_output:
             uint8_t *jpeg_data = capture_data;
             size_t jpeg_len = capture_len;
 
-            /* Write JPEG to frame buffer for HTTP servers (if clients connected or snapshot pending)
+            /* Validate JPEG data from camera before processing
+             * Camera can occasionally send corrupt frames (USB transfer issues, etc.)
+             * Check: SOI marker (FFD8), minimum size, and EOI marker (FFD9) at end */
+            int valid_jpeg = 0;
+            if (jpeg_len >= 100 &&
+                jpeg_data[0] == 0xFF && jpeg_data[1] == 0xD8 &&
+                jpeg_data[jpeg_len - 2] == 0xFF && jpeg_data[jpeg_len - 1] == 0xD9) {
+                valid_jpeg = 1;
+            }
+
+            if (!valid_jpeg) {
+                /* Bad JPEG frame from camera - skip it entirely */
+                if (g_verbose) {
+                    log_info("[MJPEG] Bad frame: len=%zu, SOI=%02x%02x, EOI=%02x%02x\n",
+                             jpeg_len,
+                             jpeg_len > 1 ? jpeg_data[0] : 0,
+                             jpeg_len > 1 ? jpeg_data[1] : 0,
+                             jpeg_len > 1 ? jpeg_data[jpeg_len - 2] : 0,
+                             jpeg_len > 1 ? jpeg_data[jpeg_len - 1] : 0);
+                }
+                /* Requeue and get next frame */
+                ioctl(v4l2_fd, VIDIOC_QBUF, &buf);
+                continue;
+            }
+
+            /* Write JPEG to frame buffer for HTTP servers (if clients connected, snapshot pending, or timelapse active)
              * Skip first few frames to let camera auto-exposure stabilize */
             TIMING_START(frame_buffer);
             if (cfg.server_mode && frame_buffers_initialized &&
                 captured_count >= CAMERA_WARMUP_FRAMES &&
-                (mjpeg_clients > 0 || g_snapshot_pending)) {
+                (mjpeg_clients > 0 || g_snapshot_pending || timelapse_is_active())) {
                 frame_buffer_write(&g_jpeg_buffer, jpeg_data, jpeg_len,
                                    get_timestamp_us(), 0);
                 g_snapshot_pending = 0;  /* Clear snapshot request after writing frame */
