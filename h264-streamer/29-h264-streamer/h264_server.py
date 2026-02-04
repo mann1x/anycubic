@@ -1584,8 +1584,9 @@ class MoonrakerClient:
         self.request_id = 1
 
         # Callbacks
-        self.on_print_start = None      # callback(filename)
-        self.on_layer_change = None     # callback(layer, total_layers)
+        self.on_print_start = None      # callback(filename) - when state becomes 'printing'
+        self.on_first_layer = None      # callback(filename) - when layer changes 0->1 (actual printing starts)
+        self.on_layer_change = None     # callback(layer, total_layers) - on each layer change
         self.on_print_complete = None   # callback(filename)
         self.on_print_cancel = None     # callback(filename, reason)
         self.on_connect = None          # callback()
@@ -1792,7 +1793,17 @@ class MoonrakerClient:
                 except Exception as e:
                     print(f"MoonrakerClient: on_print_start callback error: {e}", flush=True)
 
-        # Layer change - use separate if, not elif, so it can trigger after print start
+        # First layer callback - when layer changes from 0 to 1 (actual printing starts)
+        # This happens after heating/leveling when the printer starts actually printing
+        if self.print_state == 'printing' and old_layer == 0 and self.current_layer == 1:
+            print(f"MoonrakerClient: First layer started (actual printing begins)", flush=True)
+            if self.on_first_layer:
+                try:
+                    self.on_first_layer(self.filename)
+                except Exception as e:
+                    print(f"MoonrakerClient: on_first_layer callback error: {e}", flush=True)
+
+        # Layer change - use separate if, not elif, so it can trigger after first layer
         if self.print_state == 'printing' and self.current_layer != old_layer:
             # Layer changed
             print(f"MoonrakerClient: Triggering layer change callback: {old_layer} -> {self.current_layer}", flush=True)
@@ -2851,6 +2862,7 @@ class StreamerApp:
         self.timelapse_stream_delay = getattr(args, 'timelapse_stream_delay', 0.05)
         self.timelapse_flip_x = getattr(args, 'timelapse_flip_x', False)
         self.timelapse_flip_y = getattr(args, 'timelapse_flip_y', False)
+        self.timelapse_end_delay = getattr(args, 'timelapse_end_delay', 5.0)  # Delay before final frame (head parking)
 
         # Moonraker client (for timelapse integration)
         self.moonraker_client = None
@@ -2858,6 +2870,7 @@ class StreamerApp:
         self.timelapse_frames = 0  # Frame counter for current timelapse
         self.timelapse_filename = None  # Current print filename
         self.hyperlapse_timer = None  # Timer for hyperlapse mode
+        self.timelapse_first_layer_captured = False  # Track if first layer frame was captured
 
         # MJPEG frame buffer (for rkmpi mode)
         self.current_frame = None
@@ -3146,6 +3159,7 @@ class StreamerApp:
             config['timelapse_stream_delay'] = str(self.timelapse_stream_delay)
             config['timelapse_flip_x'] = 'true' if self.timelapse_flip_x else 'false'
             config['timelapse_flip_y'] = 'true' if self.timelapse_flip_y else 'false'
+            config['timelapse_end_delay'] = str(self.timelapse_end_delay)
 
             # Write back with explicit flush and sync
             with open(config_path, 'w') as f:
@@ -7497,6 +7511,7 @@ addStream('Display Snapshot',streamBase+'/display/snapshot');
 
         # Set up callbacks for timelapse
         self.moonraker_client.on_print_start = self._on_print_start
+        self.moonraker_client.on_first_layer = self._on_first_layer
         self.moonraker_client.on_layer_change = self._on_layer_change
         self.moonraker_client.on_print_complete = self._on_print_complete
         self.moonraker_client.on_print_cancel = self._on_print_cancel
@@ -7518,14 +7533,19 @@ addStream('Display Snapshot',streamBase+'/display/snapshot');
         print("Moonraker client stopped", flush=True)
 
     def _on_print_start(self, filename):
-        """Callback when print starts"""
+        """Callback when print state becomes 'printing' (includes heating/leveling)
+
+        We only initialize the timelapse here but don't start capturing.
+        Actual capture starts in _on_first_layer when layer changes 0->1.
+        """
         if not self.timelapse_enabled:
             return
 
-        print(f"Timelapse: Print started - {filename}", flush=True)
+        print(f"Timelapse: Print started (heating/leveling phase) - {filename}", flush=True)
         self.timelapse_active = True
         self.timelapse_frames = 0
         self.timelapse_filename = filename
+        self.timelapse_first_layer_captured = False  # Reset first layer flag
 
         # Determine output path
         output_path = self._get_timelapse_output_path()
@@ -7544,6 +7564,33 @@ addStream('Display Snapshot',streamBase+'/display/snapshot');
         if self.timelapse_duplicate_last_frame > 0:
             self._send_timelapse_command(f"timelapse_duplicate_last:{self.timelapse_duplicate_last_frame}")
         self._send_timelapse_command(f"timelapse_flip:{1 if self.timelapse_flip_x else 0}:{1 if self.timelapse_flip_y else 0}")
+
+        # NOTE: Don't start capturing or hyperlapse timer here!
+        # Wait for _on_first_layer when actual printing starts (layer 0->1)
+
+    def _on_first_layer(self, filename):
+        """Callback when layer changes from 0 to 1 - actual printing has started
+
+        This happens after heating/leveling when the printer starts extruding.
+        The print head is at/near the wiping position, perfect for first frame.
+        """
+        if not self.timelapse_enabled or not self.timelapse_active:
+            return
+
+        if self.timelapse_first_layer_captured:
+            return  # Already captured first layer frame
+
+        print(f"Timelapse: First layer started (actual printing begins) - capturing first frame", flush=True)
+        self.timelapse_first_layer_captured = True
+
+        # Wait for stream delay then capture first frame
+        if self.timelapse_stream_delay > 0:
+            time.sleep(self.timelapse_stream_delay)
+
+        # Capture the first frame (head is at/near wiping position)
+        self._send_timelapse_command("timelapse_capture")
+        self.timelapse_frames += 1
+        print(f"Timelapse: First frame captured (frame {self.timelapse_frames})", flush=True)
 
         # Start hyperlapse timer if in hyperlapse mode
         if self.timelapse_mode == 'hyperlapse':
@@ -7579,12 +7626,18 @@ addStream('Display Snapshot',streamBase+'/display/snapshot');
         self.hyperlapse_timer = None
 
     def _on_layer_change(self, layer, total_layers):
-        """Callback when layer changes"""
+        """Callback when layer changes (2, 3, 4, ... - layer 1 is handled by _on_first_layer)"""
         if not self.timelapse_enabled or not self.timelapse_active:
             return
 
         # Only capture in layer mode
         if self.timelapse_mode != 'layer':
+            return
+
+        # Skip layer 1 - it's captured by _on_first_layer when actual printing starts
+        # This prevents duplicate capture and ensures first frame is at wiping position
+        if layer == 1:
+            print(f"Timelapse: Layer 1/{total_layers} - skipped (captured by first_layer)", flush=True)
             return
 
         print(f"Timelapse: Layer {layer}/{total_layers}", flush=True)
@@ -7607,6 +7660,17 @@ addStream('Display Snapshot',streamBase+'/display/snapshot');
         # Stop hyperlapse timer first (sets timelapse_active = False in loop check)
         self.timelapse_active = False
         self._stop_hyperlapse_timer()
+
+        # Wait for head to park before capturing final frame
+        # This delay allows the print head to move away from the model
+        if self.timelapse_end_delay > 0:
+            print(f"Timelapse: Waiting {self.timelapse_end_delay}s for head to park...", flush=True)
+            time.sleep(self.timelapse_end_delay)
+
+            # Capture final frame with head parked (full model visible)
+            self._send_timelapse_command("timelapse_capture")
+            self.timelapse_frames += 1
+            print(f"Timelapse: Final frame captured (frame {self.timelapse_frames})", flush=True)
 
         self._send_timelapse_command("timelapse_finalize")
 
@@ -8407,6 +8471,7 @@ def main():
     args.timelapse_stream_delay = max(0, min(5, float(saved_config.get('timelapse_stream_delay', 0.05))))
     args.timelapse_flip_x = saved_config.get('timelapse_flip_x', 'false') == 'true'
     args.timelapse_flip_y = saved_config.get('timelapse_flip_y', 'false') == 'true'
+    args.timelapse_end_delay = max(0, min(30, float(saved_config.get('timelapse_end_delay', 5.0))))
 
     app = StreamerApp(args)
 
