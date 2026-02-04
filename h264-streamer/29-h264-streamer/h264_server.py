@@ -1579,6 +1579,7 @@ class MoonrakerClient:
         self.total_layers = 0
         self.filename = None
         self.print_duration = 0
+        self.first_layer_seen = False  # Track if first layer callback was fired for current print
 
         # JSON-RPC request ID counter
         self.request_id = 1
@@ -1786,16 +1787,20 @@ class MoonrakerClient:
 
         # Trigger callbacks based on state changes
         if old_state != 'printing' and self.print_state == 'printing':
-            # Print started
+            # Print started - reset first layer flag for fresh tracking
+            self.first_layer_seen = False
+            print(f"MoonrakerClient: Print started, waiting for first layer", flush=True)
+
             if self.on_print_start:
                 try:
                     self.on_print_start(self.filename)
                 except Exception as e:
                     print(f"MoonrakerClient: on_print_start callback error: {e}", flush=True)
 
-        # First layer callback - when layer changes from 0 to 1 (actual printing starts)
+        # First layer callback - when we first see layer >= 1 after print starts
         # This happens after heating/leveling when the printer starts actually printing
-        if self.print_state == 'printing' and old_layer == 0 and self.current_layer == 1:
+        if self.print_state == 'printing' and not self.first_layer_seen and self.current_layer >= 1:
+            self.first_layer_seen = True
             print(f"MoonrakerClient: First layer started (actual printing begins)", flush=True)
             if self.on_first_layer:
                 try:
@@ -7602,8 +7607,16 @@ addStream('Display Snapshot',streamBase+'/display/snapshot');
             return  # Already running
 
         def capture_loop():
+            # First frame already captured by _on_first_layer, so wait for interval first
             while self.timelapse_active and self.timelapse_mode == 'hyperlapse':
-                # Wait for stream delay
+                # Wait for interval before next capture
+                time.sleep(self.timelapse_hyperlapse_interval)
+
+                # Check if still active after waiting
+                if not self.timelapse_active or self.timelapse_mode != 'hyperlapse':
+                    break
+
+                # Wait for stream delay (camera stabilization)
                 if self.timelapse_stream_delay > 0:
                     time.sleep(self.timelapse_stream_delay)
 
@@ -7612,9 +7625,6 @@ addStream('Display Snapshot',streamBase+'/display/snapshot');
                     self._send_timelapse_command("timelapse_capture")
                     self.timelapse_frames += 1
                     print(f"Timelapse: Hyperlapse frame {self.timelapse_frames}", flush=True)
-
-                # Wait for interval
-                time.sleep(self.timelapse_hyperlapse_interval)
 
         self.hyperlapse_timer = threading.Thread(target=capture_loop, daemon=True)
         self.hyperlapse_timer.start()

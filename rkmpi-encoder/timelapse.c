@@ -192,6 +192,13 @@ void timelapse_set_output_dir(const char *dir) {
     if (dir && strlen(dir) > 0 && strlen(dir) < TIMELAPSE_PATH_MAX) {
         strncpy(g_timelapse.config.output_dir, dir, TIMELAPSE_PATH_MAX - 1);
         g_timelapse.config.output_dir[TIMELAPSE_PATH_MAX - 1] = '\0';
+
+        /* Strip trailing slashes to prevent double slashes in paths */
+        size_t len = strlen(g_timelapse.config.output_dir);
+        while (len > 1 && g_timelapse.config.output_dir[len - 1] == '/') {
+            g_timelapse.config.output_dir[--len] = '\0';
+        }
+
         timelapse_log("Set output directory: %s\n", g_timelapse.config.output_dir);
     }
 }
