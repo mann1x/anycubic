@@ -195,6 +195,11 @@ typedef struct {
 
 static EncoderStats g_stats = {0};
 
+/* Check if H.264 encoding is enabled (called from http_server.c) */
+int is_h264_enabled(void) {
+    return g_ctrl.h264_enabled;
+}
+
 /*
  * MJPEG frame rate control with adaptive detection
  *

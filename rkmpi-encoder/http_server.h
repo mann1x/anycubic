@@ -115,4 +115,7 @@ int flv_server_client_count(void);
 /* Set control port for homepage links (0 = use default HTTP_CONTROL_PORT) */
 void http_set_control_port(int port);
 
+/* Check if H.264 encoding is enabled (implemented in rkmpi_enc.c) */
+int is_h264_enabled(void);
+
 #endif /* HTTP_SERVER_H */

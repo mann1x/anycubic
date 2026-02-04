@@ -282,6 +282,19 @@ static void http_send_404(int fd) {
     http_send(fd, response, strlen(response));
 }
 
+/* Send 503 Service Unavailable response with custom message */
+static void http_send_503(int fd, const char *message) {
+    char response[512];
+    size_t msg_len = strlen(message);
+    int len = snprintf(response, sizeof(response),
+        "HTTP/1.1 503 Service Unavailable\r\n"
+        "Content-Type: text/plain\r\n"
+        "Content-Length: %zu\r\n"
+        "\r\n"
+        "%s", msg_len, message);
+    http_send(fd, response, len);
+}
+
 /* Send homepage */
 static void http_send_homepage(int fd, int streaming_port) {
     int control_port = g_control_port;
@@ -604,6 +617,12 @@ static void http_handle_client_read(HttpServer *srv, HttpClient *client) {
                 break;
 
             case REQUEST_FLV_STREAM:
+                /* Reject FLV connections if H.264 is disabled */
+                if (!is_h264_enabled()) {
+                    http_send_503(client->fd, "H.264 encoding is disabled");
+                    client->state = CLIENT_STATE_CLOSING;
+                    break;
+                }
                 http_send_flv_headers(client->fd);
                 client->state = CLIENT_STATE_STREAMING;
                 client->header_sent = 1;
