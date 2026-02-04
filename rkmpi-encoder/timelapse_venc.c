@@ -384,52 +384,122 @@ int timelapse_venc_add_frame(const uint8_t *jpeg_data, size_t jpeg_size) {
         return -1;
     }
 
-    /* Decode JPEG to YUV (I420 planar) then convert to NV12 */
-    /* TurboJPEG outputs I420, we need NV12 for VENC */
+    /* Calculate buffer sizes based on ACTUAL subsampling
+     * Bug fix: 4:2:2 JPEG has double the UV data compared to 4:2:0/NV12 */
     int y_size = g_state.width * g_state.height;
-    int uv_size = y_size / 4;
+    int uv_height, uv_stride;
 
-    /* Temp buffer for I420 */
-    uint8_t *i420_buf = (uint8_t *)malloc(g_state.nv12_size);
-    if (!i420_buf) {
-        TL_LOG("Failed to allocate I420 buffer\n");
+    switch (tj_subsamp) {
+        case TJSAMP_420:
+            uv_height = g_state.height / 2;
+            uv_stride = g_state.width / 2;
+            break;
+        case TJSAMP_422:
+            uv_height = g_state.height;      /* Full height for 4:2:2 */
+            uv_stride = g_state.width / 2;
+            break;
+        case TJSAMP_444:
+            uv_height = g_state.height;
+            uv_stride = g_state.width;
+            break;
+        default:
+            uv_height = g_state.height / 2;  /* Fallback to 4:2:0 */
+            uv_stride = g_state.width / 2;
+            break;
+    }
+
+    int uv_plane_size = uv_stride * uv_height;
+    size_t yuv_buf_size = y_size + 2 * uv_plane_size;
+
+    /* Allocate buffer for decoded YUV (may be larger than NV12 for 4:2:2) */
+    uint8_t *yuv_buf = (uint8_t *)malloc(yuv_buf_size);
+    if (!yuv_buf) {
+        TL_LOG("Failed to allocate YUV buffer (%zu bytes)\n", yuv_buf_size);
         return -1;
     }
 
-    /* Decode to I420 */
+    /* Set up planes based on actual subsampling */
     uint8_t *planes[3] = {
-        i420_buf,                    /* Y */
-        i420_buf + y_size,           /* U */
-        i420_buf + y_size + uv_size  /* V */
+        yuv_buf,                          /* Y */
+        yuv_buf + y_size,                 /* U */
+        yuv_buf + y_size + uv_plane_size  /* V */
     };
     int strides[3] = {
-        g_state.width,      /* Y stride */
-        g_state.width / 2,  /* U stride */
-        g_state.width / 2   /* V stride */
+        g_state.width,   /* Y stride */
+        uv_stride,       /* U stride */
+        uv_stride        /* V stride */
     };
 
     if (tjDecompressToYUVPlanes(g_state.tj_handle, jpeg_data, jpeg_size,
                                  planes, g_state.width, strides, g_state.height,
                                  TJFLAG_FASTDCT) != 0) {
         TL_LOG("tjDecompressToYUVPlanes failed: %s\n", tjGetErrorStr());
-        free(i420_buf);
+        TL_LOG("  Data: size=%zu, SOI=%02x%02x, EOI=%02x%02x, mid=%02x%02x%02x%02x\n",
+               jpeg_size, jpeg_data[0], jpeg_data[1],
+               jpeg_data[jpeg_size-2], jpeg_data[jpeg_size-1],
+               jpeg_size > 1000 ? jpeg_data[1000] : 0,
+               jpeg_size > 1001 ? jpeg_data[1001] : 0,
+               jpeg_size > 1002 ? jpeg_data[1002] : 0,
+               jpeg_size > 1003 ? jpeg_data[1003] : 0);
+        free(yuv_buf);
         return -1;
     }
 
-    /* Convert I420 to NV12 (interleave U and V) */
+    /* Convert YUV to NV12 (4:2:0 with interleaved UV) */
     /* Y plane: copy directly */
-    memcpy(g_state.nv12_buffer, i420_buf, y_size);
+    memcpy(g_state.nv12_buffer, yuv_buf, y_size);
 
-    /* UV plane: interleave U and V */
+    /* UV plane: convert to NV12 format
+     * For 4:2:0: just interleave U and V
+     * For 4:2:2: subsample vertically by 2, then interleave */
     uint8_t *nv12_uv = g_state.nv12_buffer + y_size;
-    uint8_t *i420_u = i420_buf + y_size;
-    uint8_t *i420_v = i420_buf + y_size + uv_size;
-    for (int i = 0; i < uv_size; i++) {
-        nv12_uv[i * 2] = i420_u[i];
-        nv12_uv[i * 2 + 1] = i420_v[i];
+    uint8_t *src_u = yuv_buf + y_size;
+    uint8_t *src_v = yuv_buf + y_size + uv_plane_size;
+
+    int nv12_uv_width = g_state.width / 2;
+    int nv12_uv_height = g_state.height / 2;
+
+    if (tj_subsamp == TJSAMP_420) {
+        /* 4:2:0: direct interleave */
+        for (int i = 0; i < nv12_uv_width * nv12_uv_height; i++) {
+            nv12_uv[i * 2] = src_u[i];
+            nv12_uv[i * 2 + 1] = src_v[i];
+        }
+    } else if (tj_subsamp == TJSAMP_422) {
+        /* 4:2:2: vertically subsample by 2 (average two rows), then interleave */
+        for (int y = 0; y < nv12_uv_height; y++) {
+            uint8_t *u_row0 = src_u + (y * 2) * uv_stride;
+            uint8_t *u_row1 = src_u + (y * 2 + 1) * uv_stride;
+            uint8_t *v_row0 = src_v + (y * 2) * uv_stride;
+            uint8_t *v_row1 = src_v + (y * 2 + 1) * uv_stride;
+            uint8_t *nv12_row = nv12_uv + y * g_state.width;
+
+            for (int x = 0; x < nv12_uv_width; x++) {
+                /* Average two vertical samples */
+                nv12_row[x * 2] = (u_row0[x] + u_row1[x] + 1) / 2;
+                nv12_row[x * 2 + 1] = (v_row0[x] + v_row1[x] + 1) / 2;
+            }
+        }
+    } else if (tj_subsamp == TJSAMP_444) {
+        /* 4:4:4: subsample both horizontally and vertically by 2 */
+        for (int y = 0; y < nv12_uv_height; y++) {
+            uint8_t *u_row0 = src_u + (y * 2) * g_state.width;
+            uint8_t *u_row1 = src_u + (y * 2 + 1) * g_state.width;
+            uint8_t *v_row0 = src_v + (y * 2) * g_state.width;
+            uint8_t *v_row1 = src_v + (y * 2 + 1) * g_state.width;
+            uint8_t *nv12_row = nv12_uv + y * g_state.width;
+
+            for (int x = 0; x < nv12_uv_width; x++) {
+                /* Average 2x2 block */
+                int u = (u_row0[x*2] + u_row0[x*2+1] + u_row1[x*2] + u_row1[x*2+1] + 2) / 4;
+                int v = (v_row0[x*2] + v_row0[x*2+1] + v_row1[x*2] + v_row1[x*2+1] + 2) / 4;
+                nv12_row[x * 2] = u;
+                nv12_row[x * 2 + 1] = v;
+            }
+        }
     }
 
-    free(i420_buf);
+    free(yuv_buf);
 
     /* Copy NV12 to RKMPI memory block */
     void *mb_vaddr = RK_MPI_MB_Handle2VirAddr(g_state.mb_blk);

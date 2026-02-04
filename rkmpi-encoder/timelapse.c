@@ -46,7 +46,7 @@ static void timelapse_log(const char *fmt, ...) {
  * Checks markers to detect corruption during capture.
  * Returns 1 if valid, 0 if corrupt.
  */
-static int validate_jpeg_quick(const uint8_t *data, size_t size) {
+static int validate_jpeg_full(const uint8_t *data, size_t size) {
     /* Minimum JPEG size */
     if (!data || size < 100) {
         return 0;
@@ -62,26 +62,34 @@ static int validate_jpeg_quick(const uint8_t *data, size_t size) {
         return 0;
     }
 
-    /* Quick scan for multiple SOI markers (concatenated frames) */
+    /* Full scan for multiple SOI markers (concatenated frames)
+     * This catches corruption that the quick scan misses */
     int soi_count = 0;
-    for (size_t i = 0; i < size - 1 && i < 1024; i++) {  /* Only scan first 1KB */
-        if (data[i] == 0xFF && data[i + 1] == 0xD8) {
-            soi_count++;
-            if (soi_count > 1) {
-                return 0;  /* Multiple SOI = corrupt */
+    int eoi_count = 0;
+    for (size_t i = 0; i < size - 1; i++) {
+        if (data[i] == 0xFF) {
+            uint8_t marker = data[i + 1];
+            if (marker == 0xD8) {  /* SOI */
+                soi_count++;
+                if (soi_count > 1) {
+                    return 0;  /* Multiple SOI = concatenated frames */
+                }
+            } else if (marker == 0xD9) {  /* EOI */
+                eoi_count++;
+                /* EOI should only appear at the very end */
+                if (i != size - 2) {
+                    return 0;  /* Premature EOI = truncated or concatenated */
+                }
             }
         }
     }
 
-    /* Check for premature EOI (not at end) - scan last 1KB only */
-    size_t scan_start = (size > 1024) ? size - 1024 : 0;
-    for (size_t i = scan_start; i < size - 2; i++) {
-        if (data[i] == 0xFF && data[i + 1] == 0xD9) {
-            return 0;  /* EOI before end = corrupt */
-        }
+    /* Sanity check: exactly one SOI and one EOI */
+    if (soi_count != 1 || eoi_count != 1) {
+        return 0;
     }
 
-    return 1;  /* Looks valid */
+    return 1;  /* Valid JPEG structure */
 }
 
 /*
@@ -491,8 +499,8 @@ int timelapse_capture_frame(void) {
     }
     last_sequence = sequence;
 
-    /* Validate JPEG before saving (quick marker check, no decode) */
-    if (!validate_jpeg_quick(jpeg_buf, jpeg_size)) {
+    /* Validate JPEG before saving (full marker scan, no decode) */
+    if (!validate_jpeg_full(jpeg_buf, jpeg_size)) {
         timelapse_log("Frame %d: corrupt JPEG (seq %llu, %zu bytes), skipping\n",
                       g_timelapse.frame_count, (unsigned long long)sequence, jpeg_size);
         free(jpeg_buf);
@@ -722,8 +730,24 @@ int timelapse_finalize(void) {
                 continue;
             }
 
-            fread(jpeg_buf, 1, jpeg_size, f);
+            size_t bytes_read = fread(jpeg_buf, 1, jpeg_size, f);
             fclose(f);
+
+            if (bytes_read != jpeg_size) {
+                timelapse_log("VENC: frame %d read incomplete (%zu/%zu)\n",
+                              i, bytes_read, jpeg_size);
+                venc_errors++;
+                continue;
+            }
+
+            /* Validate JPEG before encoding */
+            if (!validate_jpeg_full(jpeg_buf, jpeg_size)) {
+                timelapse_log("VENC: frame %d on disk is corrupt (%zu bytes, SOI=%02x%02x, EOI=%02x%02x)\n",
+                              i, jpeg_size, jpeg_buf[0], jpeg_buf[1],
+                              jpeg_buf[jpeg_size-2], jpeg_buf[jpeg_size-1]);
+                venc_errors++;
+                continue;
+            }
 
             if (timelapse_venc_add_frame(jpeg_buf, jpeg_size) != 0) {
                 venc_errors++;
