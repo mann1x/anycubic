@@ -626,8 +626,9 @@ static void http_handle_client_read(HttpServer *srv, HttpClient *client) {
                 http_send_flv_headers(client->fd);
                 client->state = CLIENT_STATE_STREAMING;
                 client->header_sent = 1;
-                /* Skip stale frame in buffer - wait for next fresh frame */
-                client->last_frame_seq = frame_buffer_get_sequence(&g_h264_buffer);
+                /* Set to 0 so FLV thread knows to send FLV header/metadata
+                 * The FLV thread will then set it to current seq after sending headers */
+                client->last_frame_seq = 0;
 
                 /* Allocate send buffer for FLV */
                 client->send_buf = malloc(HTTP_SEND_BUF_SIZE);
@@ -917,6 +918,10 @@ static void *flv_server_thread(void *arg) {
                         if (meta_size > 0) {
                             http_send(srv->clients[i].fd, flv_buf, meta_size);
                         }
+
+                        /* Mark headers as sent by setting seq to current
+                         * This also ensures we wait for fresh frames */
+                        srv->clients[i].last_frame_seq = frame_buffer_get_sequence(&g_h264_buffer);
                     }
                 }
             }
