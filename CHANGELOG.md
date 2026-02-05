@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## h264-streamer
 
+### [1.5.0] - 2025-02-05
+
+#### Added
+- Multi-camera support for up to 4 USB cameras with individual settings
+- Moonraker Camera Settings panel for per-camera provisioning with custom names
+- Dynamic resolution detection via V4L2 ioctls
+- Per-camera V4L2 controls (brightness, contrast, etc.)
+- Camera selector UI in control page
+- New API endpoints: `/api/cameras`, `/api/camera/enable`, `/api/camera/disable`, `/api/camera/settings`, `/api/moonraker/cameras`
+- Restart command in app.sh for cleaner encoder restarts
+
+#### Changed
+- Improved CAM#2 enable/disable toggle button styling (ON/OFF text)
+- Moonraker provisioning now uses saved per-camera settings
+
+### [1.4.0] - 2025-02-04
+
+#### Added
+- USB camera V4L2 controls (brightness, contrast, exposure, etc.)
+- Camera Controls panel with real-time adjustment
+- Hardware VENC timelapse encoding (no ffmpeg dependency)
+- Timelapse first layer detection improvements
+
+#### Fixed
+- Timelapse capture timing for better first/last frames
+- FLV headers not sent when H.264 already running
+- Return 503 for /flv when H.264 encoding is disabled
+
 ### [1.3.0] - 2025-02-03
 
 #### Added
@@ -53,6 +81,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ---
 
 ## rkmpi-encoder
+
+### [1.4.0] - 2025-02-05
+
+#### Added
+- Multi-camera support with `--no-flv` flag for secondary cameras
+- Per-camera command/control files via `--cmd-file` and `--ctrl-file` options
+- USB camera V4L2 controls support (brightness, contrast, exposure, etc.)
+- JPEG frame validation to prevent white/corrupt frames
+
+#### Fixed
+- VENC channel conflicts when multiple encoders run simultaneously
+- Timelapse VENC encoding bugs and buffer overflow for 4:2:2 JPEG
+
+### [1.3.0] - 2025-02-04
+
+#### Added
+- Hardware VENC timelapse encoding with minimp4 muxer
+- Deferred timelapse encoding and unified command file architecture
+- Pre-validation of JPEG header before decompression
+
+#### Fixed
+- VENC channel conflict between display and timelapse
+- Compiler warnings in timelapse_venc.c
 
 ### [1.2.0] - 2025-02-03
 
