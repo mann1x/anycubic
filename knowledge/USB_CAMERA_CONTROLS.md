@@ -64,6 +64,27 @@ The USB camera does NOT support `V4L2_CID_JPEG_COMPRESSION_QUALITY`.
 - rkmpi_enc encodes to JPEG via hardware VENC
 - Quality controlled by `--jpeg-quality` parameter (1-100, default 85)
 
+## Multi-Camera Control
+
+For multi-camera setups (up to 4 cameras), each camera has its own control files:
+
+| Camera | Command File | Control File |
+|--------|--------------|--------------|
+| CAM#1 | /tmp/h264_cmd | /tmp/h264_ctrl |
+| CAM#2 | /tmp/h264_cmd_2 | /tmp/h264_ctrl_2 |
+| CAM#3 | /tmp/h264_cmd_3 | /tmp/h264_ctrl_3 |
+| CAM#4 | /tmp/h264_cmd_4 | /tmp/h264_ctrl_4 |
+
+Each encoder instance is started with `--cmd-file` and `--ctrl-file` options to specify the appropriate files. This prevents interference between camera controls when multiple encoders are running.
+
+**Example secondary camera launch:**
+```bash
+rkmpi_enc -S -N -v --no-flv --streaming-port 8082 -d /dev/video12 \
+    --cmd-file /tmp/h264_cmd_2 --ctrl-file /tmp/h264_ctrl_2 -y
+```
+
+The h264_server.py manages which control file to write to based on the active camera selection in the UI.
+
 ## Implementation in rkmpi_enc
 
 ### Data Structures

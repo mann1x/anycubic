@@ -1522,6 +1522,98 @@ def update_moonraker_webcam_config(ip_address, port=8080, target_fps=10):
     return True
 
 
+def delete_moonraker_webcam(webcam_name):
+    """Delete a webcam from Moonraker configuration"""
+    try:
+        req = urllib.request.Request(
+            f"http://127.0.0.1:7125/server/webcams/item?name={urllib.parse.quote(webcam_name)}",
+            method="DELETE"
+        )
+        with urllib.request.urlopen(req, timeout=5):
+            print(f"Deleted moonraker webcam: {webcam_name}", flush=True)
+        return True
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return True  # Already doesn't exist
+        print(f"Failed to delete webcam {webcam_name}: {e}", flush=True)
+        return False
+    except Exception as e:
+        print(f"Failed to delete webcam {webcam_name}: {e}", flush=True)
+        return False
+
+
+def provision_moonraker_webcam(ip_address, port, webcam_name, target_fps=10, set_default=False):
+    """Provision a single webcam to Moonraker"""
+    if not ip_address:
+        return False
+
+    stream_url = f"http://{ip_address}:{port}/stream"
+    snapshot_url = f"http://{ip_address}:{port}/snapshot"
+
+    try:
+        webcam_data = {
+            "name": webcam_name,
+            "enabled": True,
+            "service": "mjpegstreamer-adaptive",
+            "target_fps": target_fps,
+            "target_fps_idle": 1,
+            "stream_url": stream_url,
+            "snapshot_url": snapshot_url,
+            "rotation": 0,
+            "flip_horizontal": False,
+            "flip_vertical": False
+        }
+
+        req = urllib.request.Request(
+            "http://127.0.0.1:7125/server/webcams/item",
+            data=json.dumps(webcam_data).encode('utf-8'),
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=5):
+            print(f"Provisioned moonraker webcam '{webcam_name}': {stream_url}", flush=True)
+    except Exception as e:
+        print(f"Moonraker API provision failed for {webcam_name}: {e}", flush=True)
+        return False
+
+    # Set as default webcam if requested
+    if set_default:
+        try:
+            mainsail_data = {
+                "namespace": "mainsail",
+                "key": "view.webcam.currentCam",
+                "value": {"dashboard": webcam_name, "page": webcam_name}
+            }
+
+            req = urllib.request.Request(
+                "http://127.0.0.1:7125/server/database/item",
+                data=json.dumps(mainsail_data).encode('utf-8'),
+                headers={"Content-Type": "application/json"},
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=5):
+                print(f"Set '{webcam_name}' as default dashboard webcam", flush=True)
+        except Exception:
+            pass
+
+    return True
+
+
+def get_moonraker_webcams():
+    """Get list of webcams currently configured in Moonraker"""
+    try:
+        req = urllib.request.Request(
+            "http://127.0.0.1:7125/server/webcams/list",
+            method="GET"
+        )
+        with urllib.request.urlopen(req, timeout=5) as response:
+            data = json.loads(response.read().decode('utf-8'))
+            return data.get('result', {}).get('webcams', [])
+    except Exception as e:
+        print(f"Failed to get moonraker webcams: {e}", flush=True)
+        return []
+
+
 # ============================================================================
 # CPU Usage Monitoring
 # ============================================================================
@@ -3403,6 +3495,50 @@ class StreamerApp:
         # Save to config file
         self.save_config()
 
+    def _provision_moonraker_cameras(self):
+        """Provision cameras to Moonraker based on saved settings."""
+        if not self.current_ip:
+            return
+
+        provisioned = []
+        default_cam_name = None
+
+        for cam in self.cameras:
+            unique_id = cam.get('unique_id', f"camera_{cam['id']}")
+            cam_settings = self.camera_settings.get(unique_id, {})
+
+            # Check if moonraker provisioning is enabled for this camera
+            # Default: primary camera is enabled and default if no settings exist
+            if not cam_settings:
+                # No settings yet - use defaults (primary only)
+                if cam['id'] == 1:
+                    moonraker_enabled = True
+                    moonraker_name = "USB Camera"
+                    is_default = True
+                else:
+                    moonraker_enabled = False
+                    moonraker_name = f"USB Camera {cam['id']}"
+                    is_default = False
+            else:
+                moonraker_enabled = cam_settings.get('moonraker_enabled', cam['id'] == 1)
+                moonraker_name = cam_settings.get('moonraker_name', f"USB Camera{'' if cam['id'] == 1 else ' ' + str(cam['id'])}")
+                is_default = cam_settings.get('moonraker_default', cam['id'] == 1)
+
+            if moonraker_enabled and cam.get('enabled', True):
+                # Provision this camera
+                port = cam.get('streaming_port', 8080 if cam['id'] == 1 else 8080 + cam['id'] + 1)
+                fps = cam_settings.get('mjpeg_fps', self.mjpeg_fps_target)
+
+                if provision_moonraker_webcam(self.current_ip, port, moonraker_name, fps, is_default):
+                    provisioned.append(moonraker_name)
+                    if is_default:
+                        default_cam_name = moonraker_name
+
+        if provisioned:
+            print(f"Provisioned {len(provisioned)} camera(s) to Moonraker: {', '.join(provisioned)}", flush=True)
+            if default_cam_name:
+                print(f"Default dashboard webcam: {default_cam_name}", flush=True)
+
     def start(self):
         """Start the streamer"""
         self.running = True
@@ -3440,7 +3576,7 @@ class StreamerApp:
         self.current_ip = get_ip_address()
         if self.current_ip:
             print(f"Printer IP: {self.current_ip}", flush=True)
-            update_moonraker_webcam_config(self.current_ip, self.streaming_port, self.mjpeg_fps_target)
+            self._provision_moonraker_cameras()
 
         # Start control server (both modes)
         threading.Thread(target=self._run_control_server, daemon=True).start()
@@ -4190,7 +4326,7 @@ class StreamerApp:
                 if new_ip and new_ip != self.current_ip:
                     print(f"IP changed: {self.current_ip} -> {new_ip}", flush=True)
                     self.current_ip = new_ip
-                    update_moonraker_webcam_config(new_ip, self.streaming_port, self.mjpeg_fps_target)
+                    self._provision_moonraker_cameras()
             except Exception as e:
                 print(f"IP monitor error: {e}", flush=True)
 
@@ -4510,6 +4646,20 @@ class StreamerApp:
                     if body_start != -1:
                         body = request[body_start+4:body_start+4+content_length]
                 self._handle_camera_settings(client, body)
+            # Moonraker camera settings
+            elif path == '/api/moonraker/cameras' and method == 'GET':
+                self._serve_moonraker_cameras(client)
+            elif path == '/api/moonraker/cameras' and method == 'POST':
+                content_length = 0
+                for line in request.split('\r\n'):
+                    if line.lower().startswith('content-length:'):
+                        content_length = int(line.split(':')[1].strip())
+                body = ''
+                if content_length > 0:
+                    body_start = request.find('\r\n\r\n')
+                    if body_start != -1:
+                        body = request[body_start+4:body_start+4+content_length]
+                self._handle_moonraker_cameras(client, body)
             else:
                 self._serve_404(client)
         except Exception:
@@ -4912,9 +5062,9 @@ class StreamerApp:
         .camera-selector button.active::before {{ content: '\\25CF'; margin-right: 4px; }}
         .camera-selector button:disabled {{ background: #555; cursor: not-allowed; opacity: 0.6; }}
         .camera-selector button:disabled:hover {{ background: #555; }}
-        .cam-enable-toggle {{ font-size: 10px; vertical-align: middle; margin-left: 3px; cursor: pointer; padding: 2px 4px; border-radius: 2px; background: #333; color: #888; }}
-        .cam-enable-toggle:hover {{ background: #444; color: #fff; }}
-        .cam-enable-toggle.enabled {{ background: #1a472a; color: #4CAF50; }}
+        .cam-enable-toggle {{ display: inline-block; vertical-align: middle; margin-left: 4px; cursor: pointer; padding: 4px 8px; border-radius: 4px; background: #444; color: #888; font-size: 11px; font-weight: bold; border: 1px solid #555; }}
+        .cam-enable-toggle:hover {{ background: #555; color: #fff; border-color: #666; }}
+        .cam-enable-toggle.enabled {{ background: #1a5c2e; color: #4CAF50; border-color: #2d7a45; }}
         .tab-content {{ display: none; }}
         .tab-content.active {{ display: block; }}
         .stats-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }}
@@ -5598,6 +5748,19 @@ class StreamerApp:
         </div>
 
         <div class="section">
+            <h2>Moonraker Camera Settings</h2>
+            <p style="color:#888;font-size:12px;margin-bottom:15px;">Configure which cameras are provisioned to Moonraker for the dashboard and web UI.</p>
+            <div id="moonraker-cameras-list">
+                <!-- Populated by JavaScript -->
+                <div style="color:#888;font-size:12px;">Loading cameras...</div>
+            </div>
+            <div style="margin-top:15px;">
+                <button type="button" onclick="applyMoonrakerSettings()">Apply Moonraker Settings</button>
+                <span id="moonraker-status" style="margin-left:10px;font-size:12px;"></span>
+            </div>
+        </div>
+
+        <div class="section">
             <h2>Status</h2>
             <div class="row">
                 <span class="label">Encoder:</span>
@@ -5716,8 +5879,9 @@ class StreamerApp:
                 // Secondary cameras: show with enable/disable toggle and error indicator
                 const toggleClass = isEnabled ? 'enabled' : '';
                 const toggleTitle = isEnabled ? 'Click to disable' : 'Click to enable';
+                const toggleText = isEnabled ? 'ON' : 'OFF';
                 const errorIndicator = hasError ? '<span style="color:#f44;margin-left:2px;">!</span>' : '';
-                return `<button class="${{isActive ? 'active' : ''}}" ${{isEnabled && !hasError ? '' : 'disabled'}} onclick="switchCamera(${{cam.id}})" title="${{title}}">CAM#${{cam.id}}${{errorIndicator}}</button><span class="cam-enable-toggle ${{toggleClass}}" title="${{toggleTitle}}" onclick="toggleCameraEnabled(${{cam.id}}, ${{!isEnabled}})">${{isEnabled ? '&bull;' : 'o'}}</span>`;
+                return `<button class="${{isActive ? 'active' : ''}}" ${{isEnabled && !hasError ? '' : 'disabled'}} onclick="switchCamera(${{cam.id}})" title="${{title}}">CAM#${{cam.id}}${{errorIndicator}}</button><span class="cam-enable-toggle ${{toggleClass}}" title="${{toggleTitle}}" onclick="toggleCameraEnabled(${{cam.id}}, ${{!isEnabled}})">${{toggleText}}</span>`;
             }}).join('');
 
             updateCameraStatusPanel();
@@ -5868,6 +6032,109 @@ class StreamerApp:
             .catch(err => alert('Camera toggle error: ' + err));
         }}
 
+        // Moonraker Camera Settings
+        let moonrakerCameraSettings = {{}};
+
+        function loadMoonrakerCameraSettings() {{
+            fetch('/api/moonraker/cameras')
+                .then(r => r.json())
+                .then(data => {{
+                    moonrakerCameraSettings = data.settings || {{}};
+                    renderMoonrakerCamerasList(data.cameras || []);
+                }})
+                .catch(err => console.log('Moonraker settings load error:', err));
+        }}
+
+        function renderMoonrakerCamerasList(cameraList) {{
+            const container = document.getElementById('moonraker-cameras-list');
+            if (!container) return;
+
+            if (cameraList.length === 0) {{
+                container.innerHTML = '<div style="color:#888;font-size:12px;">No cameras detected.</div>';
+                return;
+            }}
+
+            let html = '<table style="width:100%;border-collapse:collapse;font-size:12px;">';
+            html += '<tr style="border-bottom:1px solid #444;"><th style="text-align:left;padding:5px;">Camera</th><th style="text-align:left;padding:5px;">Name in Moonraker</th><th style="text-align:center;padding:5px;">Provision</th><th style="text-align:center;padding:5px;">Default</th></tr>';
+
+            cameraList.forEach(cam => {{
+                const uniqueId = cam.unique_id || `camera_${{cam.id}}`;
+                const settings = moonrakerCameraSettings[uniqueId] || {{}};
+                const moonrakerName = settings.moonraker_name || `USB Camera ${{cam.id === 1 ? '' : cam.id}}`.trim();
+                const moonrakerEnabled = settings.moonraker_enabled !== false;  // Default true
+                const isDefault = settings.moonraker_default === true;
+                const portInfo = cam.streaming_port ? ` (port ${{cam.streaming_port}})` : '';
+
+                html += `<tr style="border-bottom:1px solid #333;">`;
+                html += `<td style="padding:8px 5px;"><strong>CAM#${{cam.id}}</strong><br><span style="color:#888;font-size:11px;">${{cam.name}}${{portInfo}}</span></td>`;
+                html += `<td style="padding:8px 5px;"><input type="text" id="mr-name-${{cam.id}}" value="${{moonrakerName}}" data-unique-id="${{uniqueId}}" style="width:150px;padding:4px;background:#222;border:1px solid #444;color:#fff;border-radius:3px;"></td>`;
+                html += `<td style="padding:8px 5px;text-align:center;"><input type="checkbox" id="mr-enabled-${{cam.id}}" ${{moonrakerEnabled ? 'checked' : ''}} data-unique-id="${{uniqueId}}" style="width:18px;height:18px;cursor:pointer;"></td>`;
+                html += `<td style="padding:8px 5px;text-align:center;"><input type="radio" name="mr-default" id="mr-default-${{cam.id}}" value="${{cam.id}}" ${{isDefault ? 'checked' : ''}} data-unique-id="${{uniqueId}}" style="width:18px;height:18px;cursor:pointer;"></td>`;
+                html += `</tr>`;
+            }});
+
+            html += '</table>';
+            container.innerHTML = html;
+        }}
+
+        function applyMoonrakerSettings() {{
+            const statusEl = document.getElementById('moonraker-status');
+            statusEl.textContent = 'Applying...';
+            statusEl.style.color = '#888';
+
+            // Gather settings from form
+            const settings = {{}};
+            let defaultCamId = null;
+
+            document.querySelectorAll('#moonraker-cameras-list input[type="text"]').forEach(input => {{
+                const camId = input.id.replace('mr-name-', '');
+                const uniqueId = input.dataset.uniqueId;
+                if (!settings[uniqueId]) settings[uniqueId] = {{}};
+                settings[uniqueId].moonraker_name = input.value.trim() || `USB Camera ${{camId}}`;
+            }});
+
+            document.querySelectorAll('#moonraker-cameras-list input[type="checkbox"]').forEach(input => {{
+                const uniqueId = input.dataset.uniqueId;
+                if (!settings[uniqueId]) settings[uniqueId] = {{}};
+                settings[uniqueId].moonraker_enabled = input.checked;
+            }});
+
+            document.querySelectorAll('#moonraker-cameras-list input[type="radio"]').forEach(input => {{
+                const uniqueId = input.dataset.uniqueId;
+                if (!settings[uniqueId]) settings[uniqueId] = {{}};
+                settings[uniqueId].moonraker_default = input.checked;
+                if (input.checked) defaultCamId = input.value;
+            }});
+
+            fetch('/api/moonraker/cameras', {{
+                method: 'POST',
+                headers: {{'Content-Type': 'application/json'}},
+                body: JSON.stringify({{settings: settings}})
+            }})
+            .then(r => r.json())
+            .then(data => {{
+                if (data.status === 'ok') {{
+                    statusEl.textContent = 'Settings applied!';
+                    statusEl.style.color = '#4CAF50';
+                    moonrakerCameraSettings = settings;
+                    setTimeout(() => {{ statusEl.textContent = ''; }}, 3000);
+                }} else {{
+                    statusEl.textContent = 'Error: ' + (data.message || 'Unknown error');
+                    statusEl.style.color = '#f44';
+                }}
+            }})
+            .catch(err => {{
+                statusEl.textContent = 'Error: ' + err;
+                statusEl.style.color = '#f44';
+            }});
+        }}
+
+        // Load moonraker settings when cameras are loaded
+        function loadCamerasAndMoonraker() {{
+            loadCameras();
+            loadMoonrakerCameraSettings();
+        }}
+
         function refreshPreview() {{
             const previewImg = document.getElementById('preview-img');
             if (previewImg && currentTab === 'snapshot') {{
@@ -5878,7 +6145,7 @@ class StreamerApp:
             }}
         }}
 
-        document.addEventListener('DOMContentLoaded', loadCameras);
+        document.addEventListener('DOMContentLoaded', loadCamerasAndMoonraker);
 
         // Show/hide settings based on encoder type
         function updateEncoderVisibility() {{
@@ -6843,9 +7110,9 @@ if(flvjs.isSupported()){{
         # Save to persistent config
         self.save_config()
 
-        # Update moonraker webcam config with new target FPS
+        # Re-provision moonraker cameras with updated settings
         if self.current_ip:
-            update_moonraker_webcam_config(self.current_ip, self.streaming_port, self.mjpeg_fps_target)
+            self._provision_moonraker_cameras()
 
         # Redirect back
         response = (
@@ -7453,6 +7720,128 @@ addStream('Display Snapshot',streamBase+'/display/snapshot');
                 result = {'status': 'ok', 'message': f'Camera #{camera_id} settings applied and restarted'}
             else:
                 result = {'status': 'ok', 'message': f'Camera #{camera_id} settings saved'}
+
+        except Exception as e:
+            result = {'status': 'error', 'message': str(e)}
+
+        body = json.dumps(result)
+        response = (
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        ) + body
+        client.sendall(response.encode())
+
+    def _serve_moonraker_cameras(self, client):
+        """Serve list of cameras with their Moonraker settings"""
+        cameras = []
+        for cam in self.cameras:
+            cam_id = cam['id']
+            unique_id = cam.get('unique_id', f"camera_{cam_id}")
+            cameras.append({
+                'id': cam_id,
+                'name': cam['name'],
+                'unique_id': unique_id,
+                'streaming_port': cam.get('streaming_port', 8080 if cam_id == 1 else 8080 + cam_id + 1),
+                'is_primary': cam.get('is_primary', cam_id == 1),
+                'enabled': cam.get('enabled', cam_id == 1)
+            })
+
+        # Get moonraker settings from camera_settings
+        settings = {}
+        for cam in cameras:
+            unique_id = cam['unique_id']
+            cam_settings = self.camera_settings.get(unique_id, {})
+            settings[unique_id] = {
+                'moonraker_enabled': cam_settings.get('moonraker_enabled', cam['id'] == 1),  # Default: only primary
+                'moonraker_name': cam_settings.get('moonraker_name', f"USB Camera{'' if cam['id'] == 1 else ' ' + str(cam['id'])}"),
+                'moonraker_default': cam_settings.get('moonraker_default', cam['id'] == 1)  # Default: primary is default
+            }
+
+        result = {'cameras': cameras, 'settings': settings}
+        body = json.dumps(result)
+        response = (
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        ) + body
+        client.sendall(response.encode())
+
+    def _handle_moonraker_cameras(self, client, body: str):
+        """Update Moonraker camera settings and provision webcams"""
+        try:
+            data = json.loads(body) if body else {}
+            new_settings = data.get('settings', {})
+
+            if not new_settings:
+                raise ValueError("No settings provided")
+
+            # Validate and save settings
+            default_count = 0
+            for unique_id, cam_settings in new_settings.items():
+                if cam_settings.get('moonraker_default'):
+                    default_count += 1
+
+            if default_count > 1:
+                raise ValueError("Only one camera can be the default")
+
+            # Find default camera if none selected
+            if default_count == 0:
+                # Set primary camera as default
+                for cam in self.cameras:
+                    unique_id = cam.get('unique_id', f"camera_{cam['id']}")
+                    if unique_id in new_settings:
+                        new_settings[unique_id]['moonraker_default'] = (cam['id'] == 1)
+
+            # Update camera_settings with moonraker settings
+            for unique_id, cam_settings in new_settings.items():
+                if unique_id not in self.camera_settings:
+                    self.camera_settings[unique_id] = {}
+                self.camera_settings[unique_id]['moonraker_enabled'] = cam_settings.get('moonraker_enabled', False)
+                self.camera_settings[unique_id]['moonraker_name'] = cam_settings.get('moonraker_name', 'USB Camera')
+                self.camera_settings[unique_id]['moonraker_default'] = cam_settings.get('moonraker_default', False)
+
+            # Save config
+            self.save_config()
+
+            # Provision to Moonraker
+            provisioned = []
+            default_cam_name = None
+
+            for cam in self.cameras:
+                unique_id = cam.get('unique_id', f"camera_{cam['id']}")
+                cam_settings = self.camera_settings.get(unique_id, {})
+                moonraker_enabled = cam_settings.get('moonraker_enabled', False)
+                moonraker_name = cam_settings.get('moonraker_name', f"USB Camera {cam['id']}")
+                is_default = cam_settings.get('moonraker_default', False)
+
+                if moonraker_enabled and cam.get('enabled', True):
+                    # Provision this camera
+                    port = cam.get('streaming_port', 8080 if cam['id'] == 1 else 8080 + cam['id'] + 1)
+                    fps = cam_settings.get('mjpeg_fps', self.mjpeg_fps_target)
+
+                    if provision_moonraker_webcam(self.current_ip, port, moonraker_name, fps, is_default):
+                        provisioned.append(moonraker_name)
+                        if is_default:
+                            default_cam_name = moonraker_name
+                else:
+                    # Delete from Moonraker if disabled
+                    moonraker_name = cam_settings.get('moonraker_name')
+                    if moonraker_name:
+                        delete_moonraker_webcam(moonraker_name)
+
+            result = {
+                'status': 'ok',
+                'message': f"Provisioned {len(provisioned)} camera(s) to Moonraker",
+                'provisioned': provisioned,
+                'default': default_cam_name
+            }
 
         except Exception as e:
             result = {'status': 'error', 'message': str(e)}

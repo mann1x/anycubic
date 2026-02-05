@@ -29,7 +29,10 @@ Native USB camera capture with RV1106 hardware H.264 encoding.
 ### h264-streamer
 HTTP streaming application for Rinkhals custom firmware.
 - MJPEG and H.264 FLV streaming
+- **Multi-camera support** - up to 4 USB cameras with individual settings
 - **Display capture** for remote LCD viewing (RGA hardware rotation)
+- **Camera controls** - real-time V4L2 adjustments via web UI
+- **Moonraker camera settings** - per-camera provisioning with custom names
 - Web control interface with live preview
 - Moonraker webcam integration
 - CPU-based auto frame skipping
@@ -158,24 +161,40 @@ sshpass -p 'rockchip' ssh root@$PRINTER_IP "tail -20 /tmp/rinkhals/app-h264-stre
 |------|-------------|
 | `/useremain/home/rinkhals/apps/29-h264-streamer/` | h264-streamer app directory |
 | `/useremain/home/rinkhals/apps/29-h264-streamer.config` | Persistent config file (JSON) |
-| `/tmp/h264_ctrl` | Runtime control file (encoder ↔ Python) |
+| `/tmp/h264_cmd` | Command file for CAM#1 (Python → encoder) |
+| `/tmp/h264_ctrl` | Control/stats file for CAM#1 (encoder ↔ Python) |
+| `/tmp/h264_cmd_N` | Command file for CAM#N (N=2,3,4) |
+| `/tmp/h264_ctrl_N` | Control/stats file for CAM#N |
 | `/tmp/rinkhals/app-h264-streamer.log` | Application log file |
 
 ### Control File Format
 
-The `/tmp/h264_ctrl` file is used for bidirectional communication:
+Each camera has separate command and control files. For CAM#1, they are `/tmp/h264_cmd` and `/tmp/h264_ctrl`. For CAM#2-4, they are `/tmp/h264_cmd_N` and `/tmp/h264_ctrl_N`.
 
-**Written by h264_server.py:**
+**Command file (written by h264_server.py):**
 - `h264=0|1` - Enable/disable H.264 encoding
 - `display_enabled=0|1` - Enable/disable display capture
 - `display_fps=N` - Display capture frame rate
+- `mjpeg_fps=N` - Target MJPEG frame rate
+- `cam_brightness=N` - Camera brightness (0-255)
+- `cam_contrast=N` - Camera contrast (0-255)
+- `cam_*` - Other V4L2 camera controls
 
-**Written by rkmpi_enc:**
+**Control file (written by rkmpi_enc):**
 - `mjpeg_fps=N.N` - Current MJPEG output FPS
 - `h264_fps=N.N` - Current H.264 output FPS
 - `mjpeg_clients=N` - Connected MJPEG clients
 - `flv_clients=N` - Connected FLV clients
 - `camera_max_fps=N` - Detected camera max FPS
+
+### Multi-Camera Port Allocation
+
+| Camera | Streaming Port | Command File | Control File |
+|--------|---------------|--------------|--------------|
+| CAM#1 | 8080 | /tmp/h264_cmd | /tmp/h264_ctrl |
+| CAM#2 | 8082 | /tmp/h264_cmd_2 | /tmp/h264_ctrl_2 |
+| CAM#3 | 8083 | /tmp/h264_cmd_3 | /tmp/h264_ctrl_3 |
+| CAM#4 | 8084 | /tmp/h264_cmd_4 | /tmp/h264_ctrl_4 |
 
 ---
 

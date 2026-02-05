@@ -70,10 +70,11 @@ USB Camera (YUYV) → rkmpi_enc → YUYV→NV12 (CPU) → VENC Ch0 → H.264 FIF
 Python HTTP server that:
 - Manages LAN mode via local binary API (port 18086)
 - Kills gkcam when LAN mode is enabled (to free the camera)
-- Spawns rkmpi_enc subprocess
+- Spawns rkmpi_enc subprocess (one per enabled camera)
 - Reads MJPEG from encoder stdout and H.264 from FIFO
 - Provides FLV muxing for H.264 streams
 - Monitors CPU usage
+- Multi-camera management (up to 4 cameras)
 
 ### rkmpi_enc
 Native binary encoder built with RV1106 SDK:
@@ -180,6 +181,265 @@ The `/control` endpoint (on port 8081) provides a web UI with:
   "autolanmode": true
 }
 ```
+
+---
+
+## Multi-Camera Support
+
+h264-streamer supports up to 4 USB cameras simultaneously, with per-camera settings and control.
+
+### Port Allocation
+
+| Camera | Streaming Port | Control File | Description |
+|--------|---------------|--------------|-------------|
+| CAM#1 | 8080 | /tmp/h264_cmd | Primary camera (full H.264 + MJPEG) |
+| CAM#2 | 8082 | /tmp/h264_cmd_2 | Secondary camera (MJPEG only) |
+| CAM#3 | 8083 | /tmp/h264_cmd_3 | Secondary camera (MJPEG only) |
+| CAM#4 | 8084 | /tmp/h264_cmd_4 | Secondary camera (MJPEG only) |
+
+**Note:** Secondary cameras use `--no-flv` mode which disables H.264/FLV to avoid VENC resource conflicts.
+
+### Camera Discovery
+
+Cameras are discovered via `/dev/v4l/by-id/` symlinks and sorted with the internal camera first (USB port 1.3). Each camera is assigned:
+- **unique_id**: Stable identifier from by-id symlink (persists across reboots)
+- **id**: Camera number (1-4, assigned after sorting)
+- **streaming_port**: Port for this camera's encoder
+
+### Dynamic Resolution Detection
+
+Resolutions are detected dynamically via V4L2 `VIDIOC_ENUM_FRAMESIZES` ioctl:
+```python
+def detect_camera_resolutions(device, pixel_format='YUYV'):
+    """Detect all supported resolutions for a camera using V4L2 ioctls."""
+    # Uses VIDIOC_ENUM_FRAMESIZES to enumerate discrete or stepwise sizes
+    # Returns list of (width, height) tuples sorted by resolution
+```
+
+This allows the UI to show only resolutions actually supported by each camera.
+
+### Per-Camera Settings
+
+Each camera has its own settings stored by unique_id:
+```json
+{
+  "cameras": {
+    "usb-SunplusIT_Inc_HD_Camera-video-index0": {
+      "enabled": true,
+      "mjpeg_fps": 10,
+      "resolution": "640x480",
+      "cam_brightness": 0,
+      "cam_contrast": 32
+    },
+    "usb-Another_Camera-video-index0": {
+      "enabled": false,
+      "mjpeg_fps": 5,
+      "resolution": "640x480"
+    }
+  }
+}
+```
+
+### Secondary Camera Modes
+
+Secondary cameras (CAM#2-4) support:
+- **YUYV mode**: Lower USB bandwidth, hardware JPEG encoding
+- **Lower resolutions**: 640x480, 800x600 to fit USB bandwidth constraints
+
+**USB Bandwidth Limitations:**
+- Total USB 2.0 bandwidth: ~35-40 MB/s
+- Multiple 720p MJPEG cameras can exhaust bandwidth
+- Secondary cameras typically need 640x480 or lower
+
+### API Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/cameras` | GET | List all cameras with status, ports, settings |
+| `/api/camera/enable` | POST | Enable camera, start its encoder |
+| `/api/camera/disable` | POST | Disable camera, stop its encoder |
+| `/api/camera/settings` | POST | Update camera resolution/FPS (requires restart) |
+
+### Camera List API Response (`/api/cameras`)
+```json
+{
+  "cameras": [
+    {
+      "id": 1,
+      "unique_id": "usb-SunplusIT_Inc_HD_Camera-video-index0",
+      "name": "SunplusIT Inc HD Camera",
+      "device": "/dev/video10",
+      "usb_port": "1.3",
+      "enabled": true,
+      "streaming_port": 8080,
+      "is_primary": true,
+      "resolution": "1280x720",
+      "fps": 10,
+      "resolutions": [[1280, 720], [640, 480], [320, 240]]
+    },
+    {
+      "id": 2,
+      "unique_id": "usb-Another_Camera-video-index0",
+      "name": "Another Camera",
+      "device": "/dev/video12",
+      "usb_port": "1.4",
+      "enabled": false,
+      "streaming_port": 8082,
+      "is_primary": false,
+      "resolution": "640x480",
+      "fps": 5,
+      "resolutions": [[640, 480], [320, 240]]
+    }
+  ],
+  "active_camera_id": 1
+}
+```
+
+### Control Page UI
+
+**Camera Selector Row:**
+- Shows `CAM#1`, `CAM#2`, etc. buttons next to Live Preview tabs
+- Only visible when multiple cameras are detected
+- Disabled cameras shown grayed out
+- Active camera highlighted
+
+**Additional Cameras Settings Panel:**
+- Shows settings for CAM#2-4 when secondary cameras are detected
+- Enable/disable toggle per camera
+- Resolution dropdown (dynamically populated)
+- FPS slider
+- Settings require "Apply & Restart Encoder" to take effect
+
+**Camera Controls Panel:**
+- Controls apply to the currently active camera
+- Switching cameras updates controls to show that camera's settings
+
+### Encoder Lifecycle
+
+```python
+def start_camera_encoder(self, camera_id):
+    """Start encoder for a specific camera."""
+    cam = self.get_camera_by_id(camera_id)
+    settings = self.camera_settings.get(cam['unique_id'], {})
+
+    cmd = [
+        self.encoder_path, '-S', '-N', '-v',
+        '-d', cam['device'],
+        '-w', str(width), '-h', str(height),
+        '-f', str(fps),
+        '--streaming-port', str(cam['streaming_port']),
+        '--cmd-file', self._get_camera_cmd_file(camera_id),
+        '--ctrl-file', self._get_camera_ctrl_file(camera_id),
+    ]
+
+    # Secondary cameras: disable H.264, use YUYV mode
+    if not cam['is_primary']:
+        cmd.extend(['--no-flv', '-y'])
+```
+
+### USB Bandwidth Troubleshooting
+
+**Error: `VIDIOC_STREAMON: No space left on device`**
+
+This indicates USB bandwidth exhaustion. Solutions:
+1. Reduce secondary camera resolution (try 640x480 or lower)
+2. Reduce frame rate on all cameras
+3. Disable cameras not in use
+4. Some cameras work better with YUYV mode at lower resolutions
+
+The control page shows bandwidth warnings when cameras fail to start.
+
+---
+
+## Moonraker Camera Settings
+
+The control page includes a panel to configure which cameras are provisioned to Moonraker for the dashboard and web UI.
+
+### Features
+
+- **Per-camera Moonraker provisioning**: Enable/disable provisioning for each camera independently
+- **Custom names**: Set custom names for each camera in Moonraker (e.g., "Bed Camera", "Nozzle Cam")
+- **Dashboard default**: Select which camera appears by default on the Mainsail/Fluidd dashboard
+- **Immediate provisioning**: Changes apply immediately to Moonraker without restart
+- **Persistent settings**: Settings saved to config and restored on restart
+
+### UI Panel
+
+The "Moonraker Camera Settings" panel (below Timelapse Settings) shows a table with:
+
+| Column | Description |
+|--------|-------------|
+| Camera | Camera ID, name, and port |
+| Name in Moonraker | Editable text input for webcam name |
+| Provision | Checkbox to enable/disable Moonraker provisioning |
+| Default | Radio button to select dashboard default (one only) |
+
+### API Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/moonraker/cameras` | GET | Get cameras with Moonraker settings |
+| `/api/moonraker/cameras` | POST | Save settings and provision to Moonraker |
+
+### GET Response
+```json
+{
+  "cameras": [
+    {"id": 1, "name": "HD Camera", "unique_id": "usb-...", "streaming_port": 8080, "is_primary": true},
+    {"id": 2, "name": "Camera 2", "unique_id": "usb-...", "streaming_port": 8082, "is_primary": false}
+  ],
+  "settings": {
+    "usb-SunplusIT_Inc_HD_Camera-video-index0": {
+      "moonraker_enabled": true,
+      "moonraker_name": "USB Camera",
+      "moonraker_default": true
+    }
+  }
+}
+```
+
+### POST Request
+```json
+{
+  "settings": {
+    "usb-SunplusIT_Inc_HD_Camera-video-index0": {
+      "moonraker_enabled": true,
+      "moonraker_name": "Bed Camera",
+      "moonraker_default": true
+    },
+    "usb-Another_Camera-video-index0": {
+      "moonraker_enabled": true,
+      "moonraker_name": "Nozzle Cam",
+      "moonraker_default": false
+    }
+  }
+}
+```
+
+### Config Storage
+
+Settings are stored per-camera in the config file:
+```json
+{
+  "cameras": {
+    "usb-SunplusIT_Inc_HD_Camera-video-index0": {
+      "enabled": true,
+      "moonraker_enabled": true,
+      "moonraker_name": "Bed Camera",
+      "moonraker_default": true
+    }
+  }
+}
+```
+
+### Moonraker Webcam API
+
+The following Moonraker API endpoints are used:
+- `POST /server/webcams/item` - Create/update webcam
+- `DELETE /server/webcams/item?name=...` - Delete webcam
+- `POST /server/database/item` - Set default webcam for Mainsail
+
+---
 
 ## Operating Modes
 

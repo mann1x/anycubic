@@ -37,9 +37,11 @@ cd rkmpi-encoder && make dynamic
 HTTP streaming server with web UI for Rinkhals custom firmware.
 
 - MJPEG and H.264 FLV streaming endpoints
+- **Multi-camera support** - up to 4 USB cameras with individual settings
 - Display capture for remote LCD viewing
 - Touch control - interact with printer UI remotely
 - Web control interface with live preview
+- **Camera controls** - real-time V4L2 adjustments (brightness, contrast, exposure, etc.)
 - Moonraker webcam integration
 - Auto frame skipping based on CPU load
 - **Timelapse recording** - native Anycubic slicer support + advanced Moonraker mode

@@ -181,6 +181,8 @@ stop() {
     rm -f /tmp/mjpeg.pipe
     rm -f /tmp/h264.pipe
 
+    sleep 2
+
     # Restart gkcam fresh (go-klipper mode only)
     if [ "$MODE" != "vanilla-klipper" ]; then
         echo "Restarting gkcam..." >> $APP_LOG
@@ -191,6 +193,37 @@ stop() {
         echo "Vanilla-klipper mode: skipping gkcam restart" >> $APP_LOG
     fi
 }
+restart() {
+    # In go-klipper mode, kill gkcam first (like mjpg-streamer does) to ensure clean state
+    if [ "$MODE" != "vanilla-klipper" ]; then
+        kill_by_name gkcam
+    fi
+
+    # Stop our processes
+    # Use SIGTERM first to allow cleanup, then SIGKILL
+    kill_by_name rkmpi_enc 15
+    kill_by_name h264_server 15
+    kill_by_name h264_monitor 15
+    sleep 1
+    # Force kill if still running
+    kill_by_name rkmpi_enc 9
+    kill_by_name h264_server 9
+    kill_by_name h264_monitor 9
+
+    # Cleanup FIFOs
+    rm -f /tmp/h264_stream.fifo
+    rm -f /tmp/mjpeg.pipe
+    rm -f /tmp/h264.pipe
+
+    cd $APP_ROOT
+    echo "Restarting h264-streamer app" >> $APP_LOG
+
+    PIDS=$(get_by_name h264_monitor)
+    if [ "$PIDS" = "" ]; then
+        chmod +x ./h264_monitor.sh
+        ./h264_monitor.sh >> $APP_LOG 2>&1 &
+    fi
+}
 
 case "$1" in
     status)
@@ -198,6 +231,9 @@ case "$1" in
         ;;
     start)
         start
+        ;;
+    restart)
+        restart
         ;;
     debug)
         shift
@@ -207,7 +243,7 @@ case "$1" in
         stop
         ;;
     *)
-        echo "Usage: $0 {status|start|stop}" >&2
+        echo "Usage: $0 {status|start|stop|restart|debug}" >&2
         exit 1
         ;;
 esac

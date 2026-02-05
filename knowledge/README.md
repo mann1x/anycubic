@@ -9,6 +9,7 @@ knowledge/
 ├── TIMELAPSE_PROTOCOL.md      # Timelapse RPC/MQTT protocol
 ├── TIMELAPSE_IMPLEMENTATION_PLAN.md  # Implementation design
 ├── USB_CAMERA_BANDWIDTH.md    # USB bandwidth analysis
+├── USB_CAMERA_CONTROLS.md     # V4L2 camera controls reference
 ├── MJPEG_CPU_OPTIMIZATION.md  # CPU optimization techniques
 └── DISPLAY_STANDBY.md         # Display wake/sleep control
 ```
@@ -70,6 +71,18 @@ Research into display standby detection and wake control.
 - Touch device: hyn_ts (Hynitron), I2C bus 0018
 - Resolution: 800x480, Multi-touch Protocol B
 - Backlight: PWM-controlled
+
+### [USB_CAMERA_CONTROLS.md](USB_CAMERA_CONTROLS.md)
+
+V4L2 camera controls reference for USB cameras on Anycubic printers.
+
+**Topics covered:**
+- Available V4L2 controls (brightness, contrast, exposure, etc.)
+- Control IDs and ranges for UVC cameras
+- Control dependencies (auto vs manual modes)
+- Implementation in rkmpi_enc and h264_server.py
+- Control file format (`/tmp/h264_ctrl`)
+- API endpoints for real-time adjustment
 
 ## Related Resources
 

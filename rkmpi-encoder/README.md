@@ -78,6 +78,9 @@ Hardware H.264/JPEG encoder for RV1106-based Anycubic 3D printers.
 | `-N, --no-stdout` | Disable stdout (use with -S) | off |
 | `--streaming-port <n>` | MJPEG HTTP port | 8080 |
 | `--mode <mode>` | Operating mode (see below) | go-klipper |
+| `--no-flv` | Disable FLV server (for secondary cameras) | off |
+| `--cmd-file <path>` | Command file path | /tmp/h264_cmd |
+| `--ctrl-file <path>` | Control/stats file path | /tmp/h264_ctrl |
 
 ## Operating Modes
 
@@ -103,6 +106,26 @@ For **external Klipper** setups (e.g., Raspberry Pi) or testing.
 | MQTT/RPC clients | ✅ | ❌ |
 | Timelapse recording | ✅ | ❌ |
 | Works without firmware | ❌ | ✅ |
+
+### Multi-Camera Mode
+
+For multi-camera setups, secondary cameras use `--no-flv` to disable H.264/FLV:
+
+```bash
+# Primary camera (CAM#1) - full features
+./rkmpi_enc -S -N -v --streaming-port 8080
+
+# Secondary camera (CAM#2) - MJPEG only, YUYV capture
+./rkmpi_enc -S -N -v --no-flv --streaming-port 8082 -d /dev/video12 \
+    --cmd-file /tmp/h264_cmd_2 --ctrl-file /tmp/h264_ctrl_2 -y
+```
+
+| Option | Purpose |
+|--------|---------|
+| `--no-flv` | Disables H.264/FLV server to avoid VENC conflicts |
+| `--cmd-file` | Separate command file per camera |
+| `--ctrl-file` | Separate control file per camera |
+| `-y` | YUYV mode for lower USB bandwidth |
 
 ### Display Capture
 

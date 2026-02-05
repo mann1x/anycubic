@@ -168,6 +168,59 @@ switch (ramp_phase) {
 }
 ```
 
+## Multi-Camera USB Bandwidth
+
+When running multiple cameras, USB bandwidth becomes a critical constraint.
+
+### Total USB Bandwidth Budget
+
+| Configuration | Bandwidth Used | Status |
+|---------------|----------------|--------|
+| 1x 720p MJPEG @ 10fps | ~3-5 MB/s | OK |
+| 1x 720p MJPEG + 1x 640x480 YUYV | ~6-8 MB/s | OK |
+| 2x 720p MJPEG @ 10fps | ~6-10 MB/s | May fail |
+| 1x 720p MJPEG + 1x 640x480 MJPEG | ~5-8 MB/s | OK |
+
+### ENOSPC Error
+
+When USB bandwidth is exhausted, `VIDIOC_STREAMON` returns `ENOSPC`:
+```
+Error: VIDIOC_STREAMON: No space left on device
+```
+
+This indicates the USB controller cannot allocate isochronous bandwidth for the requested stream.
+
+### Solutions for Multi-Camera
+
+1. **Use YUYV for secondary cameras** - Lower bandwidth per camera
+2. **Reduce resolution** - 640x480 or 320x240 for CAM#2-4
+3. **Reduce frame rate** - Lower FPS reduces bandwidth
+4. **Use separate USB controllers** - If hardware supports it
+
+### Dynamic Resolution Detection
+
+The h264_server.py detects supported resolutions via V4L2 ioctls:
+
+```python
+def detect_camera_resolutions(device, pixel_format='YUYV'):
+    """Detect all supported resolutions using VIDIOC_ENUM_FRAMESIZES"""
+    VIDIOC_ENUM_FRAMESIZES = 0xc02c564a
+    # Iterates through frame sizes to find supported resolutions
+```
+
+This allows the UI to offer only valid resolution options for each camera.
+
+### Recommended Multi-Camera Configuration
+
+| Camera | Resolution | Format | Approximate Bandwidth |
+|--------|------------|--------|----------------------|
+| CAM#1 | 1280x720 | MJPEG | 3-5 MB/s |
+| CAM#2 | 640x480 | YUYV | ~0.6 MB/s @ 10fps |
+| CAM#3 | 640x480 | YUYV | ~0.6 MB/s @ 10fps |
+| CAM#4 | 320x240 | YUYV | ~0.15 MB/s @ 10fps |
+
+---
+
 ## References
 
 - [Luckfox Forums - Dmabuf mode for v4l2](https://forums.luckfox.com/viewtopic.php?t=924)

@@ -191,6 +191,65 @@ make install-h264
 | `-N` | No camera (server mode without camera capture) |
 | `--display` | Enable display capture (LCD framebuffer) |
 | `--streaming-port` | HTTP server port (default: 8080) |
+| `--no-flv` | Disable FLV server (for secondary cameras) |
+| `--cmd-file` | Command file path (default: /tmp/h264_cmd) |
+| `--ctrl-file` | Control/stats file path (default: /tmp/h264_ctrl) |
+
+## Multi-Camera Support
+
+The encoder supports running multiple instances for multi-camera setups (up to 4 cameras).
+
+### Secondary Camera Mode (`--no-flv`)
+
+For secondary cameras (CAM#2-4), use the `--no-flv` flag to disable FLV/H.264 encoding and avoid VENC resource conflicts:
+
+```bash
+# Primary camera (full features)
+./rkmpi_enc -S -N -v --streaming-port 8080
+
+# Secondary camera (MJPEG only, no H.264)
+./rkmpi_enc -S -N -v --no-flv --streaming-port 8082 -d /dev/video12 \
+    --cmd-file /tmp/h264_cmd_2 --ctrl-file /tmp/h264_ctrl_2 -y
+```
+
+### Port Allocation
+
+| Camera | Streaming Port | Command File | Control File |
+|--------|---------------|--------------|--------------|
+| CAM#1 | 8080 | /tmp/h264_cmd | /tmp/h264_ctrl |
+| CAM#2 | 8082 | /tmp/h264_cmd_2 | /tmp/h264_ctrl_2 |
+| CAM#3 | 8083 | /tmp/h264_cmd_3 | /tmp/h264_ctrl_3 |
+| CAM#4 | 8084 | /tmp/h264_cmd_4 | /tmp/h264_ctrl_4 |
+
+### YUYV Mode for Secondary Cameras
+
+Secondary cameras use YUYV capture mode (`-y`) to reduce USB bandwidth:
+- MJPEG 720p: ~3-8 MB/s per camera (can exhaust USB bandwidth with 2+ cameras)
+- YUYV 640x480: ~0.6 MB/s per camera (allows multiple cameras)
+
+When multiple cameras are connected, USB bandwidth limits typically require:
+- CAM#1: 720p MJPEG (primary, full quality)
+- CAM#2+: 640x480 or 800x600 YUYV (lower resolution to fit USB bandwidth)
+
+### Per-Camera Control Files
+
+Each encoder instance uses separate command and control files to avoid interference:
+- `--cmd-file <path>`: Where h264_server.py writes commands (FPS, resolution, camera controls)
+- `--ctrl-file <path>`: Where encoder writes stats and reads camera control values
+
+### Resource Constraints
+
+**VENC Channels:**
+- Channel 0: H.264 encoding (primary camera only)
+- Channel 1: MJPEG encoding (per-camera)
+- Channel 2: Display capture / Timelapse
+
+**USB Bandwidth:**
+- Total available: ~35-40 MB/s practical
+- Multiple cameras must share this bandwidth
+- Use YUYV at lower resolutions for secondary cameras
+
+---
 
 ## CPU Optimizations
 

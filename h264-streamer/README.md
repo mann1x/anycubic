@@ -6,9 +6,11 @@ HTTP streaming server with web UI for Rinkhals custom firmware on Anycubic print
 
 - **MJPEG Streaming** - Multipart JPEG stream from USB camera
 - **H.264 FLV Streaming** - Hardware-encoded H.264 for Anycubic slicer
+- **Multi-Camera Support** - Up to 4 USB cameras with individual settings
 - **Display Capture** - Stream the printer's LCD screen remotely
 - **Touch Control** - Click on display stream to interact with printer UI
 - **Web Control Panel** - Live preview, settings, and monitoring
+- **Camera Controls** - Real-time V4L2 camera adjustments (brightness, contrast, etc.)
 - **Timelapse Management** - Browse, preview, download, and delete recordings
 - **Moonraker Integration** - Compatible webcam endpoints
 - **Auto Frame Skipping** - Dynamic frame rate based on CPU load
@@ -96,6 +98,78 @@ The server automatically transforms coordinates based on printer model orientati
 | KS1, KS1M | 800x480 | `(800-x, 480-y)` |
 | K3, K2P, K3V2 | 480x800 | `(y, 480-x)` |
 | K3M | 480x800 | `(800-y, x)` |
+
+## Multi-Camera Support
+
+h264-streamer supports up to 4 USB cameras with individual settings.
+
+### Port Allocation
+
+| Camera | Port | Stream URL | Description |
+|--------|------|------------|-------------|
+| CAM#1 | 8080 | `:8080/stream` | Primary (H.264 + MJPEG) |
+| CAM#2 | 8082 | `:8082/stream` | Secondary (MJPEG only) |
+| CAM#3 | 8083 | `:8083/stream` | Secondary (MJPEG only) |
+| CAM#4 | 8084 | `:8084/stream` | Secondary (MJPEG only) |
+
+### Features
+
+- **Automatic Discovery** - Detects USB cameras via `/dev/v4l/by-id/`
+- **Dynamic Resolution Detection** - Queries supported resolutions per camera
+- **Per-Camera Settings** - Resolution, FPS, and V4L2 controls per camera
+- **Persistent Configuration** - Settings saved by camera unique ID
+- **Camera Selector** - Switch between cameras in the control panel
+
+### USB Bandwidth Notes
+
+USB 2.0 has limited bandwidth (~35-40 MB/s). With multiple cameras:
+- Primary camera can run at 720p MJPEG
+- Secondary cameras typically need 640x480 or lower
+- YUYV mode uses less bandwidth than MJPEG at same resolution
+
+### Control Panel
+
+- **Camera Selector** - CAM#1, CAM#2, etc. buttons next to Live Preview
+- **Additional Cameras Settings** - Panel for enabling and configuring secondary cameras
+- **Camera Controls** - Applies to currently selected camera
+
+### API Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/cameras` | GET | List all cameras with ports and status |
+| `/api/camera/enable` | POST | Enable a camera `{"id": 2}` |
+| `/api/camera/disable` | POST | Disable a camera `{"id": 2}` |
+| `/api/camera/settings` | POST | Update resolution/FPS for a camera |
+
+---
+
+## Moonraker Camera Settings
+
+Configure which cameras are provisioned to Moonraker for the dashboard and web UI.
+
+### Features
+
+- **Per-camera provisioning** - Enable/disable Moonraker registration independently
+- **Custom names** - Set custom names for each camera (e.g., "Bed Camera")
+- **Dashboard default** - Select which camera is the Mainsail/Fluidd default
+- **Immediate apply** - Changes provision to Moonraker instantly
+
+### Control Panel
+
+The "Moonraker Camera Settings" panel shows each camera with:
+- **Name in Moonraker** - Editable custom name
+- **Provision** - Checkbox to enable/disable
+- **Default** - Radio button for dashboard default
+
+### API Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/moonraker/cameras` | GET | Get cameras and Moonraker settings |
+| `/api/moonraker/cameras` | POST | Save and provision to Moonraker |
+
+---
 
 ## Camera Controls
 
