@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## h264-streamer
 
+### [1.6.3] - 2026-02-06
+
+#### Fixed
+- WiFi route fix now runs in the IP monitor loop (every 30s) instead of at startup, handling late wlan0 DHCP and re-checking on IP changes
+
 ### [1.6.2] - 2026-02-06
 
 #### Fixed
