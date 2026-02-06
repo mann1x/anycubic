@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## h264-streamer
 
+### [1.6.2] - 2026-02-06
+
+#### Fixed
+- High WiFi CPU usage when eth1 and wlan0 are on the same subnet — MJPEG stream traffic was routed through WiFi instead of USB ethernet due to wlan0 routes having equal priority; startup now sets wlan0 route metric to 100 so eth1 is preferred with automatic WiFi fallback
+
 ### [1.6.1] - 2026-02-06
 
 #### Fixed

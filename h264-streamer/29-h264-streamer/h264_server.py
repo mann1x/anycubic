@@ -4341,7 +4341,8 @@ class StreamerApp:
             time.sleep(1)
 
     def _ip_monitor_loop(self):
-        """Monitor for IP changes"""
+        """Monitor for IP changes and fix WiFi route priority"""
+        route_fixed = False
         while self.running:
             time.sleep(30)
             try:
@@ -4350,8 +4351,69 @@ class StreamerApp:
                     print(f"IP changed: {self.current_ip} -> {new_ip}", flush=True)
                     self.current_ip = new_ip
                     self._provision_moonraker_cameras()
+                    route_fixed = False  # Re-check routes on IP change
+                if not route_fixed:
+                    route_fixed = self._fix_wlan_route_priority()
             except Exception as e:
                 print(f"IP monitor error: {e}", flush=True)
+
+    def _fix_wlan_route_priority(self):
+        """Fix wlan0 route priority when eth1 and wlan0 share a subnet.
+
+        When both interfaces are on the same subnet, DHCP may add wlan0 routes
+        with the same metric as eth1, causing traffic to go through WiFi.
+        Re-add wlan0 routes with metric 100 so eth1 is preferred, with wlan0
+        as automatic fallback if eth1 disconnects.
+        """
+        try:
+            result = subprocess.run(['ifconfig'], capture_output=True, text=True, timeout=5)
+            output = result.stdout
+
+            # Extract IP prefix per interface using same regex as get_ip_address()
+            def get_iface_prefix(iface):
+                pattern = rf'{iface}.*?(?=\n\w|\Z)'
+                match = re.search(pattern, output, re.DOTALL)
+                if match:
+                    ip_match = re.search(r'inet addr:(\d+\.\d+\.\d+\.\d+)', match.group(0))
+                    if ip_match:
+                        return '.'.join(ip_match.group(1).split('.')[:3])
+                return None
+
+            eth1_net = get_iface_prefix('eth1')
+            wlan_net = get_iface_prefix('wlan0')
+
+            if not eth1_net or not wlan_net or eth1_net != wlan_net:
+                return True  # Not on same subnet, nothing to fix
+
+            # Check if wlan0 has a metric-0 route for this subnet
+            result = subprocess.run(['route', '-n'], capture_output=True, text=True, timeout=5)
+            needs_fix = False
+            wlan_gw = None
+            for line in result.stdout.split('\n'):
+                parts = line.split()
+                if len(parts) >= 8 and parts[7] == 'wlan0':
+                    if parts[0] == f'{wlan_net}.0' and parts[4] == '0':
+                        needs_fix = True
+                    if parts[0] == '0.0.0.0' and parts[4] == '0':
+                        wlan_gw = parts[1]
+
+            if not needs_fix:
+                return True  # Already fixed
+
+            print(f"Fixing route priority: eth1 and wlan0 both on {eth1_net}.0/24, preferring eth1", flush=True)
+            subprocess.run(['route', 'del', '-net', f'{wlan_net}.0', 'netmask', '255.255.255.0', 'dev', 'wlan0'],
+                          capture_output=True, timeout=5)
+            subprocess.run(['route', 'add', '-net', f'{wlan_net}.0', 'netmask', '255.255.255.0', 'dev', 'wlan0', 'metric', '100'],
+                          capture_output=True, timeout=5)
+            if wlan_gw:
+                subprocess.run(['route', 'del', 'default', 'gw', wlan_gw, 'dev', 'wlan0'],
+                              capture_output=True, timeout=5)
+                subprocess.run(['route', 'add', 'default', 'gw', wlan_gw, 'dev', 'wlan0', 'metric', '100'],
+                              capture_output=True, timeout=5)
+            return True
+        except Exception as e:
+            print(f"Route fix error: {e}", flush=True)
+            return False
 
     def _run_control_server(self):
         """Run control HTTP server on control_port for /control and /api endpoints"""
