@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## h264-streamer
 
+### [1.6.4] - 2026-02-06
+
+#### Added
+- RTL8723DS WiFi driver optimization — enables A-MSDU aggregation and disables power management, reducing WiFi kernel thread CPU usage by ~10-15% when streaming over WiFi
+
 ### [1.6.3] - 2026-02-06
 
 #### Fixed

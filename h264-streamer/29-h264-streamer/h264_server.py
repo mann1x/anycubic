@@ -4341,8 +4341,9 @@ class StreamerApp:
             time.sleep(1)
 
     def _ip_monitor_loop(self):
-        """Monitor for IP changes and fix WiFi route priority"""
+        """Monitor for IP changes, fix WiFi route priority and optimize WiFi driver"""
         route_fixed = False
+        wifi_optimized = False
         while self.running:
             time.sleep(30)
             try:
@@ -4354,6 +4355,8 @@ class StreamerApp:
                     route_fixed = False  # Re-check routes on IP change
                 if not route_fixed:
                     route_fixed = self._fix_wlan_route_priority()
+                if not wifi_optimized:
+                    wifi_optimized = self._optimize_wifi_driver()
             except Exception as e:
                 print(f"IP monitor error: {e}", flush=True)
 
@@ -4413,6 +4416,55 @@ class StreamerApp:
             return True
         except Exception as e:
             print(f"Route fix error: {e}", flush=True)
+            return False
+
+    def _optimize_wifi_driver(self):
+        """Optimize RTL8723DS WiFi driver for lower CPU usage.
+
+        Enables A-MSDU aggregation and disables power management.
+        A-MSDU bundles multiple frames into fewer WiFi transmissions,
+        reducing per-packet overhead and RTWHALXT thread CPU usage.
+        """
+        try:
+            # Check if wlan0 exists
+            result = subprocess.run(['ifconfig', 'wlan0'], capture_output=True, text=True, timeout=5)
+            if result.returncode != 0:
+                return True  # No wlan0, nothing to optimize
+
+            # Check if RTL8723DS module is loaded
+            amsdu_path = '/sys/module/RTL8723DS/parameters/rtw_amsdu_mode'
+            ampdu_amsdu_path = '/sys/module/RTL8723DS/parameters/rtw_tx_ampdu_amsdu'
+            try:
+                with open(amsdu_path, 'r') as f:
+                    current_amsdu = f.read().strip()
+                with open(ampdu_amsdu_path, 'r') as f:
+                    current_ampdu_amsdu = f.read().strip()
+            except FileNotFoundError:
+                return True  # Not RTL8723DS, skip
+
+            changed = False
+            if current_amsdu != '1':
+                with open(amsdu_path, 'w') as f:
+                    f.write('1')
+                changed = True
+            if current_ampdu_amsdu != '1':
+                with open(ampdu_amsdu_path, 'w') as f:
+                    f.write('1')
+                changed = True
+
+            # Disable power save
+            result = subprocess.run(['iw', 'dev', 'wlan0', 'get', 'power_save'],
+                                   capture_output=True, text=True, timeout=5)
+            if 'on' in result.stdout.lower():
+                subprocess.run(['iw', 'dev', 'wlan0', 'set', 'power_save', 'off'],
+                              capture_output=True, timeout=5)
+                changed = True
+
+            if changed:
+                print("WiFi optimized: A-MSDU enabled, power save off (RTL8723DS)", flush=True)
+            return True
+        except Exception as e:
+            print(f"WiFi optimization error: {e}", flush=True)
             return False
 
     def _run_control_server(self):
