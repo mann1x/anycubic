@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## h264-streamer
 
+### [1.6.1] - 2026-02-06
+
+#### Fixed
+- Control page ACProxyCam FLV Proxy checkbox not being sent to server (JavaScript form handler missing the field)
+- Control page POST body truncation for large forms (read full Content-Length)
+- Removed unnecessary startCapture keepalive flooding from MQTT responder subprocess
+
 ### [1.6.0] - 2026-02-06
 
 #### Added

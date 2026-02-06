@@ -4523,7 +4523,7 @@ class StreamerApp:
                 self._redirect_to_streaming(client, '/flv', port=self.FLV_PORT)
             elif path == '/control':
                 if method == 'POST':
-                    # Read POST body
+                    # Read POST body - may need multiple recv() for large forms
                     body = ""
                     content_length = 0
                     for line in lines:
@@ -4532,7 +4532,13 @@ class StreamerApp:
                     if content_length > 0:
                         body_start = request.find('\r\n\r\n')
                         if body_start != -1:
-                            body = request[body_start+4:body_start+4+content_length]
+                            body_data = request[body_start+4:]
+                            while len(body_data) < content_length:
+                                chunk = client.recv(4096).decode('utf-8', errors='ignore')
+                                if not chunk:
+                                    break
+                                body_data += chunk
+                            body = body_data[:content_length]
                     self._handle_control_post(client, body)
                 else:
                     self._serve_control_page(client)
@@ -6321,6 +6327,10 @@ class StreamerApp:
             // Display capture settings
             data.append('display_enabled', formData.has('display_enabled') ? 'on' : '');
             data.append('display_fps', document.querySelector('[name=display_fps]').value);
+            // ACProxyCam FLV proxy
+            if (formData.has('acproxycam_flv_proxy')) {{
+                data.append('acproxycam_flv_proxy', '1');
+            }}
 
             // Save settings, then restart
             // Stop stats polling during restart to avoid connection errors
@@ -7021,6 +7031,10 @@ if(flvjs.isSupported()){{
                 data.append('display_enabled', 'on');
             }}
             data.append('display_fps', document.querySelector('[name=display_fps]').value);
+            // ACProxyCam FLV proxy
+            if (formData.has('acproxycam_flv_proxy')) {{
+                data.append('acproxycam_flv_proxy', '1');
+            }}
 
             // Check if settings require restart
             const newMjpegFps = parseInt(mjpegFpsValue) || 10;
@@ -7028,12 +7042,14 @@ if(flvjs.isSupported()){{
             const newLogging = formData.has('logging');
             const newBitrate = parseInt(document.querySelector('[name=bitrate]').value) || 512;
             const newH264Resolution = document.querySelector('[name=h264_resolution]')?.value || '1280x720';
+            const newProxy = formData.has('acproxycam_flv_proxy');
             const needsRkmpiRestart = (newMjpegFps !== currentMjpegFpsTarget) && currentEncoderType === 'rkmpi';
             const needsGkcamRestart = (newGkcamAllFrames !== currentGkcamAllFrames) && currentEncoderType === 'gkcam';
             const needsLoggingRestart = (newLogging !== currentLogging);
             const needsBitrateRestart = (newBitrate !== currentBitrate) && (currentEncoderType === 'rkmpi' || currentEncoderType === 'rkmpi-yuyv');
             const needsResolutionRestart = (newH264Resolution !== currentH264Resolution) && (currentEncoderType === 'rkmpi' || currentEncoderType === 'rkmpi-yuyv');
-            const needsRestart = needsRkmpiRestart || needsGkcamRestart || needsLoggingRestart || needsBitrateRestart || needsResolutionRestart;
+            const needsProxyRestart = (newProxy !== {'true' if self.acproxycam_flv_proxy else 'false'}) && currentEncoderType === 'rkmpi';
+            const needsRestart = needsRkmpiRestart || needsGkcamRestart || needsLoggingRestart || needsBitrateRestart || needsResolutionRestart || needsProxyRestart;
 
             if (needsRestart) {{
                 // Show loading overlay and trigger restart
@@ -9708,11 +9724,7 @@ def run_mqtt_responder_standalone():
         ssl_sock.settimeout(0.5)
         buffer = b""
         last_pingreq = time.time()
-        last_keepalive = 0  # Send first keepalive immediately
         PINGREQ_INTERVAL = 45  # Match rkmpi_enc MQTT_KEEPALIVE_INTERVAL
-        KEEPALIVE_INTERVAL = 15  # Send startCapture every 15s to prevent slicer disconnect
-        report_topic = f"anycubic/anycubicCloud/v1/printer/public/{model_id}/{device_id}/video/report"
-        video_topic = f"anycubic/anycubicCloud/v1/web/printer/{model_id}/{device_id}/video"
 
         while True:
             # Rate limit to prevent CPU spin
@@ -9727,38 +9739,6 @@ def run_mqtt_responder_standalone():
                     last_pingreq = now
                 except Exception as e:
                     print(f"MQTT: PINGREQ failed - {e}", flush=True)
-                    break
-
-            # Send startCapture keepalive to prevent slicer/firmware from stopping camera
-            if now - last_keepalive >= KEEPALIVE_INTERVAL:
-                try:
-                    keepalive_msgid = str(uuid.uuid4())
-                    handled_msgids.add(keepalive_msgid)
-                    # Send startCapture command (like the slicer would)
-                    cmd_payload = json.dumps({
-                        "type": "video",
-                        "action": "startCapture",
-                        "timestamp": int(now * 1000),
-                        "msgid": keepalive_msgid,
-                        "data": None
-                    })
-                    ssl_sock.send(mqtt_build_publish(video_topic, cmd_payload, qos=0))
-                    # Also send initSuccess report
-                    report_payload = json.dumps({
-                        "type": "video",
-                        "action": "startCapture",
-                        "timestamp": int(now * 1000),
-                        "msgid": keepalive_msgid,
-                        "state": "initSuccess",
-                        "code": 200,
-                        "msg": "",
-                        "data": None
-                    })
-                    ssl_sock.send(mqtt_build_publish(report_topic, report_payload, qos=0))
-                    last_keepalive = now
-                    print(f"MQTT: keepalive startCapture sent", flush=True)
-                except Exception as e:
-                    print(f"MQTT: keepalive failed - {e}", flush=True)
                     break
 
             try:
