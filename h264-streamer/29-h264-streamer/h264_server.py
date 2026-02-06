@@ -3169,6 +3169,11 @@ class StreamerApp:
         self.rpc_subprocess = None
         self.mqtt_subprocess = None
 
+        # ACProxyCam FLV proxy - offload H.264 encoding to ACProxyCam
+        self.acproxycam_flv_proxy = getattr(args, 'acproxycam_flv_proxy', False)
+        self.acproxycam_flv_url = None           # Set by POST /api/acproxycam/flv
+        self.acproxycam_flv_last_seen = 0        # Timestamp of last announcement
+
         # FPS counters
         self.mjpeg_fps = FPSCounter()
         self.h264_fps = FPSCounter()
@@ -3402,6 +3407,7 @@ class StreamerApp:
             config['h264_resolution'] = self.h264_resolution
             config['display_enabled'] = 'true' if self.display_enabled else 'false'
             config['display_fps'] = str(self.display_fps)
+            config['acproxycam_flv_proxy'] = 'true' if self.acproxycam_flv_proxy else 'false'
             config['internal_usb_port'] = self.internal_usb_port
 
             # Camera controls
@@ -3598,7 +3604,10 @@ class StreamerApp:
         print(f"Streamer started:", flush=True)
         print(f"  Streaming:", flush=True)
         print(f"    Port {self.streaming_port}: /stream, /snapshot", flush=True)
-        print(f"    Port {self.FLV_PORT}: /flv (H.264 FLV)", flush=True)
+        if self.acproxycam_flv_proxy:
+            print(f"    Port {self.FLV_PORT}: /flv (ACProxyCam proxy)", flush=True)
+        else:
+            print(f"    Port {self.FLV_PORT}: /flv (H.264 FLV)", flush=True)
         if self.is_rkmpi_mode():
             if self.mode == 'vanilla-klipper':
                 print(f"    MQTT/RPC: disabled (vanilla-klipper)", flush=True)
@@ -3747,6 +3756,16 @@ class StreamerApp:
         if not started_any:
             print("ERROR: Failed to start any encoder!", flush=True)
             return False
+
+        # Start FLV proxy server when ACProxyCam proxy mode is enabled
+        # (replaces rkmpi_enc's native FLV server on port 18088)
+        if self.acproxycam_flv_proxy:
+            threading.Thread(target=self._run_flv_server, daemon=True).start()
+            print(f"FLV proxy server started on port {self.FLV_PORT}", flush=True)
+            # Start MQTT/RPC responders immediately so the slicer's startCapture
+            # is handled before any FLV client connects (rkmpi_enc --no-flv disables
+            # its built-in MQTT/RPC, so we must provide them)
+            self._spawn_responder_subprocesses()
 
         return True
 
@@ -3967,6 +3986,10 @@ class StreamerApp:
             # Enable display capture for primary camera only
             cmd.append('--display')
             cmd.extend(['--display-fps', str(self.display_fps)])
+
+            # ACProxyCam FLV proxy: disable rkmpi_enc's FLV server and VENC (saves CPU)
+            if self.acproxycam_flv_proxy:
+                cmd.append('--no-flv')
         else:
             # Secondary camera: Use YUYV mode at low resolution to reduce USB bandwidth
             # Get configured resolution or use 640x480 default for bandwidth savings
@@ -4660,6 +4683,20 @@ class StreamerApp:
                     if body_start != -1:
                         body = request[body_start+4:body_start+4+content_length]
                 self._handle_moonraker_cameras(client, body)
+            # ACProxyCam FLV proxy API
+            elif path == '/api/acproxycam/flv' and method == 'POST':
+                content_length = 0
+                for line in request.split('\r\n'):
+                    if line.lower().startswith('content-length:'):
+                        content_length = int(line.split(':')[1].strip())
+                body = ''
+                if content_length > 0:
+                    body_start = request.find('\r\n\r\n')
+                    if body_start != -1:
+                        body = request[body_start+4:body_start+4+content_length]
+                self._handle_acproxycam_flv_announce(client, body)
+            elif path == '/api/acproxycam/flv' and method == 'GET':
+                self._serve_acproxycam_flv_status(client)
             else:
                 self._serve_404(client)
         except Exception:
@@ -4814,8 +4851,118 @@ class StreamerApp:
             return self.gkcam_reader.get_jpeg(max_age=0.5)
         return None
 
+    def _spawn_responder_subprocesses(self):
+        """Spawn RPC and MQTT responder subprocesses (for slicer protocol)."""
+        script_path = os.path.abspath(__file__)
+
+        if self.rpc_subprocess is None:
+            try:
+                self.rpc_subprocess = subprocess.Popen(
+                    ['python', script_path, '--rpc-responder'],
+                    stdout=None,
+                    stderr=subprocess.STDOUT
+                )
+                print(f"RPC subprocess spawned (PID {self.rpc_subprocess.pid})", flush=True)
+            except Exception as e:
+                print(f"Failed to spawn RPC subprocess: {e}", flush=True)
+
+        if self.mqtt_subprocess is None:
+            try:
+                self.mqtt_subprocess = subprocess.Popen(
+                    ['python', script_path, '--mqtt-responder'],
+                    stdout=None,
+                    stderr=subprocess.STDOUT
+                )
+                print(f"MQTT subprocess spawned (PID {self.mqtt_subprocess.pid})", flush=True)
+            except Exception as e:
+                print(f"Failed to spawn MQTT subprocess: {e}", flush=True)
+
+    def _kill_responder_subprocesses(self):
+        """Kill RPC and MQTT responder subprocesses."""
+        if self.rpc_subprocess is not None:
+            try:
+                self.rpc_subprocess.terminate()
+                self.rpc_subprocess.wait(timeout=2)
+                print(f"RPC subprocess terminated", flush=True)
+            except Exception as e:
+                print(f"Error terminating RPC subprocess: {e}", flush=True)
+                try:
+                    self.rpc_subprocess.kill()
+                except:
+                    pass
+            self.rpc_subprocess = None
+
+        if self.mqtt_subprocess is not None:
+            try:
+                self.mqtt_subprocess.terminate()
+                self.mqtt_subprocess.wait(timeout=2)
+                print(f"MQTT subprocess terminated", flush=True)
+            except Exception as e:
+                print(f"Error terminating MQTT subprocess: {e}", flush=True)
+                try:
+                    self.mqtt_subprocess.kill()
+                except:
+                    pass
+            self.mqtt_subprocess = None
+
     def _serve_flv_stream(self, client):
-        """Serve FLV stream"""
+        """Serve FLV stream - dispatch to local or proxied handler"""
+        if self.acproxycam_flv_proxy:
+            self._serve_flv_stream_proxied(client)
+        else:
+            self._serve_flv_stream_local(client)
+
+    def _serve_flv_stream_proxied(self, client):
+        """Serve FLV stream by proxying from ACProxyCam's /flv endpoint"""
+        with self.flv_client_lock:
+            self.flv_client_count += 1
+            print(f"FLV proxy client connected (total: {self.flv_client_count})", flush=True)
+
+        try:
+            # Wait for ACProxyCam to announce its /flv URL
+            url = self.acproxycam_flv_url
+            if url is None:
+                print("Waiting for ACProxyCam /flv announcement...", flush=True)
+                for _ in range(15):  # Wait up to ~30 seconds (15 * 2s)
+                    time.sleep(2)
+                    url = self.acproxycam_flv_url
+                    if url is not None:
+                        break
+                if url is None:
+                    print("ACProxyCam /flv URL not available, closing client", flush=True)
+                    return
+
+            print(f"Proxying FLV from {url}", flush=True)
+
+            # Connect to ACProxyCam's /flv endpoint
+            req = urllib.request.Request(url)
+            upstream = urllib.request.urlopen(req, timeout=10)
+
+            # Send HTTP response headers matching gkcam format
+            response = (
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: text/plain\r\n"
+                "Access-Control-Allow-Origin: *\r\n"
+                "Content-Length: 99999999999\r\n"
+                "\r\n"
+            )
+            client.sendall(response.encode())
+
+            # Transparent byte proxy - no FLV parsing needed
+            while self.running:
+                chunk = upstream.read(8192)
+                if not chunk:
+                    break
+                client.sendall(chunk)
+        except Exception as e:
+            print(f"FLV proxy error: {e}", flush=True)
+        finally:
+            with self.flv_client_lock:
+                self.flv_client_count -= 1
+                print(f"FLV proxy client disconnected (total: {self.flv_client_count})", flush=True)
+
+    def _serve_flv_stream_local(self, client):
+        """Serve FLV stream from local H.264 buffer (original implementation)"""
         # Track client and spawn responder subprocesses when first client connects
         with self.flv_client_lock:
             self.flv_client_count += 1
@@ -4823,31 +4970,7 @@ class StreamerApp:
 
             # Spawn responder subprocesses when first client connects
             if self.flv_client_count == 1:
-                script_path = os.path.abspath(__file__)
-
-                # Spawn RPC responder subprocess
-                if self.rpc_subprocess is None:
-                    try:
-                        self.rpc_subprocess = subprocess.Popen(
-                            ['python', script_path, '--rpc-responder'],
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT
-                        )
-                        print(f"RPC subprocess spawned (PID {self.rpc_subprocess.pid})", flush=True)
-                    except Exception as e:
-                        print(f"Failed to spawn RPC subprocess: {e}", flush=True)
-
-                # Spawn MQTT responder subprocess
-                if self.mqtt_subprocess is None:
-                    try:
-                        self.mqtt_subprocess = subprocess.Popen(
-                            ['python', script_path, '--mqtt-responder'],
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT
-                        )
-                        print(f"MQTT subprocess spawned (PID {self.mqtt_subprocess.pid})", flush=True)
-                    except Exception as e:
-                        print(f"Failed to spawn MQTT subprocess: {e}", flush=True)
+                self._spawn_responder_subprocesses()
 
         try:
             # Match gkcam's HTTP headers exactly to prevent slicer disconnection
@@ -4944,33 +5067,7 @@ class StreamerApp:
 
                 # Kill responder subprocesses when last client disconnects
                 if self.flv_client_count == 0:
-                    # Kill RPC subprocess
-                    if self.rpc_subprocess is not None:
-                        try:
-                            self.rpc_subprocess.terminate()
-                            self.rpc_subprocess.wait(timeout=2)
-                            print(f"RPC subprocess terminated", flush=True)
-                        except Exception as e:
-                            print(f"Error terminating RPC subprocess: {e}", flush=True)
-                            try:
-                                self.rpc_subprocess.kill()
-                            except:
-                                pass
-                        self.rpc_subprocess = None
-
-                    # Kill MQTT subprocess
-                    if self.mqtt_subprocess is not None:
-                        try:
-                            self.mqtt_subprocess.terminate()
-                            self.mqtt_subprocess.wait(timeout=2)
-                            print(f"MQTT subprocess terminated", flush=True)
-                        except Exception as e:
-                            print(f"Error terminating MQTT subprocess: {e}", flush=True)
-                            try:
-                                self.mqtt_subprocess.kill()
-                            except:
-                                pass
-                        self.mqtt_subprocess = None
+                    self._kill_responder_subprocesses()
 
     def _serve_control_page(self, client):
         """Serve control page HTML"""
@@ -4995,6 +5092,9 @@ class StreamerApp:
             h264_fps_val = round(self.encoder_h264_fps, 1)
             mjpeg_clients = self.encoder_mjpeg_clients
             flv_clients = self.encoder_flv_clients
+            # When proxy mode is active, rkmpi_enc has no FLV clients — use Python's count
+            if self.acproxycam_flv_proxy:
+                flv_clients = self.flv_client_count
         else:
             # Fallback to local counters
             mjpeg_fps = round(self.mjpeg_fps.get_fps(), 1)
@@ -5551,6 +5651,18 @@ class StreamerApp:
                         </div>
                     </div>
                     <div class="setting-note">Higher FPS = more CPU usage</div>
+                </div>
+                <div class="setting rkmpi-only" style="{'display:none' if not self.is_rkmpi_mode() else ''}; border-top: 1px solid #444; padding-top: 15px; margin-top: 15px;">
+                    <div class="setting-row">
+                        <span class="label">ACProxyCam FLV Proxy:</span>
+                        <div class="control">
+                            <label class="toggle">
+                                <input type="checkbox" name="acproxycam_flv_proxy" value="1" {'checked' if self.acproxycam_flv_proxy else ''}>
+                                <span class="slider"></span>
+                            </label>
+                        </div>
+                    </div>
+                    <div class="setting-note">Offload H.264 encoding to ACProxyCam. Requires ACProxyCam with encoding enabled. Restarts encoder.</div>
                 </div>
                 <div class="setting" style="margin-top: 15px;">
                     <div class="setting-row">
@@ -7103,12 +7215,26 @@ if(flvjs.isSupported()){{
             except ValueError:
                 pass
 
+        # ACProxyCam FLV proxy toggle
+        old_proxy = self.acproxycam_flv_proxy
+        self.acproxycam_flv_proxy = 'acproxycam_flv_proxy' in params
+
         # Update control file (for rkmpi encoder)
         if self.is_rkmpi_mode():
             self.write_ctrl_file()
 
         # Save to persistent config
         self.save_config()
+
+        # Restart encoders if proxy mode changed (adds/removes --no-flv + starts/stops FLV proxy server)
+        if old_proxy != self.acproxycam_flv_proxy and self.is_rkmpi_mode():
+            if not self.acproxycam_flv_proxy:
+                self._kill_responder_subprocesses()
+            self.restart_encoders()
+            if self.acproxycam_flv_proxy:
+                threading.Thread(target=self._run_flv_server, daemon=True).start()
+                print(f"FLV proxy server started on port {self.FLV_PORT}", flush=True)
+                self._spawn_responder_subprocesses()
 
         # Re-provision moonraker cameras with updated settings
         if self.current_ip:
@@ -7148,6 +7274,9 @@ if(flvjs.isSupported()){{
             h264_fps_val = round(self.encoder_h264_fps, 1)
             mjpeg_clients = self.encoder_mjpeg_clients
             flv_clients = self.encoder_flv_clients
+            # When proxy mode is active, rkmpi_enc has no FLV clients — use Python's count
+            if self.acproxycam_flv_proxy:
+                flv_clients = self.flv_client_count
         else:
             # Fallback to local counters
             mjpeg_fps_val = round(self.mjpeg_fps.get_fps(), 1)
@@ -7347,8 +7476,68 @@ addStream('Display Snapshot',streamBase+'/display/snapshot');
 
             # Session info
             'session_id': self.session_id,
+
+            # ACProxyCam FLV proxy
+            'acproxycam_flv_proxy': self.acproxycam_flv_proxy,
         }
         body = json.dumps(config)
+        response = (
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        ) + body
+        client.sendall(response.encode())
+
+    def _handle_acproxycam_flv_announce(self, client, body):
+        """Handle ACProxyCam FLV proxy announcement (POST /api/acproxycam/flv)"""
+        try:
+            data = json.loads(body) if body else {}
+        except:
+            data = {}
+
+        port = data.get('port', 8080)
+        ip = data.get('ip')
+        if not ip:
+            try:
+                ip = client.getpeername()[0]
+            except:
+                ip = None
+
+        if ip:
+            self.acproxycam_flv_url = f"http://{ip}:{port}/flv"
+            self.acproxycam_flv_last_seen = time.time()
+            print(f"ACProxyCam FLV announced: {self.acproxycam_flv_url}", flush=True)
+
+        result = {
+            'status': 'ok',
+            'proxy_active': self.acproxycam_flv_proxy,
+            'url': self.acproxycam_flv_url,
+        }
+        body_str = json.dumps(result)
+        response = (
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json\r\n"
+            f"Content-Length: {len(body_str)}\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        ) + body_str
+        client.sendall(response.encode())
+
+    def _serve_acproxycam_flv_status(self, client):
+        """Serve ACProxyCam FLV proxy status (GET /api/acproxycam/flv)"""
+        connected = (self.acproxycam_flv_url is not None and
+                     time.time() - self.acproxycam_flv_last_seen < 60)
+        result = {
+            'enabled': self.acproxycam_flv_proxy,
+            'url': self.acproxycam_flv_url,
+            'connected': connected,
+            'flv_clients': self.flv_client_count,
+        }
+        body = json.dumps(result)
         response = (
             "HTTP/1.1 200 OK\r\n"
             "Content-Type: application/json\r\n"
@@ -9518,10 +9707,59 @@ def run_mqtt_responder_standalone():
 
         ssl_sock.settimeout(0.5)
         buffer = b""
+        last_pingreq = time.time()
+        last_keepalive = 0  # Send first keepalive immediately
+        PINGREQ_INTERVAL = 45  # Match rkmpi_enc MQTT_KEEPALIVE_INTERVAL
+        KEEPALIVE_INTERVAL = 15  # Send startCapture every 15s to prevent slicer disconnect
+        report_topic = f"anycubic/anycubicCloud/v1/printer/public/{model_id}/{device_id}/video/report"
+        video_topic = f"anycubic/anycubicCloud/v1/web/printer/{model_id}/{device_id}/video"
 
         while True:
             # Rate limit to prevent CPU spin
             time.sleep(0.05)
+
+            now = time.time()
+
+            # Send PINGREQ to keep MQTT broker connection alive
+            if now - last_pingreq >= PINGREQ_INTERVAL:
+                try:
+                    ssl_sock.send(bytes([0xC0, 0x00]))  # PINGREQ packet
+                    last_pingreq = now
+                except Exception as e:
+                    print(f"MQTT: PINGREQ failed - {e}", flush=True)
+                    break
+
+            # Send startCapture keepalive to prevent slicer/firmware from stopping camera
+            if now - last_keepalive >= KEEPALIVE_INTERVAL:
+                try:
+                    keepalive_msgid = str(uuid.uuid4())
+                    handled_msgids.add(keepalive_msgid)
+                    # Send startCapture command (like the slicer would)
+                    cmd_payload = json.dumps({
+                        "type": "video",
+                        "action": "startCapture",
+                        "timestamp": int(now * 1000),
+                        "msgid": keepalive_msgid,
+                        "data": None
+                    })
+                    ssl_sock.send(mqtt_build_publish(video_topic, cmd_payload, qos=0))
+                    # Also send initSuccess report
+                    report_payload = json.dumps({
+                        "type": "video",
+                        "action": "startCapture",
+                        "timestamp": int(now * 1000),
+                        "msgid": keepalive_msgid,
+                        "state": "initSuccess",
+                        "code": 200,
+                        "msg": "",
+                        "data": None
+                    })
+                    ssl_sock.send(mqtt_build_publish(report_topic, report_payload, qos=0))
+                    last_keepalive = now
+                    print(f"MQTT: keepalive startCapture sent", flush=True)
+                except Exception as e:
+                    print(f"MQTT: keepalive failed - {e}", flush=True)
+                    break
 
             try:
                 data = ssl_sock.recv(4096)
@@ -9965,6 +10203,7 @@ def main():
     # Display capture settings (disabled by default)
     args.display_enabled = saved_config.get('display_enabled', 'false') == 'true'
     args.display_fps = max(1, min(10, int(saved_config.get('display_fps', 5))))
+    args.acproxycam_flv_proxy = saved_config.get('acproxycam_flv_proxy', 'false') == 'true'
 
     # Camera controls (loaded from config, applied on startup)
     args.cam_brightness = int(saved_config.get('cam_brightness', 0))

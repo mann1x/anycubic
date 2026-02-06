@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## h264-streamer
 
+### [1.6.0] - 2026-02-06
+
+#### Added
+- ACProxyCam FLV proxy mode - offloads H.264 encoding from the printer to ACProxyCam running on a more powerful host
+- `POST /api/acproxycam/flv` endpoint for ACProxyCam to announce its FLV URL
+- `GET /api/acproxycam/flv` endpoint for proxy status monitoring
+- Control page checkbox to enable/disable ACProxyCam FLV proxy (rkmpi mode only)
+- Transparent per-client FLV byte proxy from ACProxyCam to slicer connections
+- Automatic `--no-flv` flag when proxy is enabled (skips VENC initialization on printer)
+- FLV proxy client connection tracking with upstream error handling
+
+#### Fixed
+- MQTT/RPC responders now start immediately with proxy server, preventing slicer timeout on initial `startCapture`
+- MQTT PINGREQ keepalive in standalone responder prevents broker disconnection
+- Periodic `startCapture` keepalive prevents firmware from stopping the camera stream
+
+#### Changed
+- Refactored `_serve_flv_stream` into dispatch + local/proxied methods
+- Extracted RPC/MQTT responder subprocess management into reusable helpers
+
 ### [1.5.0] - 2025-02-05
 
 #### Added

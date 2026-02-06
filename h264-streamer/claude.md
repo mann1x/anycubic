@@ -441,6 +441,48 @@ The following Moonraker API endpoints are used:
 
 ---
 
+## ACProxyCam FLV Proxy
+
+When `acproxycam_flv_proxy` is enabled, h264-streamer proxies FLV streams from ACProxyCam instead of encoding H.264 locally. This offloads the CPU-intensive H.264 encoding from the resource-constrained printer (RV1106, 1 core, 256MB) to a more powerful host running ACProxyCam.
+
+### Architecture
+```
+USB Camera ──MJPEG──> rkmpi_enc :8080/stream ──MJPEG──> ACProxyCam (Pi 5/x64)
+                      (--no-flv, no H.264)              MJPEG→H.264 encoding
+                                                         /flv endpoint
+                                                              │
+Slicer ──> :18088/flv ──> h264_server.py ─────HTTP GET────────┘
+           (Python proxy)  transparent byte proxy
+```
+
+### Configuration
+- **Control page**: Checkbox in settings (visible only in rkmpi mode)
+- **Config key**: `acproxycam_flv_proxy` (true/false)
+- **API**: `GET/POST /api/acproxycam/flv` for status and announcement
+
+### How It Works
+1. When enabled, `start_camera_encoder()` adds `--no-flv` to rkmpi_enc (disables VENC, saves CPU)
+2. `_run_flv_server()` starts on port 18088 (reuses existing dead code path)
+3. ACProxyCam announces its `/flv` URL via `POST /api/acproxycam/flv` (periodic re-announcement every 30s)
+4. When slicer connects to `:18088/flv`, `_serve_flv_stream_proxied()` opens upstream connection to ACProxyCam
+5. Raw FLV bytes are forwarded transparently (no parsing)
+6. RPC/MQTT responders still spawn on first FLV client (needed for slicer protocol)
+
+### State Variables
+```python
+self.acproxycam_flv_proxy = False    # Enable/disable proxy mode
+self.acproxycam_flv_url = None       # Set by POST /api/acproxycam/flv
+self.acproxycam_flv_last_seen = 0    # Timestamp of last announcement
+```
+
+### Edge Cases
+- ACProxyCam not ready: proxy retries every 2s for ~30s, then closes client (slicer reconnects)
+- ACProxyCam goes down: upstream read returns empty → client closed (slicer reconnects)
+- Proxy toggled off: `restart_encoders()` restarts rkmpi_enc with native FLV
+- Multiple slicers: each gets own upstream connection to ACProxyCam
+
+---
+
 ## Operating Modes
 
 The `--mode` flag controls how h264-streamer integrates with the printer's firmware.
