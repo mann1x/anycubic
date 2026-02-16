@@ -113,9 +113,13 @@ static size_t mqtt_encode_remaining_length(uint8_t *buf, size_t length) {
     return i;
 }
 
-/* Encode MQTT string (length-prefixed UTF-8) */
-static size_t mqtt_encode_string(uint8_t *buf, const char *str) {
+/* Encode MQTT string (length-prefixed UTF-8) with bounds checking */
+static size_t mqtt_encode_string(uint8_t *buf, size_t buf_avail, const char *str) {
     size_t len = strlen(str);
+    if (len + 2 > buf_avail) {
+        mqtt_log("String too long for buffer (%zu + 2 > %zu)\n", len, buf_avail);
+        return 0;
+    }
     buf[0] = (len >> 8) & 0xFF;
     buf[1] = len & 0xFF;
     memcpy(buf + 2, str, len);
@@ -129,9 +133,13 @@ static size_t mqtt_build_connect(uint8_t *buf, size_t buf_size,
                                  const char *password) {
     uint8_t var_header[256];
     uint8_t *p = var_header;
+    size_t avail = sizeof(var_header) - (size_t)(p - var_header);
+    size_t n;
 
     /* Protocol name "MQTT" */
-    p += mqtt_encode_string(p, "MQTT");
+    n = mqtt_encode_string(p, avail, "MQTT");
+    if (n == 0) return 0;
+    p += n;
 
     /* Protocol level (4 = MQTT 3.1.1) */
     *p++ = 0x04;
@@ -148,13 +156,28 @@ static size_t mqtt_build_connect(uint8_t *buf, size_t buf_size,
     /* Payload: client_id, username, password */
     uint8_t payload[512];
     uint8_t *pp = payload;
-    pp += mqtt_encode_string(pp, client_id);
-    pp += mqtt_encode_string(pp, username);
-    pp += mqtt_encode_string(pp, password);
+
+    avail = sizeof(payload) - (size_t)(pp - payload);
+    n = mqtt_encode_string(pp, avail, client_id);
+    if (n == 0) return 0;
+    pp += n;
+
+    avail = sizeof(payload) - (size_t)(pp - payload);
+    n = mqtt_encode_string(pp, avail, username);
+    if (n == 0) return 0;
+    pp += n;
+
+    avail = sizeof(payload) - (size_t)(pp - payload);
+    n = mqtt_encode_string(pp, avail, password);
+    if (n == 0) return 0;
+    pp += n;
+
     size_t payload_len = pp - payload;
 
     /* Build packet */
     size_t remaining = var_header_len + payload_len;
+    if (remaining + 5 > buf_size) return 0;  /* 5 = max header size */
+
     uint8_t *out = buf;
 
     *out++ = MQTT_CONNECT;
@@ -178,10 +201,14 @@ static size_t mqtt_build_subscribe(uint8_t *buf, size_t buf_size,
     *p++ = packet_id & 0xFF;
 
     /* Topic + QoS */
-    p += mqtt_encode_string(p, topic);
+    size_t avail = sizeof(payload) - (size_t)(p - payload) - 1;  /* -1 for QoS byte */
+    size_t n = mqtt_encode_string(p, avail, topic);
+    if (n == 0) return 0;
+    p += n;
     *p++ = 0x00;  /* QoS 0 */
 
     size_t payload_len = p - payload;
+    if (payload_len + 5 > buf_size) return 0;  /* 5 = max header size */
 
     /* Build packet */
     uint8_t *out = buf;
@@ -199,8 +226,12 @@ static size_t mqtt_build_publish(uint8_t *buf, size_t buf_size,
                                  int qos, uint16_t packet_id) {
     uint8_t var_header[256];
     uint8_t *p = var_header;
+    size_t avail = sizeof(var_header) - (size_t)(p - var_header);
 
-    p += mqtt_encode_string(p, topic);
+    size_t n = mqtt_encode_string(p, avail, topic);
+    if (n == 0) return 0;
+    p += n;
+
     if (qos > 0) {
         *p++ = (packet_id >> 8) & 0xFF;
         *p++ = packet_id & 0xFF;
@@ -209,6 +240,7 @@ static size_t mqtt_build_publish(uint8_t *buf, size_t buf_size,
 
     size_t payload_len = strlen(payload);
     size_t remaining = var_header_len + payload_len;
+    if (remaining + 5 > buf_size) return 0;  /* 5 = max header size */
 
     uint8_t *out = buf;
     uint8_t flags = (qos << 1) & 0x06;
@@ -485,6 +517,10 @@ static int mqtt_connect(MQTTClient *client) {
     uint8_t buf[1024];
     size_t len = mqtt_build_connect(buf, sizeof(buf), client->client_id,
                                     client->creds.username, client->creds.password);
+    if (len == 0) {
+        mqtt_log("CONNECT packet too large\n");
+        goto error;
+    }
     if (mqtt_ssl_send(client, buf, len) < 0) {
         mqtt_log("Failed to send CONNECT\n");
         goto error;
@@ -525,21 +561,21 @@ static void mqtt_subscribe_topics(MQTTClient *client) {
              "anycubic/anycubicCloud/v1/web/printer/%s/%s/video",
              client->config.model_id, client->creds.device_id);
     len = mqtt_build_subscribe(buf, sizeof(buf), topic, 1);
-    mqtt_ssl_send(client, buf, len);
+    if (len > 0) mqtt_ssl_send(client, buf, len);
 
     /* Slicer video topic */
     snprintf(topic, sizeof(topic),
              "anycubic/anycubicCloud/v1/slicer/printer/%s/%s/video",
              client->config.model_id, client->creds.device_id);
     len = mqtt_build_subscribe(buf, sizeof(buf), topic, 2);
-    mqtt_ssl_send(client, buf, len);
+    if (len > 0) mqtt_ssl_send(client, buf, len);
 
     /* Report topic (to detect spurious stopCapture) */
     snprintf(topic, sizeof(topic),
              "anycubic/anycubicCloud/v1/printer/public/%s/%s/video/report",
              client->config.model_id, client->creds.device_id);
     len = mqtt_build_subscribe(buf, sizeof(buf), topic, 3);
-    mqtt_ssl_send(client, buf, len);
+    if (len > 0) mqtt_ssl_send(client, buf, len);
 
     /* Read SUBACK responses */
     uint8_t suback[8];

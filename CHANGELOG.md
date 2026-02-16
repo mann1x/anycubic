@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## h264-streamer
 
+### [1.6.5] - 2026-02-16
+
+#### Added
+- Hide H.264 encoding settings when ACProxyCam FLV proxy is enabled (H.264 Encoding, Frame Rate, Auto Skip, Target CPU, Bitrate)
+
+#### Fixed
+- POST body DoS: added 1MB Content-Length cap via `_read_post_body()` helper (replaced 11 duplicated parsing blocks)
+- Filename sanitization: replaced denylist with allowlist regex approach
+- Narrowed ~31 `except Exception:` clauses to specific exception types with logging for HTTP handlers
+- Shell script quoting: quoted all path variables in app.sh and h264_monitor.sh
+
 ### [1.6.4] - 2026-02-06
 
 #### Added
@@ -124,6 +135,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## rkmpi-encoder
 
+### [1.4.1] - 2026-02-16
+
+#### Fixed
+- Command injection: replaced all `system()` calls in timelapse with `copy_file()` and `fork()`/`execv()`
+- Path traversal: added `sanitize_path()` and `sanitize_filename()` input validation
+- Race conditions: added mutex protection for shared state (`g_snapshot_pending`, `g_cam_ctrl`)
+- Signal safety: use `sig_atomic_t` for `g_running`, `sigaction()` instead of `signal()`, removed unsafe `log_info()` from signal handler
+- MQTT buffer overflow: added bounds checking in all packet builders (`mqtt_encode_string`, connect, subscribe, publish)
+
 ### [1.4.0] - 2025-02-05
 
 #### Added
@@ -178,6 +198,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ---
 
 ## fb-status
+
+### [1.0.1] - 2026-02-16
+
+#### Fixed
+- Font file size validation: added 16MB cap before malloc to prevent OOM
+- Removed `access()` TOCTOU check in font command handler, validate at use time
+- Signal safety: use `sig_atomic_t` for `g_running`, `sigaction()` instead of `signal()`
 
 ### [1.0.0] - 2025-01-15
 

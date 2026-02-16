@@ -30,6 +30,7 @@ import sys
 import threading
 import time
 import struct
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
@@ -885,7 +886,7 @@ class VideoRPCResponder:
         # This prevents buffer growth that causes progressive CPU increase
         try:
             self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
-        except Exception:
+        except OSError:
             pass
 
         self.sock.settimeout(30)
@@ -905,7 +906,7 @@ class VideoRPCResponder:
             # Use select to wait for data efficiently
             try:
                 readable, _, _ = select.select([self.sock], [], [], 0.5)
-            except Exception:
+            except (OSError, ValueError):
                 break
 
             if not readable:
@@ -1143,7 +1144,7 @@ def find_camera_device(internal_usb_port=None):
                 os.close(fd)
                 print(f"Found accessible video device: {device}", flush=True)
                 return device
-            except Exception:
+            except OSError:
                 continue
 
     print("WARNING: No camera device found", flush=True)
@@ -1516,7 +1517,7 @@ def update_moonraker_webcam_config(ip_address, port=8080, target_fps=10):
         )
         with urllib.request.urlopen(req, timeout=5):
             pass
-    except Exception:
+    except (OSError, urllib.error.URLError):
         pass
 
     return True
@@ -1593,7 +1594,7 @@ def provision_moonraker_webcam(ip_address, port, webcam_name, target_fps=10, set
             )
             with urllib.request.urlopen(req, timeout=5):
                 print(f"Set '{webcam_name}' as default dashboard webcam", flush=True)
-        except Exception:
+        except (OSError, urllib.error.URLError):
             pass
 
     return True
@@ -1636,7 +1637,7 @@ def get_cpu_usage():
             # Active excludes idle and iowait (guest is already in user)
             active = user + nice + system + irq + softirq + steal
             return active, total
-    except Exception:
+    except (OSError, ValueError, IndexError):
         pass
     return 0, 1
 
@@ -1672,7 +1673,7 @@ def get_process_cpu_usage(pid):
                         utime = int(fields[11])  # utime is 14th field, index 11 after comm
                         stime = int(fields[12])  # stime is 15th field, index 12 after comm
                         total_time += utime + stime
-                except Exception:
+                except (OSError, ValueError, IndexError):
                     continue
         else:
             # Fallback to main process stat
@@ -1681,7 +1682,7 @@ def get_process_cpu_usage(pid):
             fields = parse_stat_file(content)
             if fields:
                 total_time = int(fields[11]) + int(fields[12])
-    except Exception:
+    except (OSError, ValueError, IndexError):
         pass
     return total_time
 
@@ -1708,9 +1709,9 @@ def find_gkcam_pids():
                         comm = f.read().strip()
                     if comm == 'gkcam':
                         pids.append(int(pid))
-                except Exception:
+                except (OSError, ValueError, IndexError):
                     continue
-        except Exception:
+        except OSError:
             pass
     return pids
 
@@ -2123,8 +2124,8 @@ class MoonrakerClient:
                 if self.on_connect:
                     try:
                         self.on_connect()
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        print(f"Callback error: {e}", flush=True)
 
                 # Subscribe to print_stats
                 self._subscribe_print_stats()
@@ -2174,15 +2175,15 @@ class MoonrakerClient:
                 if self.sock:
                     try:
                         self.sock.close()
-                    except Exception:
+                    except OSError:
                         pass
                     self.sock = None
 
                 if self.on_disconnect:
                     try:
                         self.on_disconnect(str(e) if 'e' in dir() else "Unknown")
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        print(f"Callback error: {e}", flush=True)
 
             # Reconnect if still running
             if self.running:
@@ -2233,7 +2234,7 @@ class MoonrakerClient:
         if self.sock:
             try:
                 self.sock.close()
-            except Exception:
+            except OSError:
                 pass
 
         if self.thread:
@@ -2613,7 +2614,7 @@ def decode_h264_to_jpeg(h264_data):
         try:
             process.kill()
             process.wait()
-        except Exception:
+        except OSError:
             pass
     except Exception as e:
         print(f"ffmpeg decode error: {e}", flush=True)
@@ -2657,10 +2658,10 @@ class GkcamStreamingTranscoder:
             try:
                 self.process.terminate()
                 self.process.wait(timeout=2)
-            except Exception:
+            except OSError:
                 try:
                     self.process.kill()
-                except Exception:
+                except OSError:
                     pass
             self.process = None
 
@@ -3375,7 +3376,7 @@ class StreamerApp:
                     elif line.startswith('cam_power_line='):
                         try: self.cam_power_line = int(line.split('=')[1])
                         except ValueError: pass
-        except Exception:
+        except (OSError, ValueError, IndexError):
             pass
 
     def save_config(self):
@@ -3387,7 +3388,7 @@ class StreamerApp:
             try:
                 with open(config_path, 'r') as f:
                     config = json.load(f)
-            except Exception:
+            except (OSError, json.JSONDecodeError, ValueError):
                 pass
 
             # Update with current settings (using string values for bools)
@@ -4109,7 +4110,7 @@ class StreamerApp:
                     # Generic error detection
                     if camera_id in self.camera_status and self.camera_status[camera_id].get('status') != 'error':
                         self.camera_status[camera_id]['last_update'] = time.time()
-            except Exception:
+            except (OSError, ValueError):
                 break
 
         # Process ended - check if it was an error
@@ -4304,7 +4305,7 @@ class StreamerApp:
                 if not line:
                     break
                 print(f"[encoder] {line.decode('utf-8', errors='ignore').rstrip()}", flush=True)
-            except Exception:
+            except (OSError, ValueError):
                 break
 
     def _cpu_monitor_loop(self):
@@ -4532,12 +4533,12 @@ class StreamerApp:
                 self._serve_snapshot(client)
             else:
                 self._serve_404(client)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"Client handler error: {e}", flush=True)
         finally:
             try:
                 client.close()
-            except Exception:
+            except OSError:
                 pass
 
     def _run_flv_server(self):
@@ -4588,13 +4589,42 @@ class StreamerApp:
                 self._serve_flv_stream(client)
             else:
                 self._serve_404(client)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"Client handler error: {e}", flush=True)
         finally:
             try:
                 client.close()
-            except Exception:
+            except OSError:
                 pass
+
+    MAX_POST_BODY = 1024 * 1024  # 1MB
+
+    def _read_post_body(self, request, client):
+        """Read POST body with Content-Length cap to prevent OOM."""
+        content_length = 0
+        for line in request.split('\r\n'):
+            if line.lower().startswith('content-length:'):
+                try:
+                    content_length = int(line.split(':')[1].strip())
+                except (ValueError, IndexError):
+                    pass
+                break
+        content_length = min(content_length, self.MAX_POST_BODY)
+        if content_length <= 0:
+            return ''
+        body_start = request.find('\r\n\r\n')
+        if body_start == -1:
+            return ''
+        body_data = request[body_start + 4:]
+        while len(body_data) < content_length:
+            try:
+                chunk = client.recv(4096).decode('utf-8', errors='ignore')
+                if not chunk:
+                    break
+                body_data += chunk
+            except OSError:
+                break
+        return body_data[:content_length]
 
     def _handle_client(self, client):
         """Handle HTTP client"""
@@ -4637,22 +4667,7 @@ class StreamerApp:
                 self._redirect_to_streaming(client, '/flv', port=self.FLV_PORT)
             elif path == '/control':
                 if method == 'POST':
-                    # Read POST body - may need multiple recv() for large forms
-                    body = ""
-                    content_length = 0
-                    for line in lines:
-                        if line.lower().startswith('content-length:'):
-                            content_length = int(line.split(':')[1].strip())
-                    if content_length > 0:
-                        body_start = request.find('\r\n\r\n')
-                        if body_start != -1:
-                            body_data = request[body_start+4:]
-                            while len(body_data) < content_length:
-                                chunk = client.recv(4096).decode('utf-8', errors='ignore')
-                                if not chunk:
-                                    break
-                                body_data += chunk
-                            body = body_data[:content_length]
+                    body = self._read_post_body(request, client)
                     self._handle_control_post(client, body)
                 else:
                     self._serve_control_page(client)
@@ -4669,16 +4684,7 @@ class StreamerApp:
             elif path == '/api/led/off':
                 self._handle_led_control(client, False)
             elif path == '/api/touch' and method == 'POST':
-                # Parse POST body for touch coordinates
-                content_length = 0
-                for line in request.split('\r\n'):
-                    if line.lower().startswith('content-length:'):
-                        content_length = int(line.split(':')[1].strip())
-                body = ''
-                if content_length > 0:
-                    body_start = request.find('\r\n\r\n')
-                    if body_start != -1:
-                        body = request[body_start+4:body_start+4+content_length]
+                body = self._read_post_body(request, client)
                 self._handle_touch(client, body)
             # Timelapse management
             elif path == '/timelapse':
@@ -4705,27 +4711,12 @@ class StreamerApp:
                 browse_path = query.get('path', '/mnt/udisk')
                 self._serve_timelapse_browse(client, browse_path)
             elif path == '/api/timelapse/mkdir' and method == 'POST':
-                content_length = 0
-                for line in request.split('\r\n'):
-                    if line.lower().startswith('content-length:'):
-                        content_length = int(line.split(':')[1].strip())
-                body = ''
-                if content_length > 0:
-                    body_start = request.find('\r\n\r\n') + 4
-                    body = request[body_start:body_start + content_length]
+                body = self._read_post_body(request, client)
                 self._handle_timelapse_mkdir(client, body)
             elif path == '/api/timelapse/moonraker':
                 self._serve_timelapse_moonraker_status(client)
             elif path == '/api/timelapse/settings' and method == 'POST':
-                content_length = 0
-                for line in request.split('\r\n'):
-                    if line.lower().startswith('content-length:'):
-                        content_length = int(line.split(':')[1].strip())
-                body = ''
-                if content_length > 0:
-                    body_start = request.find('\r\n\r\n')
-                    if body_start != -1:
-                        body = request[body_start+4:body_start+4+content_length]
+                body = self._read_post_body(request, client)
                 self._handle_timelapse_settings(client, body)
             # Camera controls API
             elif path == '/api/camera/controls':
@@ -4733,98 +4724,42 @@ class StreamerApp:
             elif path == '/api/camera/reset' and method == 'POST':
                 self._handle_camera_reset(client)
             elif path == '/api/camera/set' and method == 'POST':
-                content_length = 0
-                for line in request.split('\r\n'):
-                    if line.lower().startswith('content-length:'):
-                        content_length = int(line.split(':')[1].strip())
-                body = ''
-                if content_length > 0:
-                    body_start = request.find('\r\n\r\n')
-                    if body_start != -1:
-                        body = request[body_start+4:body_start+4+content_length]
+                body = self._read_post_body(request, client)
                 self._handle_camera_set(client, body)
             elif path == '/api/cameras':
                 self._serve_cameras(client)
             elif path == '/api/camera/enable' and method == 'POST':
-                content_length = 0
-                for line in request.split('\r\n'):
-                    if line.lower().startswith('content-length:'):
-                        content_length = int(line.split(':')[1].strip())
-                body = ''
-                if content_length > 0:
-                    body_start = request.find('\r\n\r\n')
-                    if body_start != -1:
-                        body = request[body_start+4:body_start+4+content_length]
+                body = self._read_post_body(request, client)
                 self._handle_camera_enable(client, body)
             elif path == '/api/camera/disable' and method == 'POST':
-                content_length = 0
-                for line in request.split('\r\n'):
-                    if line.lower().startswith('content-length:'):
-                        content_length = int(line.split(':')[1].strip())
-                body = ''
-                if content_length > 0:
-                    body_start = request.find('\r\n\r\n')
-                    if body_start != -1:
-                        body = request[body_start+4:body_start+4+content_length]
+                body = self._read_post_body(request, client)
                 self._handle_camera_disable(client, body)
             elif path == '/api/camera/switch' and method == 'POST':
-                content_length = 0
-                for line in request.split('\r\n'):
-                    if line.lower().startswith('content-length:'):
-                        content_length = int(line.split(':')[1].strip())
-                body = ''
-                if content_length > 0:
-                    body_start = request.find('\r\n\r\n')
-                    if body_start != -1:
-                        body = request[body_start+4:body_start+4+content_length]
+                body = self._read_post_body(request, client)
                 self._handle_camera_switch(client, body)
             elif path == '/api/camera/settings' and method == 'POST':
-                content_length = 0
-                for line in request.split('\r\n'):
-                    if line.lower().startswith('content-length:'):
-                        content_length = int(line.split(':')[1].strip())
-                body = ''
-                if content_length > 0:
-                    body_start = request.find('\r\n\r\n')
-                    if body_start != -1:
-                        body = request[body_start+4:body_start+4+content_length]
+                body = self._read_post_body(request, client)
                 self._handle_camera_settings(client, body)
             # Moonraker camera settings
             elif path == '/api/moonraker/cameras' and method == 'GET':
                 self._serve_moonraker_cameras(client)
             elif path == '/api/moonraker/cameras' and method == 'POST':
-                content_length = 0
-                for line in request.split('\r\n'):
-                    if line.lower().startswith('content-length:'):
-                        content_length = int(line.split(':')[1].strip())
-                body = ''
-                if content_length > 0:
-                    body_start = request.find('\r\n\r\n')
-                    if body_start != -1:
-                        body = request[body_start+4:body_start+4+content_length]
+                body = self._read_post_body(request, client)
                 self._handle_moonraker_cameras(client, body)
             # ACProxyCam FLV proxy API
             elif path == '/api/acproxycam/flv' and method == 'POST':
-                content_length = 0
-                for line in request.split('\r\n'):
-                    if line.lower().startswith('content-length:'):
-                        content_length = int(line.split(':')[1].strip())
-                body = ''
-                if content_length > 0:
-                    body_start = request.find('\r\n\r\n')
-                    if body_start != -1:
-                        body = request[body_start+4:body_start+4+content_length]
+                body = self._read_post_body(request, client)
                 self._handle_acproxycam_flv_announce(client, body)
             elif path == '/api/acproxycam/flv' and method == 'GET':
                 self._serve_acproxycam_flv_status(client)
             else:
                 self._serve_404(client)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"Client handler error: {e}", flush=True)
         finally:
             try:
                 client.close()
-            except Exception:
+            except OSError:
                 pass
 
     def _serve_mjpeg_stream(self, client):
@@ -4859,7 +4794,7 @@ class StreamerApp:
                     header = f"--{self.MJPEG_BOUNDARY}\r\nContent-Type: image/jpeg\r\nContent-Length: {len(frame)}\r\n\r\n"
                     client.sendall(header.encode() + frame + b"\r\n")
                     self.mjpeg_fps.tick()
-                except Exception:
+                except (OSError, ValueError):
                     break
 
     def _serve_mjpeg_stream_gkcam(self, client):
@@ -4894,7 +4829,7 @@ class StreamerApp:
                 header = f"--{self.MJPEG_BOUNDARY}\r\nContent-Type: image/jpeg\r\nContent-Length: {len(jpeg)}\r\n\r\n"
                 client.sendall(header.encode() + jpeg + b"\r\n")
                 self.mjpeg_fps.tick()
-            except Exception:
+            except (OSError, ValueError):
                 break
 
     def _serve_mjpeg_stream_gkcam_keyframes(self, client):
@@ -4929,7 +4864,7 @@ class StreamerApp:
                 header = f"--{self.MJPEG_BOUNDARY}\r\nContent-Type: image/jpeg\r\nContent-Length: {len(jpeg)}\r\n\r\n"
                 client.sendall(header.encode() + jpeg + b"\r\n")
                 self.mjpeg_fps.tick()
-            except Exception:
+            except (OSError, ValueError):
                 break
 
     def _serve_snapshot(self, client):
@@ -5175,7 +5110,7 @@ class StreamerApp:
                             client.sendall(flv_data)
                             if contains_keyframe:
                                 sent_keyframe = True
-                    except Exception:
+                    except (OSError, ValueError):
                         break
                 else:
                     time.sleep(0.05)
@@ -5650,7 +5585,7 @@ class StreamerApp:
                     </div>
                     <div class="setting-note">Requires restart</div>
                 </div>
-                <div class="setting rkmpi-mjpeg-only" style="{'display:none' if self.encoder_type != 'rkmpi' else ''}">
+                <div class="setting rkmpi-mjpeg-only h264-local-setting" style="{'display:none' if self.encoder_type != 'rkmpi' or self.acproxycam_flv_proxy else ''}">
                     <div class="setting-row">
                         <span class="label">H.264 Encoding:</span>
                         <div class="control">
@@ -5689,7 +5624,7 @@ class StreamerApp:
                     </div>
                     <div class="setting-note">Only for Moonraker USB camera setup</div>
                 </div>
-                <div class="setting rkmpi-mjpeg-only" style="{'display:none' if self.encoder_type != 'rkmpi' else ''}">
+                <div class="setting rkmpi-mjpeg-only h264-local-setting" style="{'display:none' if self.encoder_type != 'rkmpi' or self.acproxycam_flv_proxy else ''}">
                     <div class="setting-row">
                         <span class="label">H.264 Frame Rate:</span>
                         <div class="slider-control">
@@ -5705,7 +5640,7 @@ class StreamerApp:
                     <div class="setting-note"><span id="fps_label"></span></div>
                     <input type="hidden" name="skip_ratio" id="skip_ratio_hidden" value="{self.saved_skip_ratio}">
                 </div>
-                <div class="setting rkmpi-mjpeg-only" style="{'display:none' if self.encoder_type != 'rkmpi' else ''}">
+                <div class="setting rkmpi-mjpeg-only h264-local-setting" style="{'display:none' if self.encoder_type != 'rkmpi' or self.acproxycam_flv_proxy else ''}">
                     <div class="setting-row">
                         <span class="label">Auto Skip (CPU-based):</span>
                         <div class="control">
@@ -5716,7 +5651,7 @@ class StreamerApp:
                         </div>
                     </div>
                 </div>
-                <div class="setting rkmpi-mjpeg-only" style="{'display:none' if self.encoder_type != 'rkmpi' else ''}">
+                <div class="setting rkmpi-mjpeg-only h264-local-setting" style="{'display:none' if self.encoder_type != 'rkmpi' or self.acproxycam_flv_proxy else ''}">
                     <div class="setting-row">
                         <span class="label">Target CPU % (for auto-skip):</span>
                         <div class="control">
@@ -5724,7 +5659,7 @@ class StreamerApp:
                         </div>
                     </div>
                 </div>
-                <div class="setting rkmpi-only" style="{'display:none' if not self.is_rkmpi_mode() else ''}">
+                <div class="setting rkmpi-only h264-local-setting" style="{'display:none' if not self.is_rkmpi_mode() or self.acproxycam_flv_proxy else ''}">
                     <div class="setting-row">
                         <span class="label">H.264 Bitrate (kbps):</span>
                         <div class="control">
@@ -5777,7 +5712,7 @@ class StreamerApp:
                         <span class="label">ACProxyCam FLV Proxy:</span>
                         <div class="control">
                             <label class="toggle">
-                                <input type="checkbox" name="acproxycam_flv_proxy" value="1" {'checked' if self.acproxycam_flv_proxy else ''}>
+                                <input type="checkbox" name="acproxycam_flv_proxy" value="1" {'checked' if self.acproxycam_flv_proxy else ''} onchange="toggleProxySettings(this.checked)">
                                 <span class="slider"></span>
                             </label>
                         </div>
@@ -6876,6 +6811,12 @@ if(flvjs.isSupported()){{
                 document.getElementById('skip_ratio_hidden').value = savedSkipRatio;
                 updateFpsLabel();
             }}
+        }}
+
+        function toggleProxySettings(proxyEnabled) {{
+            document.querySelectorAll('.h264-local-setting').forEach(el => {{
+                el.style.display = proxyEnabled ? 'none' : '';
+            }});
         }}
 
         function updateDisplaySettings() {{
@@ -8374,8 +8315,13 @@ addStream('Display Snapshot',streamBase+'/display/snapshot');
         """Sanitize filename to prevent path traversal attacks"""
         # Remove any path components
         name = os.path.basename(name)
-        # Remove any null bytes or other dangerous characters
-        name = name.replace('\x00', '').replace('..', '')
+        # Remove any null bytes
+        name = name.replace('\x00', '')
+        # Allowlist: only keep alphanumeric, dash, underscore, dot, space
+        name = re.sub(r'[^a-zA-Z0-9_\-. ]', '', name)
+        # Reject if empty or starts with dot (hidden files)
+        if not name or name.startswith('.'):
+            return ''
         return name
 
     def _get_query_param(self, path: str, param: str, default: str = '') -> str:
@@ -10121,11 +10067,11 @@ def run_flv_server_standalone(fifo_path, width, height):
                     time.sleep(0.05)
 
         except Exception as e:
-            pass
+            print(f"Client handler error: {e}", flush=True)
         finally:
             try:
                 client.close()
-            except:
+            except OSError:
                 pass
 
             # Kill subprocesses when last client disconnects

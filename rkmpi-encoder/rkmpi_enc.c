@@ -346,17 +346,23 @@ static int client_activity_check(int mjpeg_clients, int flv_clients, int server_
 }
 
 /* Global state */
-static volatile int g_running = 1;
+static volatile sig_atomic_t g_running = 1;
 static volatile int g_snapshot_pending = 0;  /* HTTP snapshot requested */
+static pthread_mutex_t g_state_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /* Request a snapshot (called from HTTP server thread) */
 void request_camera_snapshot(void) {
+    pthread_mutex_lock(&g_state_mutex);
     g_snapshot_pending = 1;
+    pthread_mutex_unlock(&g_state_mutex);
 }
 
 /* Check if snapshot is still pending */
 int is_snapshot_pending(void) {
-    return g_snapshot_pending;
+    pthread_mutex_lock(&g_state_mutex);
+    int pending = g_snapshot_pending;
+    pthread_mutex_unlock(&g_state_mutex);
+    return pending;
 }
 
 /* V4L2 buffer info */
@@ -401,9 +407,23 @@ typedef struct {
 #define CAM_CTRL_EXPOSURE_PRIO    (1 << 12)
 #define CAM_CTRL_POWER_LINE       (1 << 13)
 
-/* Global camera controls (can be modified at runtime via ctrl file) */
+/* Global camera controls (protected by g_state_mutex for cross-thread safety) */
 static CameraControls g_cam_ctrl = {0};
 static int g_v4l2_fd = -1;  /* V4L2 file descriptor for runtime control changes */
+
+/* Thread-safe snapshot pending helpers */
+static void clear_snapshot_pending(void) {
+    pthread_mutex_lock(&g_state_mutex);
+    g_snapshot_pending = 0;
+    pthread_mutex_unlock(&g_state_mutex);
+}
+
+static int check_snapshot_pending(void) {
+    pthread_mutex_lock(&g_state_mutex);
+    int pending = g_snapshot_pending;
+    pthread_mutex_unlock(&g_state_mutex);
+    return pending;
+}
 
 /* Configuration */
 typedef struct {
@@ -458,7 +478,7 @@ static void log_error(const char *fmt, ...) {
 }
 
 static void signal_handler(int sig) {
-    log_info("Received signal %d, stopping...\n", sig);
+    (void)sig;
     g_running = 0;
 }
 
@@ -542,77 +562,81 @@ static void read_cmd_file(void) {
         } else if (sscanf(line, "display_fps=%d", &val) == 1) {
             display_set_fps(val);
         }
-        /* === Camera controls === */
-        else if (sscanf(line, "cam_brightness=%d", &val) == 1) {
-            if (g_cam_ctrl.brightness != val) {
-                g_cam_ctrl.brightness = val;
-                g_cam_ctrl.set_mask |= CAM_CTRL_BRIGHTNESS;
+        /* === Camera controls (mutex-protected for cross-thread safety) === */
+        else if (strncmp(line, "cam_", 4) == 0) {
+            pthread_mutex_lock(&g_state_mutex);
+            if (sscanf(line, "cam_brightness=%d", &val) == 1) {
+                if (g_cam_ctrl.brightness != val) {
+                    g_cam_ctrl.brightness = val;
+                    g_cam_ctrl.set_mask |= CAM_CTRL_BRIGHTNESS;
+                }
+            } else if (sscanf(line, "cam_contrast=%d", &val) == 1) {
+                if (g_cam_ctrl.contrast != val) {
+                    g_cam_ctrl.contrast = val;
+                    g_cam_ctrl.set_mask |= CAM_CTRL_CONTRAST;
+                }
+            } else if (sscanf(line, "cam_saturation=%d", &val) == 1) {
+                if (g_cam_ctrl.saturation != val) {
+                    g_cam_ctrl.saturation = val;
+                    g_cam_ctrl.set_mask |= CAM_CTRL_SATURATION;
+                }
+            } else if (sscanf(line, "cam_hue=%d", &val) == 1) {
+                if (g_cam_ctrl.hue != val) {
+                    g_cam_ctrl.hue = val;
+                    g_cam_ctrl.set_mask |= CAM_CTRL_HUE;
+                }
+            } else if (sscanf(line, "cam_gamma=%d", &val) == 1) {
+                if (g_cam_ctrl.gamma != val) {
+                    g_cam_ctrl.gamma = val;
+                    g_cam_ctrl.set_mask |= CAM_CTRL_GAMMA;
+                }
+            } else if (sscanf(line, "cam_sharpness=%d", &val) == 1) {
+                if (g_cam_ctrl.sharpness != val) {
+                    g_cam_ctrl.sharpness = val;
+                    g_cam_ctrl.set_mask |= CAM_CTRL_SHARPNESS;
+                }
+            } else if (sscanf(line, "cam_gain=%d", &val) == 1) {
+                if (g_cam_ctrl.gain != val) {
+                    g_cam_ctrl.gain = val;
+                    g_cam_ctrl.set_mask |= CAM_CTRL_GAIN;
+                }
+            } else if (sscanf(line, "cam_backlight=%d", &val) == 1) {
+                if (g_cam_ctrl.backlight_comp != val) {
+                    g_cam_ctrl.backlight_comp = val;
+                    g_cam_ctrl.set_mask |= CAM_CTRL_BACKLIGHT;
+                }
+            } else if (sscanf(line, "cam_wb_auto=%d", &val) == 1) {
+                if (g_cam_ctrl.white_balance_auto != val) {
+                    g_cam_ctrl.white_balance_auto = val;
+                    g_cam_ctrl.set_mask |= CAM_CTRL_WB_AUTO;
+                }
+            } else if (sscanf(line, "cam_wb_temp=%d", &val) == 1) {
+                if (g_cam_ctrl.white_balance_temp != val) {
+                    g_cam_ctrl.white_balance_temp = val;
+                    g_cam_ctrl.set_mask |= CAM_CTRL_WB_TEMP;
+                }
+            } else if (sscanf(line, "cam_exposure_auto=%d", &val) == 1) {
+                if (g_cam_ctrl.exposure_auto != val) {
+                    g_cam_ctrl.exposure_auto = val;
+                    g_cam_ctrl.set_mask |= CAM_CTRL_EXPOSURE_AUTO;
+                }
+            } else if (sscanf(line, "cam_exposure=%d", &val) == 1) {
+                if (g_cam_ctrl.exposure_absolute != val) {
+                    g_cam_ctrl.exposure_absolute = val;
+                    g_cam_ctrl.set_mask |= CAM_CTRL_EXPOSURE_ABS;
+                }
+            } else if (sscanf(line, "cam_exposure_priority=%d", &val) == 1) {
+                if (g_cam_ctrl.exposure_auto_priority != val) {
+                    g_cam_ctrl.exposure_auto_priority = val;
+                    g_cam_ctrl.set_mask |= CAM_CTRL_EXPOSURE_PRIO;
+                }
+            } else if (sscanf(line, "cam_power_line=%d", &val) == 1) {
+                if (g_cam_ctrl.power_line_freq != val) {
+                    g_cam_ctrl.power_line_freq = val;
+                    g_cam_ctrl.set_mask |= CAM_CTRL_POWER_LINE;
+                }
             }
-        } else if (sscanf(line, "cam_contrast=%d", &val) == 1) {
-            if (g_cam_ctrl.contrast != val) {
-                g_cam_ctrl.contrast = val;
-                g_cam_ctrl.set_mask |= CAM_CTRL_CONTRAST;
-            }
-        } else if (sscanf(line, "cam_saturation=%d", &val) == 1) {
-            if (g_cam_ctrl.saturation != val) {
-                g_cam_ctrl.saturation = val;
-                g_cam_ctrl.set_mask |= CAM_CTRL_SATURATION;
-            }
-        } else if (sscanf(line, "cam_hue=%d", &val) == 1) {
-            if (g_cam_ctrl.hue != val) {
-                g_cam_ctrl.hue = val;
-                g_cam_ctrl.set_mask |= CAM_CTRL_HUE;
-            }
-        } else if (sscanf(line, "cam_gamma=%d", &val) == 1) {
-            if (g_cam_ctrl.gamma != val) {
-                g_cam_ctrl.gamma = val;
-                g_cam_ctrl.set_mask |= CAM_CTRL_GAMMA;
-            }
-        } else if (sscanf(line, "cam_sharpness=%d", &val) == 1) {
-            if (g_cam_ctrl.sharpness != val) {
-                g_cam_ctrl.sharpness = val;
-                g_cam_ctrl.set_mask |= CAM_CTRL_SHARPNESS;
-            }
-        } else if (sscanf(line, "cam_gain=%d", &val) == 1) {
-            if (g_cam_ctrl.gain != val) {
-                g_cam_ctrl.gain = val;
-                g_cam_ctrl.set_mask |= CAM_CTRL_GAIN;
-            }
-        } else if (sscanf(line, "cam_backlight=%d", &val) == 1) {
-            if (g_cam_ctrl.backlight_comp != val) {
-                g_cam_ctrl.backlight_comp = val;
-                g_cam_ctrl.set_mask |= CAM_CTRL_BACKLIGHT;
-            }
-        } else if (sscanf(line, "cam_wb_auto=%d", &val) == 1) {
-            if (g_cam_ctrl.white_balance_auto != val) {
-                g_cam_ctrl.white_balance_auto = val;
-                g_cam_ctrl.set_mask |= CAM_CTRL_WB_AUTO;
-            }
-        } else if (sscanf(line, "cam_wb_temp=%d", &val) == 1) {
-            if (g_cam_ctrl.white_balance_temp != val) {
-                g_cam_ctrl.white_balance_temp = val;
-                g_cam_ctrl.set_mask |= CAM_CTRL_WB_TEMP;
-            }
-        } else if (sscanf(line, "cam_exposure_auto=%d", &val) == 1) {
-            if (g_cam_ctrl.exposure_auto != val) {
-                g_cam_ctrl.exposure_auto = val;
-                g_cam_ctrl.set_mask |= CAM_CTRL_EXPOSURE_AUTO;
-            }
-        } else if (sscanf(line, "cam_exposure=%d", &val) == 1) {
-            if (g_cam_ctrl.exposure_absolute != val) {
-                g_cam_ctrl.exposure_absolute = val;
-                g_cam_ctrl.set_mask |= CAM_CTRL_EXPOSURE_ABS;
-            }
-        } else if (sscanf(line, "cam_exposure_priority=%d", &val) == 1) {
-            if (g_cam_ctrl.exposure_auto_priority != val) {
-                g_cam_ctrl.exposure_auto_priority = val;
-                g_cam_ctrl.set_mask |= CAM_CTRL_EXPOSURE_PRIO;
-            }
-        } else if (sscanf(line, "cam_power_line=%d", &val) == 1) {
-            if (g_cam_ctrl.power_line_freq != val) {
-                g_cam_ctrl.power_line_freq = val;
-                g_cam_ctrl.set_mask |= CAM_CTRL_POWER_LINE;
-            }
+            pthread_mutex_unlock(&g_state_mutex);
         }
         /* === Timelapse commands === */
         else if (strncmp(line, "timelapse_init:", 15) == 0) {
@@ -704,6 +728,7 @@ static void write_ctrl_file(void) {
         fprintf(f, "camera_max_fps=%d\n", camera_max_fps);
     }
     /* Current camera control values (for Python to read and display) */
+    pthread_mutex_lock(&g_state_mutex);
     fprintf(f, "cam_brightness=%d\n", g_cam_ctrl.brightness);
     fprintf(f, "cam_contrast=%d\n", g_cam_ctrl.contrast);
     fprintf(f, "cam_saturation=%d\n", g_cam_ctrl.saturation);
@@ -718,6 +743,7 @@ static void write_ctrl_file(void) {
     fprintf(f, "cam_exposure=%d\n", g_cam_ctrl.exposure_absolute);
     fprintf(f, "cam_exposure_priority=%d\n", g_cam_ctrl.exposure_auto_priority);
     fprintf(f, "cam_power_line=%d\n", g_cam_ctrl.power_line_freq);
+    pthread_mutex_unlock(&g_state_mutex);
     fclose(f);
 }
 
@@ -1867,9 +1893,15 @@ int main(int argc, char *argv[]) {
     }
 
     /* Setup signal handlers */
-    signal(SIGINT, signal_handler);
-    signal(SIGTERM, signal_handler);
-    signal(SIGPIPE, SIG_IGN);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+    sa.sa_handler = SIG_IGN;
+    sigaction(SIGPIPE, &sa, NULL);
 
     /* Read control files first (Python may have written settings) then write */
     read_cmd_file();  /* One-shot commands */
@@ -1970,7 +2002,9 @@ int main(int argc, char *argv[]) {
     g_v4l2_fd = v4l2_fd;
 
     /* Read current camera control values */
+    pthread_mutex_lock(&g_state_mutex);
     v4l2_read_controls(v4l2_fd, &g_cam_ctrl);
+    pthread_mutex_unlock(&g_state_mutex);
 
     /* Initialize VENC for H.264 encoding (needed for server mode FLV, but not for --no-flv) */
     if (h264_available) {
@@ -2165,9 +2199,11 @@ int main(int argc, char *argv[]) {
             read_cmd_file();  /* One-shot commands */
             read_ctrl_file();
             /* Apply any camera control changes */
+            pthread_mutex_lock(&g_state_mutex);
             if (g_cam_ctrl.set_mask) {
                 v4l2_apply_controls(v4l2_fd, &g_cam_ctrl);
             }
+            pthread_mutex_unlock(&g_state_mutex);
             last_ctrl_check = captured_count;
         }
 
@@ -2183,7 +2219,7 @@ int main(int argc, char *argv[]) {
 
             /* Idle mode - no clients, sleep longer (unless snapshot or timelapse pending) */
             if (cfg.server_mode && !cfg.mjpeg_stdout && total_clients == 0 &&
-                !g_snapshot_pending && !timelapse_is_active()) {
+                !check_snapshot_pending() && !timelapse_is_active()) {
                 /* Still check control files periodically in idle mode */
                 read_cmd_file();  /* One-shot commands */
                 read_ctrl_file();
@@ -2259,7 +2295,7 @@ int main(int argc, char *argv[]) {
             int flv_clients = cfg.server_mode ? flv_server_client_count() : 0;
             int total_clients = mjpeg_clients + flv_clients;
 
-            if (cfg.server_mode && total_clients == 0 && !g_snapshot_pending && !timelapse_is_active()) {
+            if (cfg.server_mode && total_clients == 0 && !check_snapshot_pending() && !timelapse_is_active()) {
                 /* Idle mode - no clients, requeue and sleep */
                 /* Still check control files periodically in idle mode */
                 read_cmd_file();  /* One-shot commands */
@@ -2355,7 +2391,7 @@ int main(int argc, char *argv[]) {
                                 captured_count >= CAMERA_WARMUP_FRAMES) {
                                 frame_buffer_write(&g_jpeg_buffer, jpeg_data, jpeg_len,
                                                    get_timestamp_us(), 0);
-                                g_snapshot_pending = 0;  /* Clear snapshot request */
+                                clear_snapshot_pending();  /* Clear snapshot request */
                             }
                             TIMING_END(frame_buffer);
 
@@ -2495,10 +2531,10 @@ skip_jpeg_output:
             TIMING_START(frame_buffer);
             if (cfg.server_mode && frame_buffers_initialized &&
                 captured_count >= CAMERA_WARMUP_FRAMES &&
-                (mjpeg_clients > 0 || g_snapshot_pending || timelapse_is_active())) {
+                (mjpeg_clients > 0 || check_snapshot_pending() || timelapse_is_active())) {
                 frame_buffer_write(&g_jpeg_buffer, jpeg_data, jpeg_len,
                                    get_timestamp_us(), 0);
-                g_snapshot_pending = 0;  /* Clear snapshot request after writing frame */
+                clear_snapshot_pending();  /* Clear snapshot request after writing frame */
             }
             TIMING_END(frame_buffer);
 
@@ -2672,9 +2708,11 @@ skip_jpeg_output:
             /* Read before write to preserve Python-set values (display settings) */
             read_ctrl_file();
             /* Apply any camera control changes */
+            pthread_mutex_lock(&g_state_mutex);
             if (g_cam_ctrl.set_mask) {
                 v4l2_apply_controls(v4l2_fd, &g_cam_ctrl);
             }
+            pthread_mutex_unlock(&g_state_mutex);
             write_ctrl_file();
             last_stats_write = now;
         }

@@ -18,8 +18,10 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 
 /* Global timelapse state */
 TimelapseState g_timelapse = {0};
@@ -39,6 +41,182 @@ static void timelapse_log(const char *fmt, ...) {
     vfprintf(stderr, fmt, args);
     va_end(args);
     fflush(stderr);
+}
+
+/*
+ * Validate a path: reject shell metacharacters and path traversal.
+ * Returns 0 if valid, -1 if invalid.
+ */
+static int sanitize_path(const char *path) {
+    if (!path || strlen(path) == 0) return -1;
+    /* Reject shell metacharacters */
+    for (const char *p = path; *p; p++) {
+        if (*p == '\'' || *p == '"' || *p == ';' || *p == '`' ||
+            *p == '$' || *p == '|' || *p == '&' || *p == '\n' || *p == '\r')
+            return -1;
+    }
+    /* Reject path traversal (.. components) */
+    if (strstr(path, "..") != NULL) return -1;
+    return 0;
+}
+
+/*
+ * Validate a filename: no path separators or metacharacters.
+ * Returns 0 if valid, -1 if invalid.
+ */
+static int sanitize_filename(const char *name) {
+    if (sanitize_path(name) != 0) return -1;
+    if (strchr(name, '/') != NULL) return -1;
+    return 0;
+}
+
+/*
+ * Copy a file using direct I/O (no shell).
+ * Returns 0 on success, -1 on error.
+ */
+static int copy_file(const char *src, const char *dst) {
+    int src_fd = open(src, O_RDONLY);
+    if (src_fd < 0) {
+        timelapse_log("copy_file: cannot open source %s: %s\n", src, strerror(errno));
+        return -1;
+    }
+
+    int dst_fd = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (dst_fd < 0) {
+        timelapse_log("copy_file: cannot open dest %s: %s\n", dst, strerror(errno));
+        close(src_fd);
+        return -1;
+    }
+
+    char buf[8192];
+    ssize_t nread;
+    while ((nread = read(src_fd, buf, sizeof(buf))) > 0) {
+        ssize_t written = 0;
+        while (written < nread) {
+            ssize_t n = write(dst_fd, buf + written, nread - written);
+            if (n < 0) {
+                timelapse_log("copy_file: write error: %s\n", strerror(errno));
+                close(src_fd);
+                close(dst_fd);
+                unlink(dst);
+                return -1;
+            }
+            written += n;
+        }
+    }
+
+    close(src_fd);
+    close(dst_fd);
+
+    if (nread < 0) {
+        timelapse_log("copy_file: read error: %s\n", strerror(errno));
+        unlink(dst);
+        return -1;
+    }
+
+    return 0;
+}
+
+/*
+ * Run ffmpeg using fork/execv (no shell).
+ * Returns ffmpeg exit code, or -1 on fork/exec error.
+ */
+static int run_ffmpeg(const char *ffmpeg_path, const char *ld_library_path,
+                      int fps, const char *input_pattern, const char *vf_filter,
+                      const char *codec, int crf, int q_v,
+                      const char *output_path) {
+    pid_t pid = fork();
+    if (pid < 0) {
+        timelapse_log("run_ffmpeg: fork failed: %s\n", strerror(errno));
+        return -1;
+    }
+
+    if (pid == 0) {
+        /* Child process */
+
+        /* Set LD_LIBRARY_PATH if needed (for stock ffmpeg fallback) */
+        if (ld_library_path) {
+            const char *existing = getenv("LD_LIBRARY_PATH");
+            if (existing) {
+                char new_path[1024];
+                snprintf(new_path, sizeof(new_path), "%s:%s", ld_library_path, existing);
+                setenv("LD_LIBRARY_PATH", new_path, 1);
+            } else {
+                setenv("LD_LIBRARY_PATH", ld_library_path, 1);
+            }
+        }
+
+        /* Redirect stdout/stderr to /dev/null */
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) {
+            dup2(devnull, STDOUT_FILENO);
+            dup2(devnull, STDERR_FILENO);
+            close(devnull);
+        }
+
+        /* Build argv */
+        char fps_str[16];
+        snprintf(fps_str, sizeof(fps_str), "%d", fps);
+
+        char crf_str[16];
+        snprintf(crf_str, sizeof(crf_str), "%d", crf);
+
+        char qv_str[16];
+        snprintf(qv_str, sizeof(qv_str), "%d", q_v);
+
+        /* Max 30 args should be plenty */
+        const char *argv[30];
+        int argc = 0;
+
+        argv[argc++] = ffmpeg_path;
+        argv[argc++] = "-y";
+        argv[argc++] = "-framerate";
+        argv[argc++] = fps_str;
+        argv[argc++] = "-i";
+        argv[argc++] = input_pattern;
+
+        if (vf_filter && vf_filter[0] != '\0') {
+            argv[argc++] = "-vf";
+            argv[argc++] = vf_filter;
+        }
+
+        argv[argc++] = "-c:v";
+        argv[argc++] = codec;
+
+        if (strcmp(codec, "libx264") == 0) {
+            argv[argc++] = "-preset";
+            argv[argc++] = "ultrafast";
+            argv[argc++] = "-tune";
+            argv[argc++] = "zerolatency";
+            argv[argc++] = "-x264-params";
+            argv[argc++] = "keyint=30:min-keyint=10:scenecut=0:bframes=0:ref=1:rc-lookahead=0:threads=1";
+            argv[argc++] = "-crf";
+            argv[argc++] = crf_str;
+            argv[argc++] = "-pix_fmt";
+            argv[argc++] = "yuv420p";
+        } else if (strcmp(codec, "mpeg4") == 0) {
+            argv[argc++] = "-q:v";
+            argv[argc++] = qv_str;
+        }
+
+        argv[argc++] = output_path;
+        argv[argc] = NULL;
+
+        execv(ffmpeg_path, (char *const *)argv);
+        _exit(127);  /* exec failed */
+    }
+
+    /* Parent: wait for child */
+    int status;
+    if (waitpid(pid, &status, 0) < 0) {
+        timelapse_log("run_ffmpeg: waitpid failed: %s\n", strerror(errno));
+        return -1;
+    }
+
+    if (WIFEXITED(status)) {
+        return WEXITSTATUS(status);
+    }
+    return -1;
 }
 
 /*
@@ -190,6 +368,10 @@ void timelapse_set_flip(int flip_x, int flip_y) {
 
 void timelapse_set_output_dir(const char *dir) {
     if (dir && strlen(dir) > 0 && strlen(dir) < TIMELAPSE_PATH_MAX) {
+        if (sanitize_path(dir) != 0) {
+            timelapse_log("Rejected output dir (invalid chars): %s\n", dir);
+            return;
+        }
         strncpy(g_timelapse.config.output_dir, dir, TIMELAPSE_PATH_MAX - 1);
         g_timelapse.config.output_dir[TIMELAPSE_PATH_MAX - 1] = '\0';
 
@@ -205,6 +387,10 @@ void timelapse_set_output_dir(const char *dir) {
 
 void timelapse_set_temp_dir(const char *dir) {
     if (dir && strlen(dir) > 0 && strlen(dir) < TIMELAPSE_PATH_MAX) {
+        if (sanitize_path(dir) != 0) {
+            timelapse_log("Rejected temp dir (invalid chars): %s\n", dir);
+            return;
+        }
         strncpy(g_timelapse.config.temp_dir_base, dir, TIMELAPSE_PATH_MAX - 1);
         g_timelapse.config.temp_dir_base[TIMELAPSE_PATH_MAX - 1] = '\0';
         timelapse_log("Set temp directory base: %s\n", g_timelapse.config.temp_dir_base);
@@ -326,6 +512,20 @@ int timelapse_init(const char *gcode_name, const char *output_dir) {
     if (!gcode_name || strlen(gcode_name) == 0) {
         timelapse_log("Init failed: no gcode name\n");
         return -1;
+    }
+
+    /* Validate gcode_name (filename only, no path separators) */
+    if (sanitize_filename(gcode_name) != 0) {
+        timelapse_log("Init failed: invalid gcode name\n");
+        return -1;
+    }
+
+    /* Validate output_dir if provided */
+    if (output_dir && strlen(output_dir) > 0) {
+        if (sanitize_path(output_dir) != 0) {
+            timelapse_log("Init failed: invalid output dir\n");
+            return -1;
+        }
     }
 
     /* Cancel any existing timelapse */
@@ -781,10 +981,11 @@ int timelapse_finalize(void) {
             snprintf(last_frame_path, sizeof(last_frame_path), "%s/frame_%04d.jpg",
                      g_timelapse.temp_dir, g_timelapse.frame_count - 1);
 
-            char cmd[TIMELAPSE_PATH_MAX * 2 + 32];
-            snprintf(cmd, sizeof(cmd), "cp '%s' '%s'", last_frame_path, output_thumb);
-            system(cmd);
-            timelapse_log("Created thumbnail: %s\n", output_thumb);
+            if (copy_file(last_frame_path, output_thumb) == 0) {
+                timelapse_log("Created thumbnail: %s\n", output_thumb);
+            } else {
+                timelapse_log("Failed to create thumbnail: %s\n", output_thumb);
+            }
 
             /* Clean up frame JPEGs */
             cleanup_temp_frames();
@@ -816,9 +1017,9 @@ ffmpeg_path:
             snprintf(dup_frame, sizeof(dup_frame), "%s/frame_%04d.jpg",
                      g_timelapse.temp_dir, g_timelapse.frame_count + i);
 
-            char cmd[TIMELAPSE_PATH_MAX * 2 + 32];
-            snprintf(cmd, sizeof(cmd), "cp '%s' '%s'", last_frame_path, dup_frame);
-            system(cmd);
+            if (copy_file(last_frame_path, dup_frame) != 0) {
+                timelapse_log("Failed to duplicate frame to %s\n", dup_frame);
+            }
         }
         g_timelapse.frame_count += g_timelapse.config.duplicate_last_frame;
         timelapse_log("Duplicated last frame %d times (total: %d frames)\n",
@@ -842,75 +1043,42 @@ ffmpeg_path:
     build_video_filter(vf_filter, sizeof(vf_filter));
 
     /* Assemble MP4 using ffmpeg with libx264 (minimal memory settings) */
-    char cmd[2048];
     int crf = (g_timelapse.config.crf > 0) ? g_timelapse.config.crf : 23;
 
-    if (vf_filter[0] != '\0') {
-        snprintf(cmd, sizeof(cmd),
-                 TIMELAPSE_FFMPEG_CMD " -y -framerate %d -i '%s/frame_%%04d.jpg' "
-                 "-vf '%s' "
-                 "-c:v libx264 -preset ultrafast -tune zerolatency "
-                 "-x264-params keyint=30:min-keyint=10:scenecut=0:bframes=0:ref=1:rc-lookahead=0:threads=1 "
-                 "-crf %d -pix_fmt yuv420p '%s' >/dev/null 2>&1",
-                 output_fps, g_timelapse.temp_dir, vf_filter, crf, output_mp4);
-    } else {
-        snprintf(cmd, sizeof(cmd),
-                 TIMELAPSE_FFMPEG_CMD " -y -framerate %d -i '%s/frame_%%04d.jpg' "
-                 "-c:v libx264 -preset ultrafast -tune zerolatency "
-                 "-x264-params keyint=30:min-keyint=10:scenecut=0:bframes=0:ref=1:rc-lookahead=0:threads=1 "
-                 "-crf %d -pix_fmt yuv420p '%s' >/dev/null 2>&1",
-                 output_fps, g_timelapse.temp_dir, crf, output_mp4);
-    }
+    /* Build input pattern for ffmpeg */
+    char input_pattern[TIMELAPSE_PATH_MAX];
+    snprintf(input_pattern, sizeof(input_pattern), "%s/frame_%%04d.jpg", g_timelapse.temp_dir);
 
     timelapse_log("Running ffmpeg (fps=%d, crf=%d)...\n", output_fps, crf);
-    int ret = system(cmd);
+    int ret = run_ffmpeg(TIMELAPSE_FFMPEG_PATH, NULL,
+                         output_fps, input_pattern, vf_filter,
+                         "libx264", crf, 0, output_mp4);
 
     /* Fallback 1: Try stock ffmpeg with LD_LIBRARY_PATH if static failed */
     if (ret != 0) {
         timelapse_log("Static ffmpeg failed (code %d), trying stock ffmpeg...\n", ret);
-        if (vf_filter[0] != '\0') {
-            snprintf(cmd, sizeof(cmd),
-                     TIMELAPSE_FFMPEG_CMD_STOCK " -y -framerate %d -i '%s/frame_%%04d.jpg' "
-                     "-vf '%s' "
-                     "-c:v libx264 -preset ultrafast -tune zerolatency "
-                     "-x264-params keyint=30:min-keyint=10:scenecut=0:bframes=0:ref=1:rc-lookahead=0:threads=1 "
-                     "-crf %d -pix_fmt yuv420p '%s' >/dev/null 2>&1",
-                     output_fps, g_timelapse.temp_dir, vf_filter, crf, output_mp4);
-        } else {
-            snprintf(cmd, sizeof(cmd),
-                     TIMELAPSE_FFMPEG_CMD_STOCK " -y -framerate %d -i '%s/frame_%%04d.jpg' "
-                     "-c:v libx264 -preset ultrafast -tune zerolatency "
-                     "-x264-params keyint=30:min-keyint=10:scenecut=0:bframes=0:ref=1:rc-lookahead=0:threads=1 "
-                     "-crf %d -pix_fmt yuv420p '%s' >/dev/null 2>&1",
-                     output_fps, g_timelapse.temp_dir, crf, output_mp4);
-        }
-        ret = system(cmd);
+        ret = run_ffmpeg(TIMELAPSE_FFMPEG_STOCK, TIMELAPSE_FFMPEG_LIBS,
+                         output_fps, input_pattern, vf_filter,
+                         "libx264", crf, 0, output_mp4);
     }
 
     /* Fallback 2: Try mpeg4 codec if libx264 fails (e.g., OOM) */
     if (ret != 0) {
         timelapse_log("libx264 failed (code %d), trying mpeg4...\n", ret);
-        if (vf_filter[0] != '\0') {
-            snprintf(cmd, sizeof(cmd),
-                     TIMELAPSE_FFMPEG_CMD_STOCK " -y -framerate %d -i '%s/frame_%%04d.jpg' "
-                     "-vf '%s' -c:v mpeg4 -q:v 5 '%s' >/dev/null 2>&1",
-                     output_fps, g_timelapse.temp_dir, vf_filter, output_mp4);
-        } else {
-            snprintf(cmd, sizeof(cmd),
-                     TIMELAPSE_FFMPEG_CMD_STOCK " -y -framerate %d -i '%s/frame_%%04d.jpg' "
-                     "-c:v mpeg4 -q:v 5 '%s' >/dev/null 2>&1",
-                     output_fps, g_timelapse.temp_dir, output_mp4);
-        }
-        ret = system(cmd);
+        ret = run_ffmpeg(TIMELAPSE_FFMPEG_STOCK, TIMELAPSE_FFMPEG_LIBS,
+                         output_fps, input_pattern, vf_filter,
+                         "mpeg4", 0, 5, output_mp4);
     }
 
     if (ret == 0) {
         timelapse_log("Created %s\n", output_mp4);
 
         /* Copy last frame as thumbnail */
-        snprintf(cmd, sizeof(cmd), "cp '%s' '%s'", last_frame, output_thumb);
-        system(cmd);
-        timelapse_log("Created thumbnail %s\n", output_thumb);
+        if (copy_file(last_frame, output_thumb) == 0) {
+            timelapse_log("Created thumbnail %s\n", output_thumb);
+        } else {
+            timelapse_log("Failed to create thumbnail %s\n", output_thumb);
+        }
     } else {
         timelapse_log("Failed to create MP4 (ffmpeg returned %d)\n", ret);
     }

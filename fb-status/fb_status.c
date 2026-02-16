@@ -270,7 +270,7 @@ typedef struct {
 static ScreenOrientation g_orientation = ORIENT_NORMAL;
 
 // Signal handling for cleanup
-static volatile int g_running = 1;
+static volatile sig_atomic_t g_running = 1;
 
 static void signal_handler(int sig) {
     (void)sig;
@@ -647,12 +647,20 @@ static uint32_t parse_color(const char *name) {
     return color_table[0].color;
 }
 
+#define MAX_FONT_SIZE (16 * 1024 * 1024)  /* 16MB */
+
 static unsigned char *load_font(const char *path, size_t *size) {
     FILE *f = fopen(path, "rb");
     if (!f) return NULL;
 
     fseek(f, 0, SEEK_END);
-    *size = ftell(f);
+    long file_size = ftell(f);
+    if (file_size <= 0 || (size_t)file_size > MAX_FONT_SIZE) {
+        fprintf(stderr, "Font file too large or invalid: %s (%ld bytes)\n", path, file_size);
+        fclose(f);
+        return NULL;
+    }
+    *size = (size_t)file_size;
     fseek(f, 0, SEEK_SET);
 
     unsigned char *data = malloc(*size);
@@ -2030,14 +2038,10 @@ static int run_pipe_mode(PipeState *state, const char *initial_message) {
                 state->custom_font[0] = '\0';  // Reset to default
                 pipe_respond(state->quiet, "OK\n");
             } else {
-                // Check if file exists
-                if (access(arg, R_OK) == 0) {
-                    strncpy(state->custom_font, arg, sizeof(state->custom_font) - 1);
-                    state->custom_font[sizeof(state->custom_font) - 1] = '\0';
-                    pipe_respond(state->quiet, "OK\n");
-                } else {
-                    pipe_respond(state->quiet, "ERR: Cannot read font file '%s'\n", arg);
-                }
+                // Store path; validation happens at font load time (FT_New_Face)
+                strncpy(state->custom_font, arg, sizeof(state->custom_font) - 1);
+                state->custom_font[sizeof(state->custom_font) - 1] = '\0';
+                pipe_respond(state->quiet, "OK\n");
             }
         }
         else if (strcmp(cmd, "hide") == 0) {
@@ -2267,9 +2271,14 @@ int main(int argc, char *argv[]) {
         }
 
         // Set up signal handlers for cleanup
-        signal(SIGINT, signal_handler);
-        signal(SIGTERM, signal_handler);
-        signal(SIGHUP, signal_handler);
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = signal_handler;
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = 0;
+        sigaction(SIGINT, &sa, NULL);
+        sigaction(SIGTERM, &sa, NULL);
+        sigaction(SIGHUP, &sa, NULL);
 
         // Initialize pipe state
         PipeState state = {

@@ -22,8 +22,6 @@
 #define TIMELAPSE_FFMPEG_PATH   "/useremain/home/rinkhals/apps/29-h264-streamer/ffmpeg"
 #define TIMELAPSE_FFMPEG_STOCK  "/ac_lib/lib/third_bin/ffmpeg"
 #define TIMELAPSE_FFMPEG_LIBS   "/ac_lib/lib/third_lib"
-#define TIMELAPSE_FFMPEG_CMD    TIMELAPSE_FFMPEG_PATH
-#define TIMELAPSE_FFMPEG_CMD_STOCK "LD_LIBRARY_PATH=" TIMELAPSE_FFMPEG_LIBS ":$LD_LIBRARY_PATH " TIMELAPSE_FFMPEG_STOCK
 
 /* Maximum path lengths */
 #define TIMELAPSE_PATH_MAX      1024
