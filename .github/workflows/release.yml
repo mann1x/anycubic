@@ -166,7 +166,8 @@ jobs:
           cat > /tmp/notes.md << 'NOTES'
           ## rkmpi-encoder
 
-          Hardware H.264/JPEG encoder for RV1106-based Anycubic printers.
+          Hardware H.264/JPEG encoder and streaming server for RV1106-based Anycubic printers.
+          Supports standalone mode and primary mode (all-in-one with web UI, config, multi-camera).
 
           ### Usage
           ```bash
@@ -299,7 +300,8 @@ jobs:
           cat > /tmp/notes.md << NOTES
           ## h264-streamer v${VERSION}
 
-          HTTP streaming server for Anycubic RV1106-based 3D printers.
+          All-in-one USB camera streaming application for Anycubic RV1106-based 3D printers.
+          Pure C implementation — single \`rkmpi_enc\` binary with hardware-accelerated encoding.
 
           ### Built with
           - rkmpi-encoder v${RKMPI_VERSION}
@@ -320,10 +322,14 @@ jobs:
           3. Insert USB into printer
 
           ### Features
-          - USB camera MJPEG/H.264 streaming
-          - Display capture with touch control
-          - Timelapse recording
-          - Web control interface
+          - USB camera MJPEG/H.264 streaming with hardware VENC encoding
+          - Multi-camera support (up to 4 USB cameras)
+          - Web control panel with live preview and settings
+          - Display capture with remote touch control
+          - Timelapse recording (layer/hyperlapse modes via Moonraker)
+          - Moonraker WebSocket integration for print monitoring
+          - Persistent JSON config with hot-reload
+          - ACProxyCam FLV proxy support
           NOTES
 
           gh release create "$TAG" \
