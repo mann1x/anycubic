@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## h264-streamer
 
+### [2.0.0] - 2026-02-17
+
+#### Added
+- Pure C architecture — rkmpi_enc `--primary` mode replaces h264_server.py as the sole application process
+- Built-in control server (port 8081) with web UI, REST API, and config persistence
+- Built-in multi-camera management — auto-detect, spawn, and manage up to 4 USB cameras
+- Built-in Moonraker WebSocket client for advanced timelapse (no Python IPC needed)
+- Built-in camera detection via `/dev/v4l/by-id/` with USB port resolution
+- Built-in CPU monitoring for stats and auto-skip
+- Built-in touch injection for remote display interaction
+- Built-in LAN mode management via local binary API
+- Built-in ACProxyCam FLV proxy with transparent byte forwarding
+- HTML template system (`control.html`, `index.html`, `timelapse.html`) with `{{variable}}` substitution
+- JSON config file persistence (`29-h264-streamer.config`) for all settings
+
+#### Removed
+- h264_server.py (10,160 lines of Python) — all functionality now in rkmpi_enc C binary
+- Python interpreter dependency — saves ~18MB RSS on the 256MB RV1106
+- FIFO pipes (`/tmp/mjpeg.pipe`, `/tmp/h264.pipe`) — streaming now internal to process
+- gkcam encoder mode — only rkmpi and rkmpi-yuyv modes supported
+
+#### Changed
+- Process model: single `rkmpi_enc --primary` process instead of Python orchestrator + C encoder subprocesses
+- Timelapse via Moonraker now uses direct function calls instead of control file IPC
+- Control page served from HTML template files instead of inline Python strings
+- Config now read/written by C `config.c` module instead of Python ConfigParser
+
 ### [1.6.5] - 2026-02-16
 
 #### Added
@@ -134,6 +161,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ---
 
 ## rkmpi-encoder
+
+### [1.5.0] - 2026-02-17
+
+#### Added
+- Primary mode (`--primary`) — all-in-one application process for h264-streamer
+- Control HTTP server (`control_server.c`) — web UI, REST API, config persistence on port 8081
+- Moonraker WebSocket client (`moonraker_client.c`) — RFC 6455 WebSocket, JSON-RPC subscription to print_stats/virtual_sdcard, direct timelapse function calls
+- Config management (`config.c`) — JSON config file read/write with AppConfig struct
+- Multi-camera management (`camera_detect.c`, `process_manager.c`) — USB camera discovery via /dev/v4l/by-id/, secondary encoder process lifecycle
+- CPU monitor (`cpu_monitor.c`) — system and per-process CPU tracking from /proc/stat
+- Touch injection (`touch_inject.c`) — Linux input subsystem touch events via /dev/input/event0
+- LAN mode management (`lan_mode.c`) — query/enable LAN mode via local binary API (port 18086)
+- ACProxyCam FLV proxy — transparent byte proxy from control server to ACProxyCam
+- HTML template serving with `{{variable}}` substitution for control page, index, timelapse manager
+- Moonraker camera provisioning — configure webcams in Moonraker via HTTP API
+- Timelapse file management — list, serve (with HTTP Range), delete, auto-generate thumbnails
+- Dynamic config reload — `on_config_changed` callback for live settings updates
 
 ### [1.4.1] - 2026-02-16
 

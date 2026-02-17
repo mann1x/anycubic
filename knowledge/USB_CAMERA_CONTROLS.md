@@ -83,7 +83,7 @@ rkmpi_enc -S -N -v --no-flv --streaming-port 8082 -d /dev/video12 \
     --cmd-file /tmp/h264_cmd_2 --ctrl-file /tmp/h264_ctrl_2 -y
 ```
 
-The h264_server.py manages which control file to write to based on the active camera selection in the UI.
+The control server manages which control file to write to based on the active camera selection in the UI.
 
 ## Implementation in rkmpi_enc
 
@@ -111,9 +111,9 @@ typedef struct {
 
 ### Control Flow
 
-1. Python (h264_server.py) writes `cam_*` values to `/tmp/h264_ctrl`
-2. rkmpi_enc reads ctrl file and applies to camera via `VIDIOC_S_CTRL`
-3. rkmpi_enc writes current values back to ctrl file for Python to display
+1. Control server writes `cam_*` values to `/tmp/h264_cmd`
+2. rkmpi_enc reads cmd file and applies to camera via `VIDIOC_S_CTRL`
+3. rkmpi_enc writes current values back to ctrl file for control server to display
 
 ### Ctrl File Format
 
@@ -134,7 +134,7 @@ cam_exposure_priority=0
 cam_power_line=1
 ```
 
-## API Endpoints (h264_server.py)
+## API Endpoints (control_server.c)
 
 ### GET /api/camera/controls
 

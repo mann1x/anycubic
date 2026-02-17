@@ -29,6 +29,17 @@ FlvServerThread g_flv_server;
 /* Control port for homepage links (default: 8081) */
 static int g_control_port = HTTP_CONTROL_PORT;
 
+/* FLV proxy state */
+static char g_flv_proxy_url[256] = "";
+static pthread_mutex_t g_flv_proxy_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Forward declarations for FLV proxy */
+typedef struct {
+    int client_fd;
+    char url[256];
+} FlvProxyArg;
+static void *flv_proxy_thread(void *arg);
+
 void http_set_control_port(int port) {
     g_control_port = (port > 0) ? port : HTTP_CONTROL_PORT;
 }
@@ -617,7 +628,39 @@ static void http_handle_client_read(HttpServer *srv, HttpClient *client) {
                 break;
 
             case REQUEST_FLV_STREAM:
-                /* Reject FLV connections if H.264 is disabled */
+                /* Check for FLV proxy mode first */
+                if (!is_h264_enabled() && flv_proxy_is_active()) {
+                    /* Proxy mode: hand off fd to proxy thread */
+                    FlvProxyArg *pa = malloc(sizeof(FlvProxyArg));
+                    if (pa) {
+                        pa->client_fd = client->fd;
+                        pthread_mutex_lock(&g_flv_proxy_lock);
+                        strncpy(pa->url, g_flv_proxy_url, sizeof(pa->url) - 1);
+                        pa->url[sizeof(pa->url) - 1] = '\0';
+                        pthread_mutex_unlock(&g_flv_proxy_lock);
+
+                        pthread_t pt;
+                        pthread_attr_t attr;
+                        pthread_attr_init(&attr);
+                        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+                        if (pthread_create(&pt, &attr, flv_proxy_thread, pa) == 0) {
+                            /* fd ownership transferred to proxy thread */
+                            client->fd = -1;
+                            client->state = CLIENT_STATE_CLOSING;
+                            log_info("HTTP[%d]: FLV proxy started\n", srv->port);
+                        } else {
+                            free(pa);
+                            http_send_503(client->fd, "FLV proxy thread failed");
+                            client->state = CLIENT_STATE_CLOSING;
+                        }
+                        pthread_attr_destroy(&attr);
+                    } else {
+                        http_send_503(client->fd, "Out of memory");
+                        client->state = CLIENT_STATE_CLOSING;
+                    }
+                    break;
+                }
+                /* Reject FLV connections if H.264 is disabled and no proxy */
                 if (!is_h264_enabled()) {
                     http_send_503(client->fd, "H.264 encoding is disabled");
                     client->state = CLIENT_STATE_CLOSING;
@@ -1039,4 +1082,171 @@ void flv_server_stop(void) {
 
 int flv_server_client_count(void) {
     return g_flv_server.server.client_count;
+}
+
+/* ============================================================================
+ * FLV Proxy - relay ACProxyCam's FLV stream to local clients
+ * ============================================================================ */
+
+void flv_proxy_set_url(const char *url) {
+    pthread_mutex_lock(&g_flv_proxy_lock);
+    if (url && url[0]) {
+        strncpy(g_flv_proxy_url, url, sizeof(g_flv_proxy_url) - 1);
+    } else {
+        g_flv_proxy_url[0] = '\0';
+    }
+    pthread_mutex_unlock(&g_flv_proxy_lock);
+}
+
+int flv_proxy_is_active(void) {
+    pthread_mutex_lock(&g_flv_proxy_lock);
+    int active = g_flv_proxy_url[0] != '\0';
+    pthread_mutex_unlock(&g_flv_proxy_lock);
+    return active;
+}
+
+/* Parse "http://host:port/path" into components */
+static int parse_http_url(const char *url, char *host, int host_size,
+                           int *port, char *path, int path_size) {
+    if (strncmp(url, "http://", 7) != 0) return -1;
+    const char *hp = url + 7;
+    const char *colon = strchr(hp, ':');
+    const char *slash = strchr(hp, '/');
+
+    if (colon && (!slash || colon < slash)) {
+        int hlen = colon - hp;
+        if (hlen >= host_size) hlen = host_size - 1;
+        memcpy(host, hp, hlen);
+        host[hlen] = '\0';
+        *port = atoi(colon + 1);
+    } else {
+        *port = 80;
+        int hlen = slash ? (slash - hp) : (int)strlen(hp);
+        if (hlen >= host_size) hlen = host_size - 1;
+        memcpy(host, hp, hlen);
+        host[hlen] = '\0';
+    }
+
+    if (slash) {
+        strncpy(path, slash, path_size - 1);
+        path[path_size - 1] = '\0';
+    } else {
+        strncpy(path, "/", path_size - 1);
+    }
+
+    return 0;
+}
+
+/* Proxy thread: connect to ACProxyCam, relay FLV bytes to client */
+static void *flv_proxy_thread(void *arg) {
+    FlvProxyArg *pa = (FlvProxyArg *)arg;
+    int client_fd = pa->client_fd;
+    char url[256];
+    strncpy(url, pa->url, sizeof(url) - 1);
+    url[sizeof(url) - 1] = '\0';
+    free(pa);
+
+    char host[64], path[128];
+    int port;
+    if (parse_http_url(url, host, sizeof(host), &port, path, sizeof(path)) < 0) {
+        fprintf(stderr, "FLV proxy: invalid URL: %s\n", url);
+        close(client_fd);
+        return NULL;
+    }
+
+    /* Connect to upstream (ACProxyCam) */
+    int upstream = socket(AF_INET, SOCK_STREAM, 0);
+    if (upstream < 0) {
+        fprintf(stderr, "FLV proxy: socket() failed: %s\n", strerror(errno));
+        close(client_fd);
+        return NULL;
+    }
+
+    struct timeval tv = { .tv_sec = 10, .tv_usec = 0 };
+    setsockopt(upstream, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    setsockopt(upstream, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    inet_pton(AF_INET, host, &addr.sin_addr);
+
+    if (connect(upstream, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        fprintf(stderr, "FLV proxy: connect to %s:%d failed: %s\n",
+                host, port, strerror(errno));
+        close(upstream);
+        close(client_fd);
+        return NULL;
+    }
+
+    /* Send HTTP GET to upstream */
+    char req[256];
+    int rlen = snprintf(req, sizeof(req),
+        "GET %s HTTP/1.1\r\nHost: %s:%d\r\nConnection: close\r\n\r\n",
+        path, host, port);
+    send(upstream, req, rlen, MSG_NOSIGNAL);
+
+    /* Read upstream response header (skip it) */
+    char hdr_buf[1024];
+    int hdr_pos = 0;
+    int body_start = -1;
+    while (hdr_pos < (int)sizeof(hdr_buf) - 1) {
+        ssize_t n = recv(upstream, hdr_buf + hdr_pos, 1, 0);
+        if (n <= 0) break;
+        hdr_pos++;
+        if (hdr_pos >= 4 &&
+            hdr_buf[hdr_pos-4] == '\r' && hdr_buf[hdr_pos-3] == '\n' &&
+            hdr_buf[hdr_pos-2] == '\r' && hdr_buf[hdr_pos-1] == '\n') {
+            body_start = hdr_pos;
+            break;
+        }
+    }
+
+    if (body_start < 0) {
+        fprintf(stderr, "FLV proxy: no response from upstream\n");
+        close(upstream);
+        close(client_fd);
+        return NULL;
+    }
+
+    /* Send our own HTTP headers to client (matching gkcam format) */
+    const char *resp =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/plain\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "Content-Length: 99999999999\r\n"
+        "\r\n";
+    if (send(client_fd, resp, strlen(resp), MSG_NOSIGNAL) < 0) {
+        close(upstream);
+        close(client_fd);
+        return NULL;
+    }
+
+    fprintf(stderr, "FLV proxy: relaying from %s\n", url);
+
+    /* Transparent byte relay */
+    char buf[8192];
+    while (g_flv_server.running) {
+        ssize_t n = recv(upstream, buf, sizeof(buf), 0);
+        if (n <= 0) break;
+        ssize_t sent = 0;
+        while (sent < n) {
+            ssize_t w = send(client_fd, buf + sent, n - sent, MSG_NOSIGNAL);
+            if (w < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    usleep(1000);
+                    continue;
+                }
+                goto proxy_done;
+            }
+            sent += w;
+        }
+    }
+
+proxy_done:
+    fprintf(stderr, "FLV proxy: client disconnected\n");
+    close(upstream);
+    close(client_fd);
+    return NULL;
 }

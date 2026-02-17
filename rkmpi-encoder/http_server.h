@@ -118,4 +118,12 @@ void http_set_control_port(int port);
 /* Check if H.264 encoding is enabled (implemented in rkmpi_enc.c) */
 int is_h264_enabled(void);
 
+/* FLV proxy: set upstream URL for ACProxyCam relay.
+ * When set and H.264 is disabled, FLV clients are proxied to this URL.
+ * Pass NULL or empty string to disable proxy. */
+void flv_proxy_set_url(const char *url);
+
+/* Check if FLV proxy is configured */
+int flv_proxy_is_active(void);
+
 #endif /* HTTP_SERVER_H */

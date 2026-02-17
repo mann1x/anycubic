@@ -1,6 +1,6 @@
 # h264-streamer
 
-HTTP streaming server with web UI for Rinkhals custom firmware on Anycubic printers.
+All-in-one USB camera streaming app for Rinkhals custom firmware on Anycubic printers. Pure C implementation — no Python interpreter required.
 
 ## Features
 
@@ -11,10 +11,12 @@ HTTP streaming server with web UI for Rinkhals custom firmware on Anycubic print
 - **Touch Control** - Click on display stream to interact with printer UI
 - **Web Control Panel** - Live preview, settings, and monitoring
 - **Camera Controls** - Real-time V4L2 camera adjustments (brightness, contrast, etc.)
+- **Timelapse Recording** - Layer-by-layer or interval-based recording to MP4
 - **Timelapse Management** - Browse, preview, download, and delete recordings
-- **Moonraker Integration** - Compatible webcam endpoints
+- **Moonraker Integration** - WebSocket timelapse + webcam provisioning
 - **Auto Frame Skipping** - Dynamic frame rate based on CPU load
-- **Timelapse Recording** - Layer-by-layer recording to MP4
+- **ACProxyCam FLV Proxy** - Offload H.264 encoding to external host
+- **Config Persistence** - JSON config file for all settings
 
 ## Installation
 
@@ -356,10 +358,10 @@ Enable in the Timelapse Settings panel on the control page:
 
 ### Video Encoding
 
-Videos are encoded using libx264 with memory-optimized settings for the RV1106:
-- **Codec**: H.264 (libx264) with ultrafast preset
-- **Fallback**: mpeg4 if libx264 fails (OOM)
-- **Quality**: Configurable CRF (0-51, default 23)
+Videos are encoded using the RV1106 hardware VENC encoder:
+- **Codec**: H.264 via hardware VENC (no ffmpeg dependency)
+- **Muxer**: minimp4 header-only library for MP4 container
+- **Fallback**: ffmpeg with libx264 if VENC fails
 - **Compatibility**: HTML5 video playback in browsers
 
 ### Notes
@@ -371,19 +373,29 @@ Videos are encoded using libx264 with memory-optimized settings for the RV1106:
 
 ## Configuration
 
-Settings are stored in `app.json`:
+Basic settings in `app.json` (Rinkhals app properties):
 
 | Property | Default | Description |
 |----------|---------|-------------|
 | `mode` | go-klipper | Operating mode (see below) |
-| `encoder_type` | rkmpi-yuyv | Encoder: gkcam, rkmpi, rkmpi-yuyv |
+| `streaming_port` | 8080 | Streaming server port |
+| `control_port` | 8081 | Control server port |
+| `logging` | false | Enable debug logging |
+
+All other settings are persisted in `29-h264-streamer.config` (JSON) and managed via the control page:
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `encoder_type` | rkmpi | Encoder mode: rkmpi, rkmpi-yuyv |
 | `autolanmode` | true | Auto-enable LAN mode on start |
+| `h264_enabled` | true | Enable H.264 encoding |
 | `auto_skip` | false | Auto frame skip based on CPU |
 | `target_cpu` | 60 | Target CPU % for auto-skip |
 | `bitrate` | 512 | H.264 bitrate (kbps) |
 | `mjpeg_fps` | 10 | MJPEG framerate |
-| `port` | 8080 | Main HTTP server port |
-| `logging` | false | Enable debug logging |
+| `display_enabled` | false | Enable display capture |
+| `timelapse_enabled` | false | Enable Moonraker timelapse |
+| `acproxycam_flv_proxy` | false | Enable ACProxyCam FLV proxy |
 
 ## Operating Modes
 
@@ -464,23 +476,12 @@ MJPEG capture from USB camera with pass-through for MJPEG streaming.
 - **~10 fps MJPEG, ~2-10 fps H.264 on KS1**
 - Best for: Higher frame rate when CPU headroom available
 
-### gkcam
-
-Uses the native gkcam camera service (no rkmpi_enc).
-
-- Proxies gkcam's FLV stream at `:18088/flv`
-- **H.264 stream runs at ~4 fps on KS1**
-- MJPEG extracted from H.264 keyframes (~1 fps)
-- Lowest resource usage
-- Does not kill gkcam (coexists with native firmware)
-
 ### Mode Comparison
 
 | Mode | MJPEG FPS | H.264 FPS | CPU Usage | Notes |
 |------|-----------|-----------|-----------|-------|
 | **rkmpi-yuyv** | ~4 | ~4 | 5-10% | Recommended - low CPU |
 | rkmpi | ~10 | ~2-10 | 7-20% | Higher CPU with H.264 enabled |
-| gkcam | ~1 | ~4 | <5% | Uses native firmware stream |
 
 *FPS values measured on Kobra S1. Other models may vary.*
 
@@ -497,17 +498,17 @@ Uses the native gkcam camera service (no rkmpi_enc).
 /useremain/home/rinkhals/apps/29-h264-streamer/app.sh status
 ```
 
-**Warning**: Never use `killall python` or `pkill python` - this will break Moonraker/Klipper!
-
 ## Files
 
 ```
 29-h264-streamer/
-├── app.json          # Configuration
+├── app.json          # Rinkhals app metadata
 ├── app.sh            # Start/stop script
-├── h264_server.py    # Main Python server
-├── h264_monitor.sh   # Monitor/restart script
-└── rkmpi_enc         # Hardware encoder binary
+├── h264_monitor.sh   # Config reader, launches primary encoder
+├── rkmpi_enc         # All-in-one binary (encoder + control server + APIs)
+├── control.html      # Control page template
+├── index.html        # Homepage template
+└── timelapse.html    # Timelapse manager template
 ```
 
 ## Documentation

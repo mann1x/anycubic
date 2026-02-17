@@ -63,6 +63,11 @@
 #include "rpc_client.h"
 #include "display_capture.h"
 #include "timelapse.h"
+#include "control_server.h"
+#include "lan_mode.h"
+#include "camera_detect.h"
+#include "process_manager.h"
+#include "moonraker_client.h"
 
 /* Forward declarations */
 static void log_info(const char *fmt, ...);
@@ -457,6 +462,11 @@ typedef struct {
     int no_flv;           /* 1=disable FLV server (for secondary cameras) */
     char cmd_file[256];   /* Command file path (default: /tmp/h264_cmd) */
     char ctrl_file[256];  /* Control/stats file path (default: /tmp/h264_ctrl) */
+    /* Primary mode (control server + camera management) */
+    int primary_mode;     /* 1=enable control server, config persistence */
+    char config_file[256]; /* Config file path */
+    char template_dir[256]; /* HTML template directory */
+    char internal_usb_port[32]; /* Internal USB port for camera detection */
 } EncoderConfig;
 
 static void log_info(const char *fmt, ...) {
@@ -722,7 +732,7 @@ static void write_ctrl_file(void) {
     fprintf(f, "mjpeg_clients=%d\n", g_stats.mjpeg_clients);
     fprintf(f, "flv_clients=%d\n", g_stats.flv_clients);
     fprintf(f, "display_clients=%d\n", display_get_client_count());
-    /* Detected camera max FPS (for h264_server.py to update slider limits) */
+    /* Detected camera max FPS (for control server to update slider limits) */
     if (g_mjpeg_ctrl.camera_fps_detected && g_mjpeg_ctrl.camera_interval > 0) {
         int camera_max_fps = 1000000 / g_mjpeg_ctrl.camera_interval;
         fprintf(f, "camera_max_fps=%d\n", camera_max_fps);
@@ -1685,6 +1695,9 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "  --display            Enable display framebuffer capture (server mode)\n");
     fprintf(stderr, "  --display-fps <n>    Display capture FPS (default: %d)\n", DISPLAY_DEFAULT_FPS);
     fprintf(stderr, "  --no-flv             Disable FLV server (for secondary cameras)\n");
+    fprintf(stderr, "  --primary            Enable primary mode (control server + config)\n");
+    fprintf(stderr, "  --config <path>      Config file path (primary mode)\n");
+    fprintf(stderr, "  --template-dir <dir> HTML template directory (primary mode)\n");
     fprintf(stderr, "  -v, --verbose        Verbose output to stderr\n");
     fprintf(stderr, "  -V, --version        Show version and exit\n");
     fprintf(stderr, "  --help               Show this help\n");
@@ -1703,6 +1716,58 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "  - MJPEG mode: Camera delivers MJPEG, TurboJPEG decodes for H.264\n");
     fprintf(stderr, "  - YUYV mode: Lower FPS (~5fps at 720p) but lower CPU usage\n");
     fprintf(stderr, "  - In YUYV mode, both H.264 and JPEG use hardware encoding\n");
+}
+
+/* ============================================================================
+ * Moonraker Client State (file-scope for config-changed callback access)
+ * ============================================================================ */
+
+static MoonrakerClient g_moonraker_client;
+static int g_moonraker_initialized = 0;
+static AppConfig *g_app_config_ptr = NULL;  /* Set in main() */
+
+/*
+ * Config-changed callback: handle timelapse/moonraker setting changes.
+ * Called from control server thread when settings are saved.
+ */
+static void on_config_changed(AppConfig *cfg) {
+    /* Check if moonraker client needs start/stop/restart */
+    int should_run = cfg->timelapse_enabled;
+    int is_running = g_moonraker_initialized;
+
+    if (should_run && !is_running) {
+        /* Timelapse newly enabled — start moonraker client */
+        log_info("Config: timelapse enabled, starting Moonraker client\n");
+        if (moonraker_client_start(&g_moonraker_client,
+                cfg->moonraker_host,
+                cfg->moonraker_port,
+                cfg) == 0) {
+            g_moonraker_initialized = 1;
+            control_server_set_moonraker(&g_moonraker_client);
+        }
+    } else if (!should_run && is_running) {
+        /* Timelapse newly disabled — stop moonraker client */
+        log_info("Config: timelapse disabled, stopping Moonraker client\n");
+        moonraker_client_stop(&g_moonraker_client);
+        g_moonraker_initialized = 0;
+        control_server_set_moonraker(NULL);
+    } else if (should_run && is_running) {
+        /* Check if moonraker host/port changed */
+        if (strcmp(g_moonraker_client.host, cfg->moonraker_host) != 0 ||
+            g_moonraker_client.port != cfg->moonraker_port) {
+            log_info("Config: Moonraker host/port changed, restarting client\n");
+            moonraker_client_stop(&g_moonraker_client);
+            if (moonraker_client_start(&g_moonraker_client,
+                    cfg->moonraker_host,
+                    cfg->moonraker_port,
+                    cfg) == 0) {
+                control_server_set_moonraker(&g_moonraker_client);
+            } else {
+                g_moonraker_initialized = 0;
+                control_server_set_moonraker(NULL);
+            }
+        }
+    }
 }
 
 int main(int argc, char *argv[]) {
@@ -1761,6 +1826,10 @@ int main(int argc, char *argv[]) {
         {"no-flv",       no_argument,       0, 'X'},
         {"cmd-file",     required_argument, 0, 1001},
         {"ctrl-file",    required_argument, 0, 1002},
+        {"primary",      no_argument,       0, 1003},
+        {"config",       required_argument, 0, 1004},
+        {"template-dir", required_argument, 0, 1005},
+        {"internal-usb-port", required_argument, 0, 1006},
         {0, 0, 0, 0}
     };
 
@@ -1805,6 +1874,10 @@ int main(int argc, char *argv[]) {
             case 'X': cfg.no_flv = 1; break;
             case 1001: strncpy(cfg.cmd_file, optarg, sizeof(cfg.cmd_file) - 1); break;
             case 1002: strncpy(cfg.ctrl_file, optarg, sizeof(cfg.ctrl_file) - 1); break;
+            case 1003: cfg.primary_mode = 1; break;
+            case 1004: strncpy(cfg.config_file, optarg, sizeof(cfg.config_file) - 1); break;
+            case 1005: strncpy(cfg.template_dir, optarg, sizeof(cfg.template_dir) - 1); break;
+            case 1006: strncpy(cfg.internal_usb_port, optarg, sizeof(cfg.internal_usb_port) - 1); break;
             case 'H':
             case '?':
                 print_usage(argv[0]);
@@ -1907,6 +1980,155 @@ int main(int argc, char *argv[]) {
     read_cmd_file();  /* One-shot commands */
     read_ctrl_file();
     write_ctrl_file();
+
+    /* Primary mode: load config, start control server, enable LAN mode */
+    AppConfig app_config;
+    int control_server_initialized = 0;
+    if (cfg.primary_mode) {
+        config_set_defaults(&app_config);
+
+        /* Load persistent config (if it exists) */
+        const char *config_path = cfg.config_file[0]
+            ? cfg.config_file
+            : "/useremain/home/rinkhals/apps/29-h264-streamer.config";
+        if (config_load(&app_config, config_path) == 0) {
+            log_info("Primary: loaded config from %s\n", config_path);
+        } else {
+            log_info("Primary: using default config (no config file)\n");
+        }
+
+        /* Store config path for later saves */
+        strncpy(app_config.config_file, config_path,
+                sizeof(app_config.config_file) - 1);
+
+        /* Override config with CLI args where provided */
+        if (cfg.streaming_port > 0)
+            app_config.streaming_port = cfg.streaming_port;
+        if (cfg.control_port > 0)
+            app_config.control_port = cfg.control_port;
+        if (cfg.yuyv_mode)
+            strncpy(app_config.encoder_type, "rkmpi-yuyv",
+                    sizeof(app_config.encoder_type) - 1);
+
+        /* Apply config values back to encoder state */
+        g_ctrl.h264_enabled = app_config.h264_enabled;
+        g_ctrl.skip_ratio = app_config.skip_ratio;
+        g_ctrl.auto_skip = app_config.auto_skip;
+        g_ctrl.target_cpu = app_config.target_cpu;
+
+        /* When ACProxyCam FLV proxy is enabled, disable local H.264 encoding
+         * since ACProxyCam handles encoding on the PC side */
+        if (app_config.acproxycam_flv_proxy) {
+            g_ctrl.h264_enabled = 0;
+            g_ctrl.auto_skip = 0;
+            log_info("Primary: ACProxyCam FLV proxy enabled, "
+                     "disabling local H.264 encoding\n");
+        }
+
+        /* Apply display settings from config */
+        if (app_config.display_enabled) {
+            display_set_enabled(1);
+        }
+        if (app_config.display_fps > 0) {
+            display_set_fps(app_config.display_fps);
+        }
+
+        /* Enable LAN mode if configured */
+        if (app_config.autolanmode) {
+            int lan_status = lan_mode_query();
+            if (lan_status == 0) {
+                log_info("Primary: enabling LAN mode...\n");
+                if (lan_mode_enable() == 0) {
+                    log_info("Primary: LAN mode enabled\n");
+                } else {
+                    log_error("Primary: failed to enable LAN mode\n");
+                }
+            } else if (lan_status == 1) {
+                log_info("Primary: LAN mode already enabled\n");
+            }
+        }
+
+        /* Start control server */
+        const char *tmpl_dir = cfg.template_dir[0]
+            ? cfg.template_dir : NULL;
+        if (control_server_start(&app_config, app_config.control_port,
+                                  tmpl_dir) == 0) {
+            control_server_initialized = 1;
+            log_info("Primary: control server on port %d\n",
+                     app_config.control_port > 0
+                     ? app_config.control_port : 8081);
+
+            /* Set config-changed callback */
+            control_server_set_config_callback(on_config_changed);
+            control_server_set_restart_callback(NULL);  /* TODO: implement */
+        } else {
+            log_error("Primary: failed to start control server\n");
+        }
+    }
+
+    /* Multi-camera: detect cameras and spawn secondary processes */
+    CameraInfo detected_cameras[CAMERA_MAX];
+    int num_cameras = 0;
+    ManagedProcess managed_procs[CAMERA_MAX];
+    memset(managed_procs, 0, sizeof(managed_procs));
+    int num_managed = 0;
+
+    if (cfg.primary_mode) {
+        const char *usb_port = cfg.internal_usb_port[0]
+            ? cfg.internal_usb_port : "1.3";
+        num_cameras = camera_detect_all(detected_cameras, CAMERA_MAX, usb_port);
+
+        if (num_cameras > 1) {
+            /* Get path to our own binary for fork/exec */
+            char binary_path[256];
+            ssize_t len = readlink("/proc/self/exe", binary_path,
+                                    sizeof(binary_path) - 1);
+            if (len > 0) {
+                binary_path[len] = '\0';
+
+                /* Start secondary cameras (skip CAM#1, that's us) */
+                for (int i = 1; i < num_cameras; i++) {
+                    if (!detected_cameras[i].enabled) continue;
+                    ManagedProcess *proc = &managed_procs[num_managed];
+                    if (procmgr_start_camera(proc, &detected_cameras[i],
+                                              &app_config, binary_path) == 0) {
+                        num_managed++;
+                    }
+                }
+                log_info("Primary: started %d secondary camera(s)\n",
+                         num_managed);
+            } else {
+                log_error("Primary: cannot read /proc/self/exe: %s\n",
+                          strerror(errno));
+            }
+        }
+
+        /* Share camera info with control server */
+        if (control_server_initialized) {
+            control_server_set_cameras(detected_cameras, num_cameras,
+                                        managed_procs, num_managed);
+
+            /* Provision cameras to Moonraker */
+            control_server_provision_moonraker(&g_control_server);
+        }
+    }
+
+    /* Start Moonraker client for timelapse automation (primary mode only) */
+    if (cfg.primary_mode) {
+        g_app_config_ptr = &app_config;
+
+        if (app_config.timelapse_enabled) {
+            if (moonraker_client_start(&g_moonraker_client,
+                    app_config.moonraker_host,
+                    app_config.moonraker_port,
+                    &app_config) == 0) {
+                g_moonraker_initialized = 1;
+                if (control_server_initialized) {
+                    control_server_set_moonraker(&g_moonraker_client);
+                }
+            }
+        }
+    }
 
     log_info("Combined MJPEG/H.264 Streamer v%s starting...\n", VERSION);
     log_info("Camera: %s %dx%d (%s mode)\n", cfg.device, cfg.width, cfg.height,
@@ -2712,6 +2934,22 @@ skip_jpeg_output:
             }
             pthread_mutex_unlock(&g_state_mutex);
             write_ctrl_file();
+
+            /* Update control server stats (primary mode) */
+            if (cfg.primary_mode && control_server_initialized) {
+                int max_cam_fps = 0;
+                if (g_mjpeg_ctrl.camera_fps_detected &&
+                    g_mjpeg_ctrl.camera_interval > 0) {
+                    max_cam_fps = 1000000 / g_mjpeg_ctrl.camera_interval;
+                }
+                control_server_update_stats(
+                    g_stats.mjpeg_fps, g_stats.h264_fps,
+                    g_stats.mjpeg_clients, g_stats.flv_clients,
+                    0 /* display_clients */,
+                    max_cam_fps > 0 ? max_cam_fps
+                                    : g_mjpeg_ctrl.target_fps);
+            }
+
             last_stats_write = now;
         }
 
@@ -2723,6 +2961,19 @@ skip_jpeg_output:
                      g_ctrl.h264_enabled ? "on" : "off", g_ctrl.skip_ratio,
                      g_ctrl.auto_skip ? " auto" : "");
             last_stats_time = now;
+
+            /* Check secondary camera processes (primary mode, every 5s) */
+            if (cfg.primary_mode && num_managed > 0) {
+                char binary_path[256];
+                ssize_t len = readlink("/proc/self/exe", binary_path,
+                                        sizeof(binary_path) - 1);
+                if (len > 0) {
+                    binary_path[len] = '\0';
+                    procmgr_check_children(managed_procs, num_managed,
+                                            &app_config, binary_path,
+                                            detected_cameras);
+                }
+            }
         }
     }
 
@@ -2735,6 +2986,25 @@ skip_jpeg_output:
         log_info("Final: MJPEG=%llu (%.1f fps), H.264=%llu (%.1f fps), time=%.1fs\n",
                  (unsigned long long)mjpeg_frame_count, mjpeg_fps,
                  (unsigned long long)h264_frame_count, h264_fps, elapsed);
+    }
+
+    /* Stop Moonraker client (before secondary cameras and control server) */
+    if (g_moonraker_initialized) {
+        log_info("Stopping Moonraker client...\n");
+        moonraker_client_stop(&g_moonraker_client);
+        g_moonraker_initialized = 0;
+    }
+
+    /* Stop secondary camera processes (primary mode) */
+    if (num_managed > 0) {
+        log_info("Stopping %d secondary camera(s)...\n", num_managed);
+        procmgr_stop_all(managed_procs, num_managed);
+    }
+
+    /* Stop control server (primary mode) */
+    if (control_server_initialized) {
+        log_info("Stopping control server...\n");
+        control_server_stop();
     }
 
     /* Stop servers first (they reference frame buffers) */

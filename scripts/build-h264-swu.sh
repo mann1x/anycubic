@@ -82,6 +82,10 @@ chmod +x $APP_DST/app.sh
 chmod +x $APP_DST/h264_monitor.sh 2>/dev/null
 chmod +x $APP_DST/rkmpi_enc 2>/dev/null
 
+# Remove legacy Python server (replaced by rkmpi_enc --primary)
+rm -f $APP_DST/h264_server.py
+rm -rf $APP_DST/__pycache__
+
 touch $APP_DST/.enabled
 
 echo "$APP_NAME installed successfully"
@@ -98,6 +102,7 @@ rm -rf "$UPDATE_DIR/app/__pycache__"
 rm -f "$UPDATE_DIR/app/claude.md"
 rm -f "$UPDATE_DIR/app/test_*.sh"
 rm -f "$UPDATE_DIR/app/test_*.py"
+rm -f "$UPDATE_DIR/app/h264_server.py"
 
 # Make sure encoder is executable
 chmod +x "$UPDATE_DIR/app/rkmpi_enc"

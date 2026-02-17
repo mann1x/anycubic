@@ -7,7 +7,7 @@ Development tools and utilities for Anycubic RV1106-based 3D printers (Kobra 2 P
 ```
 anycubic/
 ├── rkmpi-encoder/      # Hardware H.264/JPEG encoder (C)
-├── h264-streamer/      # HTTP streaming server (Python + C)
+├── h264-streamer/      # HTTP streaming server (C)
 ├── fb-status/          # Framebuffer status display (C)
 ├── scripts/            # Test and utility scripts
 └── knowledge/          # Protocol documentation
@@ -21,23 +21,19 @@ Native USB camera capture with RV1106 hardware H.264 encoding.
 - TurboJPEG software decode OR hardware JPEG encoding
 - RKMPI VENC hardware H.264 encoding
 - Built-in HTTP, MQTT, and RPC servers
+- **Control server** (port 8081) with web UI, REST API, config persistence
+- **Multi-camera management** - camera detection, fork/exec secondary instances
 - **Display capture** with full hardware acceleration (RGA + VENC)
 - **Timelapse recording** with hardware VENC encoding (no ffmpeg dependency)
+- **Moonraker WebSocket client** - timelapse layer/hyperlapse triggers
 - **MQTT keepalive** - automatic PINGREQ to prevent broker disconnections
 - See: `rkmpi-encoder/claude.md`
 
 ### h264-streamer
-HTTP streaming application for Rinkhals custom firmware.
-- MJPEG and H.264 FLV streaming
-- **Multi-camera support** - up to 4 USB cameras with individual settings
-- **Display capture** for remote LCD viewing (RGA hardware rotation)
-- **Camera controls** - real-time V4L2 adjustments via web UI
-- **Moonraker camera settings** - per-camera provisioning with custom names
-- Web control interface with live preview
-- Moonraker webcam integration
-- CPU-based auto frame skipping
-- **Timelapse management UI** - browse, preview, download, delete recordings
-- **Advanced timelapse** - layer/hyperlapse modes via Moonraker integration
+Deployment package for Rinkhals custom firmware (pure C, no Python).
+- Shell scripts (app.sh, h264_monitor.sh) + rkmpi_enc binary
+- HTML templates for web UI (control.html, timelapse.html, index.html)
+- All streaming, control, and timelapse logic is in the rkmpi_enc binary
 - See: `h264-streamer/claude.md`
 
 ### fb-status
@@ -143,9 +139,8 @@ make dynamic
 # 2. Stop h264-streamer
 sshpass -p 'rockchip' ssh root@$PRINTER_IP "$APP_DIR/app.sh stop"
 
-# 3. Deploy files
+# 3. Deploy binary
 sshpass -p 'rockchip' scp rkmpi_enc root@$PRINTER_IP:$APP_DIR/rkmpi_enc
-sshpass -p 'rockchip' scp ../h264-streamer/29-h264-streamer/h264_server.py root@$PRINTER_IP:$APP_DIR/h264_server.py
 
 # 4. Start h264-streamer
 sshpass -p 'rockchip' ssh root@$PRINTER_IP "$APP_DIR/app.sh start"
@@ -161,8 +156,8 @@ sshpass -p 'rockchip' ssh root@$PRINTER_IP "tail -20 /tmp/rinkhals/app-h264-stre
 |------|-------------|
 | `/useremain/home/rinkhals/apps/29-h264-streamer/` | h264-streamer app directory |
 | `/useremain/home/rinkhals/apps/29-h264-streamer.config` | Persistent config file (JSON) |
-| `/tmp/h264_cmd` | Command file for CAM#1 (Python → encoder) |
-| `/tmp/h264_ctrl` | Control/stats file for CAM#1 (encoder ↔ Python) |
+| `/tmp/h264_cmd` | Command file for CAM#1 (control server → encoder) |
+| `/tmp/h264_ctrl` | Control/stats file for CAM#1 (encoder → control server) |
 | `/tmp/h264_cmd_N` | Command file for CAM#N (N=2,3,4) |
 | `/tmp/h264_ctrl_N` | Control/stats file for CAM#N |
 | `/tmp/rinkhals/app-h264-streamer.log` | Application log file |
@@ -171,7 +166,7 @@ sshpass -p 'rockchip' ssh root@$PRINTER_IP "tail -20 /tmp/rinkhals/app-h264-stre
 
 Each camera has separate command and control files. For CAM#1, they are `/tmp/h264_cmd` and `/tmp/h264_ctrl`. For CAM#2-4, they are `/tmp/h264_cmd_N` and `/tmp/h264_ctrl_N`.
 
-**Command file (written by h264_server.py):**
+**Command file (written by control server for secondary cameras):**
 - `h264=0|1` - Enable/disable H.264 encoding
 - `display_enabled=0|1` - Enable/disable display capture
 - `display_fps=N` - Display capture frame rate
@@ -199,17 +194,6 @@ Each camera has separate command and control files. For CAM#1, they are `/tmp/h2
 ---
 
 ## ⛔ Critical Warnings
-
-### Never Kill Python Processes
-```
-NEVER USE: killall python
-NEVER USE: pkill python
-
-Moonraker, Klipper, and other critical services run as Python.
-Killing all Python processes will BRICK the printer!
-
-Always use app.sh for h264-streamer management.
-```
 
 ### Never Kill gkapi
 ```
@@ -437,8 +421,10 @@ h264-streamer-{MODEL}.swu    # Password-protected zip
             ├── app.json     # Rinkhals app metadata
             ├── app.sh       # Start/stop script
             ├── h264_monitor.sh
-            ├── h264_server.py
-            └── rkmpi_enc    # Encoder binary
+            ├── rkmpi_enc    # Encoder binary (all-in-one)
+            ├── index.html   # Homepage template
+            ├── control.html # Control page template
+            └── timelapse.html # Timelapse page template
 ```
 
 ### SWU Passwords by Model

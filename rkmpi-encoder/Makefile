@@ -52,7 +52,15 @@ SRCS = rkmpi_enc.c \
        timelapse.c \
        timelapse_venc.c \
        display_capture.c \
-       cJSON.c
+       cJSON.c \
+       control_server.c \
+       config.c \
+       lan_mode.c \
+       cpu_monitor.c \
+       touch_inject.c \
+       camera_detect.c \
+       process_manager.c \
+       moonraker_client.c
 
 OBJS = $(SRCS:.c=.o)
 
@@ -66,7 +74,15 @@ HDRS = frame_buffer.h \
        timelapse.h \
        timelapse_venc.h \
        minimp4.h \
-       display_capture.h
+       display_capture.h \
+       control_server.h \
+       config.h \
+       lan_mode.h \
+       cpu_monitor.h \
+       touch_inject.h \
+       camera_detect.h \
+       process_manager.h \
+       moonraker_client.h
 
 .PHONY: all clean install static dynamic server-only timing
 

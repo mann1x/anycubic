@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Time Lapse Recordings</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        * { box-sizing: border-box; }
+        body { font-family: sans-serif; margin: 0; padding: 20px; background: #1a1a1a; color: #fff; }
+        .container { max-width: 900px; margin: 0 auto; }
+        h1 { color: #4CAF50; margin-bottom: 20px; }
+        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; flex-wrap: wrap; gap: 10px; }
+        .header h1 { margin: 0; }
+        .controls { display: flex; gap: 10px; align-items: center; }
+        .summary { background: #2d2d2d; padding: 12px 15px; border-radius: 8px; margin-bottom: 15px; color: #888; }
+        .recording { background: #2d2d2d; padding: 15px; margin-bottom: 10px; border-radius: 8px; display: flex; gap: 15px; align-items: flex-start; }
+        .thumbnail { width: 160px; height: 90px; background: #111; border-radius: 4px; flex-shrink: 0; object-fit: cover; cursor: pointer; }
+        .thumbnail-placeholder { width: 160px; height: 90px; background: #333; border-radius: 4px; flex-shrink: 0; display: flex; align-items: center; justify-content: center; color: #666; font-size: 12px; }
+        .info { flex: 1; min-width: 0; }
+        .filename { font-weight: bold; color: #fff; margin-bottom: 8px; word-break: break-all; }
+        .meta { color: #888; font-size: 13px; margin-bottom: 10px; }
+        .meta span { margin-right: 15px; }
+        .actions { display: flex; gap: 8px; flex-wrap: wrap; }
+        button { background: #4CAF50; color: white; border: none; padding: 8px 16px; border-radius: 4px; cursor: pointer; font-size: 13px; display: inline-flex; align-items: center; gap: 5px; }
+        button:hover { background: #45a049; }
+        button.secondary { background: #555; }
+        button.secondary:hover { background: #666; }
+        button.danger { background: #f44336; }
+        button.danger:hover { background: #da190b; }
+        select { padding: 8px 12px; border-radius: 4px; border: 1px solid #555; background: #333; color: #fff; cursor: pointer; }
+        .empty { text-align: center; padding: 60px 20px; color: #666; }
+        .empty-icon { font-size: 48px; margin-bottom: 15px; }
+        .loading { text-align: center; padding: 60px 20px; color: #888; }
+        /* Modal */
+        .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.9); z-index: 1000; justify-content: center; align-items: center; }
+        .modal.active { display: flex; }
+        .modal-content { position: relative; max-width: 90%; max-height: 90%; }
+        .modal video { max-width: 100%; max-height: 80vh; border-radius: 8px; }
+        .modal-close { position: absolute; top: -40px; right: 0; background: none; border: none; color: #fff; font-size: 30px; cursor: pointer; padding: 5px 10px; }
+        .modal-close:hover { color: #f44; }
+        .modal-title { color: #fff; margin-bottom: 10px; font-size: 14px; text-align: center; word-break: break-all; }
+        /* Responsive */
+        @media (max-width: 600px) {
+            .recording { flex-direction: column; }
+            .thumbnail, .thumbnail-placeholder { width: 100%; height: auto; aspect-ratio: 16/9; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>Time Lapse Recordings</h1>
+            <div class="controls">
+                <select id="storage-select" onchange="changeStorage()">
+                    <option value="internal">Internal Storage</option>
+                    <option value="usb">USB Drive</option>
+                </select>
+                <select id="sort-select" onchange="sortRecordings()">
+                    <option value="date-desc">Newest first</option>
+                    <option value="date-asc">Oldest first</option>
+                    <option value="name-asc">Name (A-Z)</option>
+                    <option value="size-desc">Largest first</option>
+                </select>
+                <button onclick="loadRecordings()" class="secondary">Refresh</button>
+            </div>
+        </div>
+        <div class="summary" id="summary">Loading...</div>
+        <div id="recordings-list">
+            <div class="loading">Loading recordings...</div>
+        </div>
+    </div>
+
+    <!-- Video Preview Modal -->
+    <div class="modal" id="preview-modal" onclick="closePreview(event)">
+        <div class="modal-content" onclick="event.stopPropagation()">
+            <button class="modal-close" onclick="closePreview()">&times;</button>
+            <div class="modal-title" id="preview-title"></div>
+            <video id="preview-video" controls autoplay></video>
+        </div>
+    </div>
+
+    <script>
+        let recordings = [];
+        let currentStorage = 'internal';
+        let usbMounted = false;
+
+        function initPage() {
+            fetch('/api/timelapse/storage')
+                .then(r => r.json())
+                .then(data => {
+                    usbMounted = data.usb_mounted;
+                    const usbConfigured = data.current === 'usb';
+                    currentStorage = data.current || 'internal';
+                    const storageSelect = document.getElementById('storage-select');
+                    if (usbConfigured && usbMounted) {
+                        storageSelect.style.display = '';
+                        storageSelect.value = currentStorage;
+                    } else {
+                        storageSelect.style.display = 'none';
+                        currentStorage = 'internal';
+                    }
+                    loadRecordings();
+                })
+                .catch(() => loadRecordings());
+        }
+
+        function changeStorage() {
+            currentStorage = document.getElementById('storage-select').value;
+            loadRecordings();
+        }
+
+        function getStorageParam() {
+            return currentStorage === 'usb' ? '?storage=usb' : '';
+        }
+
+        function formatSize(bytes) {
+            if (bytes < 1024) return bytes + ' B';
+            if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+            return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+        }
+
+        function formatDuration(seconds) {
+            var mins = Math.floor(seconds / 60);
+            var secs = Math.floor(seconds % 60);
+            return mins + ':' + secs.toString().padStart(2, '0');
+        }
+
+        function formatDate(timestamp) {
+            var d = new Date(timestamp * 1000);
+            var year = d.getFullYear();
+            var month = (d.getMonth() + 1).toString().padStart(2, '0');
+            var day = d.getDate().toString().padStart(2, '0');
+            var hour = d.getHours().toString().padStart(2, '0');
+            var min = d.getMinutes().toString().padStart(2, '0');
+            return year + '-' + month + '-' + day + ' ' + hour + ':' + min;
+        }
+
+        function loadRecordings() {
+            var storageLabel = currentStorage === 'usb' ? 'USB' : 'Internal';
+            document.getElementById('summary').textContent = 'Loading ' + storageLabel + '...';
+            fetch('/api/timelapse/list' + getStorageParam())
+                .then(r => r.json())
+                .then(data => {
+                    if (data.error) {
+                        recordings = [];
+                        document.getElementById('summary').textContent = storageLabel + ': Error';
+                        document.getElementById('recordings-list').innerHTML =
+                            '<div class="empty"><div class="empty-icon">&#9888;</div>' + escapeHtml(data.error) + '</div>';
+                        return;
+                    }
+                    recordings = data.recordings || [];
+                    document.getElementById('summary').textContent =
+                        storageLabel + ': ' + recordings.length + ' recording' + (recordings.length !== 1 ? 's' : '') +
+                        ', ' + formatSize(data.total_size || 0);
+                    sortRecordings();
+                })
+                .catch(function(err) {
+                    document.getElementById('summary').textContent = 'Error loading recordings';
+                    document.getElementById('recordings-list').innerHTML =
+                        '<div class="empty"><div class="empty-icon">&#9888;</div>Failed to load recordings</div>';
+                });
+        }
+
+        function sortRecordings() {
+            var sort = document.getElementById('sort-select').value;
+            var sorted = recordings.slice();
+            switch (sort) {
+                case 'date-desc': sorted.sort(function(a,b){return b.mtime - a.mtime;}); break;
+                case 'date-asc': sorted.sort(function(a,b){return a.mtime - b.mtime;}); break;
+                case 'name-asc': sorted.sort(function(a,b){return a.name.localeCompare(b.name);}); break;
+                case 'size-desc': sorted.sort(function(a,b){return b.size - a.size;}); break;
+            }
+            renderRecordings(sorted);
+        }
+
+        function renderRecordings(list) {
+            var container = document.getElementById('recordings-list');
+            if (list.length === 0) {
+                container.innerHTML = '<div class="empty"><div class="empty-icon">&#128249;</div>No recordings found</div>';
+                return;
+            }
+            var sp = getStorageParam();
+            var html = '';
+            for (var i = 0; i < list.length; i++) {
+                var rec = list[i];
+                var thumbHtml = rec.thumbnail
+                    ? '<img class="thumbnail" src="/api/timelapse/thumb/' + encodeURIComponent(rec.thumbnail) + sp + '" alt="Thumbnail" onclick="previewVideo(\'' + escapeJs(rec.mp4) + '\', \'' + escapeJs(rec.name) + '\')">'
+                    : '<div class="thumbnail-placeholder">No thumbnail</div>';
+                html += '<div class="recording" data-name="' + escapeHtml(rec.name) + '">' +
+                    thumbHtml +
+                    '<div class="info">' +
+                    '<div class="filename">' + escapeHtml(rec.mp4) + '</div>' +
+                    '<div class="meta">' +
+                    '<span>' + formatDate(rec.mtime) + '</span>' +
+                    '<span>Duration: ' + (rec.frames > 0 ? formatDuration(rec.duration) : '-') + '</span>' +
+                    '<span>Size: ' + formatSize(rec.size) + '</span>' +
+                    '<span>Frames: ' + (rec.frames > 0 ? rec.frames : '-') + '</span>' +
+                    '</div>' +
+                    '<div class="actions">' +
+                    '<button onclick="previewVideo(\'' + escapeJs(rec.mp4) + '\', \'' + escapeJs(rec.name) + '\')">&#9658; Preview</button>' +
+                    '<button class="secondary" onclick="downloadVideo(\'' + escapeJs(rec.mp4) + '\')">&#11123; Download</button>' +
+                    '<button class="danger" onclick="deleteRecording(\'' + escapeJs(rec.name) + '\', \'' + escapeJs(rec.mp4) + '\')">&#128465; Delete</button>' +
+                    '</div></div></div>';
+            }
+            container.innerHTML = html;
+        }
+
+        function escapeHtml(str) {
+            return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+        }
+
+        function escapeJs(str) {
+            return str.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+        }
+
+        function previewVideo(mp4, name) {
+            var modal = document.getElementById('preview-modal');
+            var video = document.getElementById('preview-video');
+            var title = document.getElementById('preview-title');
+            title.textContent = mp4;
+            video.src = '/api/timelapse/video/' + encodeURIComponent(mp4) + getStorageParam();
+            modal.classList.add('active');
+            video.play();
+        }
+
+        function closePreview(event) {
+            if (event && event.target !== event.currentTarget) return;
+            var modal = document.getElementById('preview-modal');
+            var video = document.getElementById('preview-video');
+            video.pause();
+            video.src = '';
+            modal.classList.remove('active');
+        }
+
+        function downloadVideo(mp4) {
+            var a = document.createElement('a');
+            a.href = '/api/timelapse/video/' + encodeURIComponent(mp4) + getStorageParam();
+            a.download = mp4;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+        }
+
+        function deleteRecording(name, mp4) {
+            if (!confirm('Delete "' + mp4 + '"?\n\nThis cannot be undone.')) return;
+            fetch('/api/timelapse/delete/' + encodeURIComponent(name) + getStorageParam(), {
+                method: 'DELETE'
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (data.success) {
+                    loadRecordings();
+                } else {
+                    alert('Delete failed: ' + (data.error || 'Unknown error'));
+                }
+            })
+            .catch(function(err) {
+                alert('Delete failed: ' + err.message);
+            });
+        }
+
+        document.addEventListener('keydown', function(e) {
+            if (e.key === 'Escape') closePreview();
+        });
+
+        initPage();
+    </script>
+</body>
+</html>

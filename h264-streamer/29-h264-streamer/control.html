@@ -1,0 +1,2030 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>H264 Streamer Control</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <script src="https://cdn.jsdelivr.net/npm/flv.js@1.6.2/dist/flv.min.js"></script>
+    <style>
+        body { font-family: sans-serif; margin: 20px; background: #1a1a1a; color: #fff; }
+        .container { max-width: 900px; margin: 0 auto; }
+        h1 { color: #4CAF50; }
+        .section { background: #2d2d2d; padding: 15px; margin: 10px 0; border-radius: 8px; }
+        .section h2 { margin-top: 0; color: #888; font-size: 14px; text-transform: uppercase; }
+        .row { display: flex; justify-content: space-between; align-items: center; margin: 10px 0; }
+        .label { color: #ccc; }
+        /* Settings layout - controls aligned right, centered content */
+        #settings-form { padding: 0 12%; }
+        .setting { margin-bottom: 18px; }
+        .setting-row { display: flex; justify-content: space-between; align-items: center; gap: 30px; }
+        .setting-row .label { flex-shrink: 0; white-space: nowrap; }
+        .setting-row .control { display: flex; align-items: center; gap: 10px; justify-content: flex-end; }
+        .setting-row .slider-control { display: flex; align-items: center; gap: 10px; flex: 1; max-width: 320px; }
+        .setting-row .slider-control input[type="range"] { flex: 1; min-width: 200px; }
+        .setting-note { text-align: right; color: #888; font-size: 12px; margin-top: 6px; }
+        .value { color: #4CAF50; font-weight: bold; }
+        button { background: #4CAF50; color: white; border: none; padding: 10px 20px;
+                  border-radius: 4px; cursor: pointer; font-size: 14px; margin: 2px; }
+        button:hover { background: #45a049; }
+        button.secondary { background: #555; }
+        button.secondary:hover { background: #666; }
+        button.danger { background: #f44336; }
+        button.danger:hover { background: #da190b; }
+        input[type="number"] { width: 60px; padding: 8px; border-radius: 4px; border: 1px solid #555;
+                                background: #333; color: #fff; }
+        .toggle { position: relative; display: inline-block; width: 50px; height: 26px; }
+        .toggle input { opacity: 0; width: 0; height: 0; }
+        .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0;
+                   background-color: #555; transition: .3s; border-radius: 26px; }
+        .slider:before { position: absolute; content: ""; height: 20px; width: 20px; left: 3px;
+                         bottom: 3px; background-color: white; transition: .3s; border-radius: 50%; }
+        input:checked + .slider { background-color: #4CAF50; }
+        input:checked + .slider:before { transform: translateX(24px); }
+        .preview { margin: 10px 0; }
+        .preview img, .preview video { max-width: 100%; border-radius: 4px; background: #000; }
+        .links a { color: #4CAF50; margin-right: 15px; }
+        #cpu-stats { font-family: monospace; }
+        .tabs { display: flex; gap: 5px; margin-bottom: 10px; }
+        .tabs button { flex: 1; }
+        .tabs button.active { background: #4CAF50; }
+        .tabs button.active::before { content: '\25CF'; margin-right: 6px; }
+        .camera-selector { display: flex; gap: 5px; margin: 10px 0; flex-wrap: wrap; }
+        .camera-selector button { padding: 4px 10px; font-size: 12px; background: #2563eb; border: none; border-radius: 4px; color: #fff; cursor: pointer; }
+        .camera-selector button:hover { background: #1d4ed8; }
+        .camera-selector button.active { background: #1e40af; box-shadow: 0 0 0 2px #60a5fa; }
+        .camera-selector button.active::before { content: '\25CF'; margin-right: 4px; }
+        .camera-selector button:disabled { background: #555; cursor: not-allowed; opacity: 0.6; }
+        .camera-selector button:disabled:hover { background: #555; }
+        .cam-enable-toggle { display: inline-block; vertical-align: middle; margin-left: 4px; cursor: pointer; padding: 4px 8px; border-radius: 4px; background: #444; color: #888; font-size: 11px; font-weight: bold; border: 1px solid #555; }
+        .cam-enable-toggle:hover { background: #555; color: #fff; border-color: #666; }
+        .cam-enable-toggle.enabled { background: #1a5c2e; color: #4CAF50; border-color: #2d7a45; }
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+        .stats-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+        .stat-box { background: #222; padding: 10px; border-radius: 4px; text-align: center; }
+        .stat-value { font-size: 24px; color: #4CAF50; font-weight: bold; }
+        .stat-label { font-size: 12px; color: #888; }
+        #flv-player { width: 100%; max-height: 480px; }
+        .player-controls { margin-top: 10px; }
+        /* Loading overlay for restart */
+        .loading-overlay {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.85);
+            z-index: 9999;
+            justify-content: center;
+            align-items: center;
+            flex-direction: column;
+        }
+        .loading-overlay.active { display: flex; }
+        .spinner {
+            width: 50px;
+            height: 50px;
+            border: 4px solid #333;
+            border-top: 4px solid #4CAF50;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        .loading-text {
+            margin-top: 20px;
+            color: #4CAF50;
+            font-size: 18px;
+        }
+        .loading-status {
+            margin-top: 10px;
+            color: #888;
+            font-size: 14px;
+        }
+        /* Camera controls */
+        .camera-controls-section h2 {
+            margin-bottom: 10px;
+        }
+        .camera-controls-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 20px;
+        }
+        .cam-ctrl-group {
+            background: #252525;
+            padding: 15px;
+            border-radius: 6px;
+        }
+        .cam-ctrl-group h3 {
+            margin: 0 0 12px 0;
+            font-size: 14px;
+            color: #4CAF50;
+            border-bottom: 1px solid #444;
+            padding-bottom: 8px;
+        }
+        .cam-ctrl {
+            display: flex;
+            align-items: center;
+            margin-bottom: 10px;
+            gap: 10px;
+        }
+        .cam-ctrl label {
+            flex: 0 0 100px;
+            font-size: 12px;
+            color: #aaa;
+        }
+        .cam-ctrl input[type="range"] {
+            flex: 1;
+            height: 6px;
+            background: #444;
+            border-radius: 3px;
+            -webkit-appearance: none;
+            appearance: none;
+        }
+        .cam-ctrl input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            appearance: none;
+            width: 14px;
+            height: 14px;
+            background: #4CAF50;
+            border-radius: 50%;
+            cursor: pointer;
+        }
+        .cam-ctrl input[type="range"]::-moz-range-thumb {
+            width: 14px;
+            height: 14px;
+            background: #4CAF50;
+            border-radius: 50%;
+            cursor: pointer;
+            border: none;
+        }
+        .cam-ctrl span {
+            flex: 0 0 50px;
+            text-align: right;
+            font-size: 12px;
+            color: #888;
+            font-family: monospace;
+        }
+        .cam-ctrl select {
+            flex: 1;
+            padding: 6px;
+            border-radius: 4px;
+            border: 1px solid #555;
+            background: #333;
+            color: #fff;
+            font-size: 12px;
+        }
+    </style>
+</head>
+<body>
+    <!-- Loading overlay for restart -->
+    <div id="loading-overlay" class="loading-overlay">
+        <div class="spinner"></div>
+        <div class="loading-text">Restarting H264 Streamer...</div>
+        <div class="loading-status" id="loading-status">Saving settings...</div>
+    </div>
+
+    <div class="container">
+        <h1>H264 Streamer Control</h1>
+
+        <div class="section">
+            <h2 style="display:inline;">Live Preview</h2>
+            <span style="color:#f44;font-size:12px;margin-left:15px;background:#411;padding:4px 8px;border-radius:4px;">WARNING: Debug tool - increases CPU usage, do not leave open!</span>
+            <div id="camera-selector" class="camera-selector" style="display:none;"></div>
+            <div id="camera-status-panel" style="display:none;background:#1a1a1a;padding:8px;border-radius:4px;margin:5px 0;"></div>
+            <div class="tabs">
+                <button class="active" onclick="switchTab('snapshot')">Snapshot</button>
+                <button onclick="switchTab('mjpeg')">MJPEG Stream</button>
+                <button onclick="switchTab('flv')">H.264 Stream</button>
+                <button onclick="switchTab('display')">Display</button>
+            </div>
+            <div class="preview">
+                <div id="tab-snapshot" class="tab-content active">
+                    <img src="/snapshot" id="preview-img" onclick="this.src='/snapshot?'+Date.now()">
+                    <p style="color:#888;font-size:12px">Click image to refresh</p>
+                </div>
+                <div id="tab-mjpeg" class="tab-content">
+                    <img id="mjpeg-stream" style="display:none">
+                    <p style="color:#888;font-size:12px">Live MJPEG stream</p>
+                </div>
+                <div id="tab-flv" class="tab-content">
+                    <video id="flv-player" muted autoplay></video>
+                    <div class="player-controls">
+                        <button onclick="startFlvPlayer()">Play</button>
+                        <button class="secondary" onclick="stopFlvPlayer()">Stop</button>
+                        <span id="flv-status" style="margin-left:10px;color:#888;"></span>
+                    </div>
+                </div>
+                <div id="tab-display" class="tab-content">
+                    <img id="display-stream" style="display:none">
+                    <p style="color:#888;font-size:12px">Printer LCD framebuffer - Click to touch</p>
+                </div>
+            </div>
+            <div style="margin-top:10px;display:flex;justify-content:space-between;align-items:center;">
+                <div style="display:flex;gap:5px;">
+                    <button onclick="window.open(streamBase + '/stream', '_blank')" class="secondary" style="padding:5px 12px;font-size:12px;">Open MJPEG</button>
+                    <button onclick="window.open(streamBase + '/snapshot', '_blank')" class="secondary" style="padding:5px 12px;font-size:12px;">Open Snapshot</button>
+                    <button onclick="openFlvFullscreen()" class="secondary" style="padding:5px 12px;font-size:12px;">Open FLV</button>
+                    <button onclick="window.open(streamBase + '/display', '_blank')" class="secondary" style="padding:5px 12px;font-size:12px;">Open Display</button>
+                    <button onclick="window.open('/timelapse', 'timelapse_' + location.hostname.replace(/\./g, '_'), 'width=900,height=700')" class="secondary" style="padding:5px 12px;font-size:12px;">Time Lapse</button>
+                </div>
+                <div style="display:flex;gap:5px;align-items:center;">
+                    <span style="color:#888;font-size:12px;margin-right:5px;">LED:</span>
+                    <button onclick="controlLed(true)" style="padding:5px 12px;font-size:12px;">On</button>
+                    <button onclick="controlLed(false)" class="secondary" style="padding:5px 12px;font-size:12px;">Off</button>
+                </div>
+            </div>
+        </div>
+
+        <div class="section camera-controls-section">
+            <h2 onclick="toggleCameraControls()" style="cursor:pointer;user-select:none;">
+                <span id="camera-controls-arrow">&#9654;</span> CAMERA CONTROLS
+                <span style="font-size:12px;color:#888;font-weight:normal;margin-left:10px;">(click to expand)</span>
+            </h2>
+            <div id="camera-controls-panel" style="display:none;">
+                <div class="camera-controls-grid">
+                    <div class="cam-ctrl-group">
+                        <h3>Image</h3>
+                        <div class="cam-ctrl">
+                            <label>Brightness</label>
+                            <input type="range" id="cam-brightness" min="0" max="255" value="0" oninput="setCameraControl('brightness', this.value)">
+                            <span id="cam-brightness-val">0</span>
+                        </div>
+                        <div class="cam-ctrl">
+                            <label>Contrast</label>
+                            <input type="range" id="cam-contrast" min="0" max="255" value="32" oninput="setCameraControl('contrast', this.value)">
+                            <span id="cam-contrast-val">32</span>
+                        </div>
+                        <div class="cam-ctrl">
+                            <label>Saturation</label>
+                            <input type="range" id="cam-saturation" min="0" max="132" value="85" oninput="setCameraControl('saturation', this.value)">
+                            <span id="cam-saturation-val">85</span>
+                        </div>
+                        <div class="cam-ctrl">
+                            <label>Hue</label>
+                            <input type="range" id="cam-hue" min="-180" max="180" value="0" oninput="setCameraControl('hue', this.value)">
+                            <span id="cam-hue-val">0</span>
+                        </div>
+                        <div class="cam-ctrl">
+                            <label>Gamma</label>
+                            <input type="range" id="cam-gamma" min="90" max="150" value="100" oninput="setCameraControl('gamma', this.value)">
+                            <span id="cam-gamma-val">100</span>
+                        </div>
+                        <div class="cam-ctrl">
+                            <label>Sharpness</label>
+                            <input type="range" id="cam-sharpness" min="0" max="30" value="3" oninput="setCameraControl('sharpness', this.value)">
+                            <span id="cam-sharpness-val">3</span>
+                        </div>
+                    </div>
+                    <div class="cam-ctrl-group">
+                        <h3>Exposure</h3>
+                        <div class="cam-ctrl">
+                            <label>Auto Exposure</label>
+                            <select id="cam-exposure-auto" onchange="setCameraControl('exposure_auto', this.value)">
+                                <option value="1">Manual</option>
+                                <option value="3" selected>Auto (Aperture Priority)</option>
+                            </select>
+                        </div>
+                        <div class="cam-ctrl">
+                            <label>Exposure</label>
+                            <input type="range" id="cam-exposure" min="10" max="2500" value="156" oninput="setCameraControl('exposure', this.value)">
+                            <span id="cam-exposure-val">156</span>
+                        </div>
+                        <div class="cam-ctrl">
+                            <label>Exposure Priority</label>
+                            <select id="cam-exposure-priority" onchange="setCameraControl('exposure_priority', this.value)">
+                                <option value="0" selected>Constant FPS</option>
+                                <option value="1">Variable FPS</option>
+                            </select>
+                        </div>
+                        <div class="cam-ctrl">
+                            <label>Gain</label>
+                            <select id="cam-gain" onchange="setCameraControl('gain', this.value)">
+                                <option value="0">Off</option>
+                                <option value="1" selected>On</option>
+                            </select>
+                        </div>
+                        <div class="cam-ctrl">
+                            <label>Backlight Comp</label>
+                            <input type="range" id="cam-backlight" min="0" max="7" value="0" oninput="setCameraControl('backlight', this.value)">
+                            <span id="cam-backlight-val">0</span>
+                        </div>
+                    </div>
+                    <div class="cam-ctrl-group">
+                        <h3>White Balance</h3>
+                        <div class="cam-ctrl">
+                            <label>Auto WB</label>
+                            <select id="cam-wb-auto" onchange="setCameraControl('wb_auto', this.value); updateWbTempState();">
+                                <option value="0">Manual</option>
+                                <option value="1" selected>Auto</option>
+                            </select>
+                        </div>
+                        <div class="cam-ctrl">
+                            <label>Temperature</label>
+                            <input type="range" id="cam-wb-temp" min="2800" max="6500" value="4000" oninput="setCameraControl('wb_temp', this.value)">
+                            <span id="cam-wb-temp-val">4000K</span>
+                        </div>
+                        <div class="cam-ctrl">
+                            <label>Power Line</label>
+                            <select id="cam-power-line" onchange="setCameraControl('power_line', this.value)">
+                                <option value="0">Disabled</option>
+                                <option value="1" selected>50 Hz</option>
+                                <option value="2">60 Hz</option>
+                            </select>
+                        </div>
+                    </div>
+                </div>
+                <div style="margin-top:15px;text-align:center;">
+                    <button type="button" onclick="resetCameraDefaults()" class="secondary" style="padding:8px 20px;">Reset to Defaults</button>
+                </div>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2>Performance</h2>
+            <div class="stats-grid">
+                <div class="stat-box">
+                    <div class="stat-value" id="stat-mjpeg-fps">-</div>
+                    <div class="stat-label">MJPEG FPS</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-value" id="stat-h264-fps">-</div>
+                    <div class="stat-label">H.264 FPS</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-value" id="stat-clients">0</div>
+                    <div class="stat-label">Clients</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-value" id="stat-cpu-total">-</div>
+                    <div class="stat-label">Total CPU</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-value" id="stat-cpu-encoder">-</div>
+                    <div class="stat-label">Encoder CPU</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-value" id="stat-cpu-streamer">-</div>
+                    <div class="stat-label">Secondary Encoders CPU</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2>Settings</h2>
+            <form id="settings-form">
+                <div class="setting">
+                    <div class="setting-row">
+                        <span class="label">Encoder Type:</span>
+                        <div class="control">
+                            <select name="encoder_type" id="encoder_type" onchange="handleEncoderChange(this)" style="padding:8px;border-radius:4px;border:1px solid #555;background:#333;color:#fff;">
+                                <option value="rkmpi" $encoder_rkmpi_selected>rkmpi (HW MJPEG)</option>
+                                <option value="rkmpi-yuyv" $encoder_rkmpi_yuyv_selected>rkmpi-yuyv (HW H.264)</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="setting-note">Requires restart</div>
+                </div>
+                <div class="setting">
+                    <div class="setting-row">
+                        <span class="label">Auto Enable LAN Mode:</span>
+                        <div class="control">
+                            <label class="toggle">
+                                <input type="checkbox" name="autolanmode" $autolanmode_checked>
+                                <span class="slider"></span>
+                            </label>
+                        </div>
+                    </div>
+                </div>
+                <div class="setting">
+                    <div class="setting-row">
+                        <span class="label">Debug Logging:</span>
+                        <div class="control">
+                            <label class="toggle">
+                                <input type="checkbox" name="logging" $logging_checked>
+                                <span class="slider"></span>
+                            </label>
+                        </div>
+                    </div>
+                    <div class="setting-note">Requires restart</div>
+                </div>
+                <div class="setting rkmpi-mjpeg-only h264-local-setting">
+                    <div class="setting-row">
+                        <span class="label">H.264 Encoding:</span>
+                        <div class="control">
+                            <label class="toggle">
+                                <input type="checkbox" name="h264_enabled" $h264_enabled_checked>
+                                <span class="slider"></span>
+                            </label>
+                        </div>
+                    </div>
+                </div>
+                <div class="setting rkmpi-mjpeg-only">
+                    <div class="setting-row">
+                        <span class="label">MJPEG Frame Rate:</span>
+                        <div class="slider-control">
+                            <input type="range" id="mjpeg_fps_slider" name="mjpeg_fps" min="2" max="$max_camera_fps" value="$mjpeg_fps"
+                                   oninput="document.getElementById('mjpeg_fps_input').value=this.value;updateMjpegFpsLabel();">
+                            <input type="number" id="mjpeg_fps_input" min="2" max="$max_camera_fps" value="$mjpeg_fps"
+                                   style="width:50px;"
+                                   oninput="document.getElementById('mjpeg_fps_slider').value=this.value;document.querySelector('[name=mjpeg_fps]').value=this.value;updateMjpegFpsLabel();">
+                            <span>fps</span>
+                        </div>
+                    </div>
+                    <div class="setting-note"><span id="mjpeg_fps_label"></span></div>
+                </div>
+                <div class="setting rkmpi-yuyv-only">
+                    <div class="setting-row">
+                        <span class="label">Moonraker FPS:</span>
+                        <div class="slider-control">
+                            <input type="range" id="mjpeg_fps_slider_yuyv" name="mjpeg_fps" min="2" max="30" value="$mjpeg_fps"
+                                   oninput="document.getElementById('mjpeg_fps_input_yuyv').value=this.value;">
+                            <input type="number" id="mjpeg_fps_input_yuyv" min="2" max="30" value="$mjpeg_fps"
+                                   style="width:50px;"
+                                   oninput="document.getElementById('mjpeg_fps_slider_yuyv').value=this.value;document.querySelector('[name=mjpeg_fps]').value=this.value;">
+                            <span>fps</span>
+                        </div>
+                    </div>
+                    <div class="setting-note">Only for Moonraker USB camera setup</div>
+                </div>
+                <div class="setting rkmpi-mjpeg-only h264-local-setting">
+                    <div class="setting-row">
+                        <span class="label">H.264 Frame Rate:</span>
+                        <div class="slider-control">
+                            <input type="range" id="fps_pct_slider" min="0" max="100" value="$fps_pct"
+                                   oninput="document.getElementById('fps_pct_input').value=this.value;updateFpsLabel();savedSkipRatio=pctToSkipRatio(parseInt(this.value));">
+                            <input type="number" id="fps_pct_input" min="0" max="100" value="$fps_pct"
+                                   style="width:50px;"
+                                   oninput="document.getElementById('fps_pct_slider').value=this.value;updateFpsLabel();savedSkipRatio=pctToSkipRatio(parseInt(this.value));">
+                            <span>%</span>
+                        </div>
+                    </div>
+                    <div class="setting-note"><span id="fps_label"></span></div>
+                    <input type="hidden" name="skip_ratio" id="skip_ratio_hidden" value="$skip_ratio">
+                </div>
+                <div class="setting rkmpi-mjpeg-only h264-local-setting">
+                    <div class="setting-row">
+                        <span class="label">Auto Skip (CPU-based):</span>
+                        <div class="control">
+                            <label class="toggle">
+                                <input type="checkbox" name="auto_skip" $auto_skip_checked onchange="toggleAutoSkip(this.checked);">
+                                <span class="slider"></span>
+                            </label>
+                        </div>
+                    </div>
+                </div>
+                <div class="setting rkmpi-mjpeg-only h264-local-setting">
+                    <div class="setting-row">
+                        <span class="label">Target CPU % (for auto-skip):</span>
+                        <div class="control">
+                            <input type="number" name="target_cpu" value="$target_cpu" min="25" max="90">
+                        </div>
+                    </div>
+                </div>
+                <div class="setting rkmpi-only h264-local-setting">
+                    <div class="setting-row">
+                        <span class="label">H.264 Bitrate (kbps):</span>
+                        <div class="control">
+                            <input type="number" name="bitrate" value="$bitrate" min="100" max="4000" style="width:80px;">
+                        </div>
+                    </div>
+                    <div class="setting-note">Requires restart</div>
+                </div>
+                <div class="setting rkmpi-only">
+                    <div class="setting-row">
+                        <span class="label">Camera Resolution:</span>
+                        <div class="control">
+                            <select name="h264_resolution" id="camera_resolution" style="padding:8px;border-radius:4px;border:1px solid #555;background:#333;color:#fff;">
+                                <option value="1280x720" $res_1280_selected>1280x720 (full)</option>
+                                <option value="960x540" $res_960_selected>960x540 (scaled)</option>
+                                <option value="640x360" $res_640_selected>640x360 (scaled)</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="setting-note rkmpi-mjpeg-note">Lower resolution = less TurboJPEG decode CPU. Requires restart.</div>
+                    <div class="setting-note rkmpi-yuyv-note" style="display:none;">Lower resolution = more FPS. Requires restart.</div>
+                </div>
+                <div class="setting rkmpi-only" style="border-top: 1px solid #444; padding-top: 15px; margin-top: 15px;">
+                    <div class="setting-row">
+                        <span class="label">Display Capture:</span>
+                        <div class="control">
+                            <label class="toggle">
+                                <input type="checkbox" name="display_enabled" $display_enabled_checked onchange="updateDisplaySettings()">
+                                <span class="slider"></span>
+                            </label>
+                        </div>
+                    </div>
+                    <div class="setting-note">Capture printer LCD screen (full hardware acceleration)</div>
+                </div>
+                <div class="setting rkmpi-only">
+                    <div class="setting-row">
+                        <span class="label">Display FPS:</span>
+                        <div class="control">
+                            <select name="display_fps" id="display_fps_select" style="padding:8px;border-radius:4px;border:1px solid #555;background:#333;color:#fff;">
+                                <option value="1" $dfps_1_selected>1 fps (lowest CPU)</option>
+                                <option value="2" $dfps_2_selected>2 fps</option>
+                                <option value="3" $dfps_3_selected>3 fps</option>
+                                <option value="5" $dfps_5_selected>5 fps</option>
+                                <option value="10" $dfps_10_selected>10 fps (highest)</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="setting-note">Higher FPS = more CPU usage</div>
+                </div>
+                <div class="setting rkmpi-only" style="border-top: 1px solid #444; padding-top: 15px; margin-top: 15px;">
+                    <div class="setting-row">
+                        <span class="label">ACProxyCam FLV Proxy:</span>
+                        <div class="control">
+                            <label class="toggle">
+                                <input type="checkbox" name="acproxycam_flv_proxy" value="1" $acproxycam_flv_proxy_checked onchange="toggleProxySettings(this.checked)">
+                                <span class="slider"></span>
+                            </label>
+                        </div>
+                    </div>
+                    <div class="setting-note">Offload H.264 encoding to ACProxyCam. Requires ACProxyCam with encoding enabled. Restarts encoder.</div>
+                </div>
+                <div class="setting" style="margin-top: 15px;">
+                    <div class="setting-row">
+                        <button type="submit">Apply Settings</button>
+                        <span style="color:#f90;font-size:12px;">Note: Encoder type change requires app restart</span>
+                    </div>
+                </div>
+            </form>
+        </div>
+
+        <div class="section rkmpi-only">
+            <h2>Timelapse Settings</h2>
+            <p style="color:#888;font-size:12px;margin-bottom:15px;">Independent timelapse recording via Moonraker integration. Records regardless of slicer settings.</p>
+            <form id="timelapse-form">
+                <div class="setting">
+                    <div class="setting-row">
+                        <span class="label">Enable Timelapse:</span>
+                        <div class="control">
+                            <label class="toggle">
+                                <input type="checkbox" name="timelapse_enabled" id="timelapse_enabled" $timelapse_enabled_checked onchange="updateTimelapseSettings()">
+                                <span class="slider"></span>
+                            </label>
+                        </div>
+                    </div>
+                    <div class="setting-note">Auto-record timelapse for all prints via Moonraker</div>
+                </div>
+                <div class="setting timelapse-setting" style="display:none;">
+                    <div class="setting-row">
+                        <span class="label">Mode:</span>
+                        <div class="control">
+                            <select name="timelapse_mode" id="timelapse_mode" onchange="updateTimelapseModeSettings()" style="padding:8px;border-radius:4px;border:1px solid #555;background:#333;color:#fff;">
+                                <option value="layer" $timelapse_mode_layer_selected>Layer-based</option>
+                                <option value="hyperlapse" $timelapse_mode_hyperlapse_selected>Hyperlapse (time-based)</option>
+                            </select>
+                        </div>
+                    </div>
+                </div>
+                <div class="setting timelapse-setting hyperlapse-only" style="display:none;">
+                    <div class="setting-row">
+                        <span class="label">Hyperlapse Interval:</span>
+                        <div class="control">
+                            <input type="number" name="timelapse_hyperlapse_interval" value="$timelapse_hyperlapse_interval" min="5" max="300" style="width:60px;">
+                            <span style="margin-left:5px;">seconds</span>
+                        </div>
+                    </div>
+                </div>
+                <div class="setting timelapse-setting" style="display:none; border-top: 1px solid #444; padding-top: 15px; margin-top: 15px;">
+                    <div class="setting-row">
+                        <span class="label">Storage Location:</span>
+                        <div class="control">
+                            <select name="timelapse_storage" id="timelapse_storage" onchange="updateStorageSettings()" style="padding:8px;border-radius:4px;border:1px solid #555;background:#333;color:#fff;">
+                                <option value="internal" $timelapse_storage_internal_selected>Internal Flash</option>
+                                <option value="usb" $timelapse_storage_usb_selected>USB Drive</option>
+                            </select>
+                        </div>
+                    </div>
+                </div>
+                <div class="setting timelapse-setting" style="display:none;">
+                    <div class="setting-row">
+                        <span class="label">USB Status:</span>
+                        <div class="control">
+                            <span id="usb_status" style="color:#888;">Checking...</span>
+                        </div>
+                    </div>
+                </div>
+                <div class="setting timelapse-setting usb-path-setting" style="display:none;">
+                    <div class="setting-row">
+                        <span class="label">USB Path:</span>
+                        <div class="control" style="display:flex;gap:5px;">
+                            <input type="text" name="timelapse_usb_path" id="timelapse_usb_path" value="$timelapse_usb_path" readonly style="flex:1;min-width:150px;padding:8px;border-radius:4px;border:1px solid #555;background:#222;color:#aaa;cursor:pointer;" onclick="openFolderPicker()" title="Click to browse">
+                            <button type="button" onclick="openFolderPicker()" style="padding:8px 12px;cursor:pointer;" title="Browse folders">&#128193;</button>
+                        </div>
+                    </div>
+                </div>
+                <div class="setting timelapse-setting" style="display:none; border-top: 1px solid #444; padding-top: 15px; margin-top: 15px;">
+                    <div class="setting-row">
+                        <span class="label">Moonraker Host:</span>
+                        <div class="control">
+                            <input type="text" name="moonraker_host" value="$moonraker_host" style="width:120px;padding:8px;border-radius:4px;border:1px solid #555;background:#333;color:#fff;">
+                        </div>
+                    </div>
+                </div>
+                <div class="setting timelapse-setting" style="display:none;">
+                    <div class="setting-row">
+                        <span class="label">Moonraker Port:</span>
+                        <div class="control">
+                            <input type="number" name="moonraker_port" value="$moonraker_port" min="1" max="65535" style="width:80px;">
+                        </div>
+                    </div>
+                </div>
+                <div class="setting timelapse-setting" style="display:none;">
+                    <div class="setting-row">
+                        <span class="label">Connection Status:</span>
+                        <div class="control">
+                            <span id="moonraker_status" style="color:#888;">Not connected</span>
+                        </div>
+                    </div>
+                </div>
+                <div class="setting timelapse-setting" style="display:none; border-top: 1px solid #444; padding-top: 15px; margin-top: 15px;">
+                    <div class="setting-row">
+                        <span class="label">Output FPS:</span>
+                        <div class="control">
+                            <input type="number" name="timelapse_output_fps" value="$timelapse_output_fps" min="1" max="120" style="width:60px;">
+                        </div>
+                    </div>
+                    <div class="setting-note">Video playback framerate</div>
+                </div>
+                <div class="setting timelapse-setting" style="display:none;">
+                    <div class="setting-row">
+                        <span class="label">Variable FPS:</span>
+                        <div class="control">
+                            <label class="toggle">
+                                <input type="checkbox" name="timelapse_variable_fps" id="timelapse_variable_fps" $timelapse_variable_fps_checked onchange="updateVariableFpsSettings()">
+                                <span class="slider"></span>
+                            </label>
+                        </div>
+                    </div>
+                    <div class="setting-note">Auto-adjust FPS to reach target video length</div>
+                </div>
+                <div class="setting timelapse-setting variable-fps-setting" style="display:none;">
+                    <div class="setting-row">
+                        <span class="label">Target Length:</span>
+                        <div class="control">
+                            <input type="number" name="timelapse_target_length" value="$timelapse_target_length" min="1" max="300" style="width:60px;">
+                            <span style="margin-left:5px;">seconds</span>
+                        </div>
+                    </div>
+                </div>
+                <div class="setting timelapse-setting variable-fps-setting" style="display:none;">
+                    <div class="setting-row">
+                        <span class="label">Min/Max FPS:</span>
+                        <div class="control">
+                            <input type="number" name="timelapse_variable_fps_min" value="$timelapse_variable_fps_min" min="1" max="60" style="width:50px;">
+                            <span style="margin:0 5px;">/</span>
+                            <input type="number" name="timelapse_variable_fps_max" value="$timelapse_variable_fps_max" min="1" max="120" style="width:50px;">
+                        </div>
+                    </div>
+                </div>
+                <div class="setting timelapse-setting" style="display:none;">
+                    <div class="setting-row">
+                        <span class="label">Quality (CRF):</span>
+                        <div class="control">
+                            <input type="number" name="timelapse_crf" value="$timelapse_crf" min="0" max="51" style="width:60px;">
+                        </div>
+                    </div>
+                    <div class="setting-note">0=lossless, 23=default, 51=worst</div>
+                </div>
+                <div class="setting timelapse-setting" style="display:none;">
+                    <div class="setting-row">
+                        <span class="label">Duplicate Last Frame:</span>
+                        <div class="control">
+                            <input type="number" name="timelapse_duplicate_last_frame" value="$timelapse_duplicate_last_frame" min="0" max="60" style="width:60px;">
+                        </div>
+                    </div>
+                    <div class="setting-note">Repeat final frame N times</div>
+                </div>
+                <div class="setting timelapse-setting" style="display:none; border-top: 1px solid #444; padding-top: 15px; margin-top: 15px;">
+                    <div class="setting-row">
+                        <span class="label">Stream Delay:</span>
+                        <div class="control">
+                            <input type="number" name="timelapse_stream_delay" value="$timelapse_stream_delay" min="0" max="5" step="0.01" style="width:60px;">
+                            <span style="margin-left:5px;">seconds</span>
+                        </div>
+                    </div>
+                    <div class="setting-note">Delay before capture to compensate for stream latency</div>
+                </div>
+                <div class="setting timelapse-setting" style="display:none;">
+                    <div class="setting-row">
+                        <span class="label">End Delay:</span>
+                        <div class="control">
+                            <input type="number" name="timelapse_end_delay" value="$timelapse_end_delay" min="0" max="30" step="0.5" style="width:60px;">
+                            <span style="margin-left:5px;">seconds</span>
+                        </div>
+                    </div>
+                    <div class="setting-note">Delay before final capture for head to park</div>
+                </div>
+                <div class="setting timelapse-setting" style="display:none;">
+                    <div class="setting-row">
+                        <span class="label">Flip Horizontal:</span>
+                        <div class="control">
+                            <label class="toggle">
+                                <input type="checkbox" name="timelapse_flip_x" $timelapse_flip_x_checked>
+                                <span class="slider"></span>
+                            </label>
+                        </div>
+                    </div>
+                </div>
+                <div class="setting timelapse-setting" style="display:none;">
+                    <div class="setting-row">
+                        <span class="label">Flip Vertical:</span>
+                        <div class="control">
+                            <label class="toggle">
+                                <input type="checkbox" name="timelapse_flip_y" $timelapse_flip_y_checked>
+                                <span class="slider"></span>
+                            </label>
+                        </div>
+                    </div>
+                </div>
+                <div class="setting timelapse-setting" style="display:none; margin-top: 15px;">
+                    <div class="setting-row">
+                        <button type="submit">Apply Timelapse Settings</button>
+                    </div>
+                </div>
+            </form>
+        </div>
+
+        <div class="section">
+            <h2>Moonraker Camera Settings</h2>
+            <p style="color:#888;font-size:12px;margin-bottom:15px;">Configure which cameras are provisioned to Moonraker for the dashboard and web UI.</p>
+            <div id="moonraker-cameras-list">
+                <!-- Populated by JavaScript -->
+                <div style="color:#888;font-size:12px;">Loading cameras...</div>
+            </div>
+            <div style="margin-top:15px;">
+                <button type="button" onclick="applyMoonrakerSettings()">Apply Moonraker Settings</button>
+                <span id="moonraker-status" style="margin-left:10px;font-size:12px;"></span>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2>Status</h2>
+            <div class="row">
+                <span class="label">Encoder:</span>
+                <span class="value" id="status-encoder">$encoder_type</span>
+            </div>
+            <div class="row rkmpi-only">
+                <span class="label">Streaming Port:</span>
+                <span class="value">$streaming_port</span>
+            </div>
+            <div class="row rkmpi-only">
+                <span class="label">Control Port:</span>
+                <span class="value">$control_port</span>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let flvPlayer = null;
+        let flvPlayerBusy = false;
+        let mjpegActive = false;
+        let statsInterval = null;
+        let currentEncoderType = '$encoder_type';
+        let currentMjpegFpsTarget = $mjpeg_fps;
+        let currentLogging = false;
+        let currentBitrate = $bitrate;
+        let currentH264Resolution = '$h264_resolution';
+        let currentSessionId = '$session_id';
+
+        // Streaming server base URL
+        const streamingPort = $streaming_port;
+        const controlPort = $control_port;
+        const streamBase = (streamingPort == location.port || !streamingPort) ? '' : 'http://' + location.hostname + ':' + streamingPort;
+
+        // FLV port is always 18088
+        const FLV_PORT = 18088;
+
+        // Dynamic URL variables that update when switching cameras
+        let snapshotUrl = streamBase + '/snapshot';
+        let mjpegUrl = streamBase + '/stream';
+        let flvUrl = 'http://' + location.hostname + ':' + FLV_PORT + '/flv';
+        let displayUrl = streamBase + '/display';
+
+        // Status message helper
+        function showStatus(msg, type) {
+            console.log('[Status] ' + msg);
+        }
+
+        // Initialize stream URLs on page load
+        function initStreamUrls() {
+            if (!streamBase) {
+                // Same port, use relative URLs
+                snapshotUrl = '/snapshot';
+                mjpegUrl = '/stream';
+                displayUrl = '/display';
+            }
+
+            // Update preview image
+            const previewImg = document.getElementById('preview-img');
+            if (previewImg) {
+                previewImg.src = snapshotUrl;
+                previewImg.onclick = function() { this.src = snapshotUrl + '?' + Date.now(); };
+            }
+
+            // Update links
+            document.querySelectorAll('a[href="/stream"]').forEach(a => {
+                a.href = mjpegUrl;
+            });
+            document.querySelectorAll('a[href="/snapshot"]').forEach(a => {
+                a.href = snapshotUrl;
+            });
+            document.querySelectorAll('a[href="/display"]').forEach(a => {
+                a.href = displayUrl;
+            });
+        }
+        document.addEventListener('DOMContentLoaded', initStreamUrls);
+
+        // Camera selector
+        let cameras = [];
+        let activeCameraId = 1;
+
+        function loadCameras() {
+            fetch('/api/cameras')
+                .then(r => r.json())
+                .then(data => {
+                    cameras = data.cameras || [];
+                    activeCameraId = data.active_camera_id || 1;
+                    renderCameraSelector();
+                })
+                .catch(err => console.log('Camera load error:', err));
+        }
+
+        function renderCameraSelector() {
+            const container = document.getElementById('camera-selector');
+            if (!container) return;
+
+            // Only show if more than one camera
+            if (cameras.length <= 1) {
+                container.style.display = 'none';
+                updateCameraStatusPanel();
+                return;
+            }
+
+            container.style.display = 'flex';
+            container.innerHTML = cameras.map(cam => {
+                const isActive = cam.id === activeCameraId;
+                const isEnabled = cam.enabled;
+                const isPrimary = cam.is_primary;
+                const hasError = cam.error != null;
+                const title = `${cam.name} (${cam.resolution} ${cam.mode}, port ${cam.streaming_port})${isEnabled ? '' : ' - disabled'}${hasError ? ' - ERROR' : ''}`;
+
+                // Primary camera button (cannot be disabled)
+                if (isPrimary) {
+                    return `<button class="${isActive ? 'active' : ''}" onclick="switchCamera(${cam.id})" title="${title}">CAM#${cam.id}</button>`;
+                }
+
+                // Secondary cameras: show with enable/disable toggle and error indicator
+                const toggleClass = isEnabled ? 'enabled' : '';
+                const toggleTitle = isEnabled ? 'Click to disable' : 'Click to enable';
+                const toggleText = isEnabled ? 'ON' : 'OFF';
+                const errorIndicator = hasError ? '<span style="color:#f44;margin-left:2px;">!</span>' : '';
+                return `<button class="${isActive ? 'active' : ''}" ${isEnabled && !hasError ? '' : 'disabled'} onclick="switchCamera(${cam.id})" title="${title}">CAM#${cam.id}${errorIndicator}</button><span class="cam-enable-toggle ${toggleClass}" title="${toggleTitle}" onclick="toggleCameraEnabled(${cam.id}, ${!isEnabled})">${toggleText}</span>`;
+            }).join('');
+
+            updateCameraStatusPanel();
+        }
+
+        function updateCameraStatusPanel() {
+            const panel = document.getElementById('camera-status-panel');
+            if (!panel) return;
+
+            // Show status for non-primary cameras
+            const secondaryCams = cameras.filter(c => !c.is_primary);
+            if (secondaryCams.length === 0) {
+                panel.style.display = 'none';
+                return;
+            }
+
+            panel.style.display = 'block';
+            let html = '<div style="font-size:12px;color:#888;margin-bottom:8px;">Additional Cameras Settings:</div>';
+            secondaryCams.forEach(cam => {
+                const statusColor = cam.error ? '#f44' : (cam.status === 'running' ? '#4CAF50' : '#888');
+                const statusText = cam.error ? 'Error' : (cam.status === 'running' ? 'Running' : (cam.enabled ? 'Starting...' : 'Disabled'));
+                const enabledChecked = cam.enabled ? 'checked' : '';
+                const res = cam.resolution || '640x480';
+                const fps = cam.mjpeg_fps || 10;
+
+                html += `<div style="background:#222;padding:8px;margin-bottom:8px;border-radius:4px;">`;
+                html += `<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">`;
+                html += `<span><strong>CAM#${cam.id}</strong>: ${cam.name.substring(0,25)}</span>`;
+                html += `<span style="color:${statusColor};">&bull; ${statusText}</span>`;
+                html += `</div>`;
+
+                if (cam.error) {
+                    html += `<div style="color:#f44;font-size:11px;background:#411;padding:4px 6px;border-radius:3px;margin-bottom:6px;">${cam.error}</div>`;
+                }
+
+                // Settings row
+                html += `<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;font-size:11px;">`;
+                // Enable toggle
+                html += `<label style="display:flex;align-items:center;gap:4px;cursor:pointer;">`;
+                html += `<input type="checkbox" ${enabledChecked} onchange="toggleCameraEnabled(${cam.id}, this.checked)"> Enable`;
+                html += `</label>`;
+                // Resolution (dynamically populated from camera capabilities)
+                html += `<label style="display:flex;align-items:center;gap:4px;">Res:`;
+                html += `<select id="cam${cam.id}-res" style="font-size:11px;padding:2px;" ${cam.enabled ? '' : 'disabled'}>`;
+                const supportedRes = cam.supported_resolutions || ['640x480'];
+                supportedRes.forEach(r => {
+                    html += `<option value="${r}" ${res === r ? 'selected' : ''}>${r}</option>`;
+                });
+                html += `</select></label>`;
+                // FPS
+                html += `<label style="display:flex;align-items:center;gap:4px;">FPS:`;
+                html += `<input type="number" id="cam${cam.id}-fps" value="${fps}" min="1" max="15" style="width:40px;font-size:11px;padding:2px;" ${cam.enabled ? '' : 'disabled'}>`;
+                html += `</label>`;
+                // Apply button (highlighted)
+                html += `<button onclick="applySecondaryCamera(${cam.id})" style="font-size:11px;padding:2px 8px;background:#2563eb;color:white;border:none;border-radius:3px;cursor:pointer;" ${cam.enabled ? '' : 'disabled'}>Apply</button>`;
+                html += `</div>`;
+                html += `</div>`;
+            });
+            panel.innerHTML = html;
+        }
+
+        function applySecondaryCamera(camId) {
+            const res = document.getElementById(`cam${camId}-res`).value;
+            const fps = parseInt(document.getElementById(`cam${camId}-fps`).value) || 10;
+            showStatus(`Applying ${res} @ ${fps}fps to CAM#${camId}...`);
+            fetch('/api/camera/settings', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({id: camId, resolution: res, mjpeg_fps: fps})
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (data.status === 'ok') {
+                    showStatus(`CAM#${camId}: Restarting at ${res}...`);
+                    // Wait longer for encoder to start and potentially report errors
+                    setTimeout(() => {
+                        loadCameras();
+                        showStatus(`CAM#${camId}: Settings applied (${res} @ ${fps}fps)`);
+                    }, 3500);
+                } else {
+                    showStatus('Error: ' + (data.message || 'Unknown error'), 'error');
+                }
+            })
+            .catch(e => showStatus('Error: ' + e, 'error'));
+        }
+
+        function switchCamera(id) {
+            const cam = cameras.find(c => c.id === id);
+            if (!cam || !cam.enabled) return;
+            if (id === activeCameraId) return;
+
+            // Update UI immediately
+            activeCameraId = id;
+            renderCameraSelector();
+
+            // Update stream URLs to point to this camera's port
+            const host = location.hostname;
+            const port = cam.streaming_port;
+            const baseUrl = `http://${host}:${port}`;
+
+            // Update preview sources
+            snapshotUrl = `${baseUrl}/snapshot`;
+            mjpegUrl = `${baseUrl}/stream`;
+
+            // FLV only available for primary camera
+            const flvTab = document.querySelector('.tabs button:nth-child(3)');
+            if (cam.is_primary) {
+                flvUrl = `http://${host}:${FLV_PORT}/flv`;
+                if (flvTab) {
+                    flvTab.disabled = false;
+                    flvTab.style.opacity = '1';
+                    flvTab.title = 'H.264 FLV stream';
+                }
+            } else {
+                flvUrl = null;
+                if (flvTab) {
+                    flvTab.disabled = true;
+                    flvTab.style.opacity = '0.5';
+                    flvTab.title = 'H.264 FLV only available for primary camera';
+                }
+                // If FLV tab is active, switch to snapshot
+                if (currentTab === 'flv') {
+                    switchTab('snapshot');
+                }
+            }
+
+            // Refresh preview with new camera
+            refreshPreview();
+        }
+
+        function toggleCameraEnabled(id, enabled) {
+            const endpoint = enabled ? '/api/camera/enable' : '/api/camera/disable';
+
+            fetch(endpoint, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({id: id})
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (data.status === 'ok') {
+                    // Reload camera list to get updated state
+                    loadCameras();
+                } else {
+                    alert('Camera toggle failed: ' + data.message);
+                }
+            })
+            .catch(err => alert('Camera toggle error: ' + err));
+        }
+
+        // Moonraker Camera Settings
+        let moonrakerCameraSettings = {};
+
+        function loadMoonrakerCameraSettings() {
+            fetch('/api/moonraker/cameras')
+                .then(r => r.json())
+                .then(data => {
+                    moonrakerCameraSettings = data.settings || {};
+                    renderMoonrakerCamerasList(data.cameras || []);
+                })
+                .catch(err => console.log('Moonraker settings load error:', err));
+        }
+
+        function renderMoonrakerCamerasList(cameraList) {
+            const container = document.getElementById('moonraker-cameras-list');
+            if (!container) return;
+
+            if (cameraList.length === 0) {
+                container.innerHTML = '<div style="color:#888;font-size:12px;">No cameras detected.</div>';
+                return;
+            }
+
+            let html = '<table style="width:100%;border-collapse:collapse;font-size:12px;">';
+            html += '<tr style="border-bottom:1px solid #444;"><th style="text-align:left;padding:5px;">Camera</th><th style="text-align:left;padding:5px;">Name in Moonraker</th><th style="text-align:center;padding:5px;">Provision</th><th style="text-align:center;padding:5px;">Default</th></tr>';
+
+            cameraList.forEach(cam => {
+                const uniqueId = cam.unique_id || `camera_${cam.id}`;
+                const settings = moonrakerCameraSettings[uniqueId] || {};
+                const moonrakerName = settings.moonraker_name || `USB Camera ${cam.id === 1 ? '' : cam.id}`.trim();
+                const moonrakerEnabled = settings.moonraker_enabled !== false;  // Default true
+                const isDefault = settings.moonraker_default === true;
+                const portInfo = cam.streaming_port ? ` (port ${cam.streaming_port})` : '';
+
+                html += `<tr style="border-bottom:1px solid #333;">`;
+                html += `<td style="padding:8px 5px;"><strong>CAM#${cam.id}</strong><br><span style="color:#888;font-size:11px;">${cam.name}${portInfo}</span></td>`;
+                html += `<td style="padding:8px 5px;"><input type="text" id="mr-name-${cam.id}" value="${moonrakerName}" data-unique-id="${uniqueId}" style="width:150px;padding:4px;background:#222;border:1px solid #444;color:#fff;border-radius:3px;"></td>`;
+                html += `<td style="padding:8px 5px;text-align:center;"><input type="checkbox" id="mr-enabled-${cam.id}" ${moonrakerEnabled ? 'checked' : ''} data-unique-id="${uniqueId}" style="width:18px;height:18px;cursor:pointer;"></td>`;
+                html += `<td style="padding:8px 5px;text-align:center;"><input type="radio" name="mr-default" id="mr-default-${cam.id}" value="${cam.id}" ${isDefault ? 'checked' : ''} data-unique-id="${uniqueId}" style="width:18px;height:18px;cursor:pointer;"></td>`;
+                html += `</tr>`;
+            });
+
+            html += '</table>';
+            container.innerHTML = html;
+        }
+
+        function applyMoonrakerSettings() {
+            const statusEl = document.getElementById('moonraker-status');
+            statusEl.textContent = 'Applying...';
+            statusEl.style.color = '#888';
+
+            // Gather settings from form
+            const settings = {};
+            let defaultCamId = null;
+
+            document.querySelectorAll('#moonraker-cameras-list input[type="text"]').forEach(input => {
+                const camId = input.id.replace('mr-name-', '');
+                const uniqueId = input.dataset.uniqueId;
+                if (!settings[uniqueId]) settings[uniqueId] = {};
+                settings[uniqueId].moonraker_name = input.value.trim() || `USB Camera ${camId}`;
+            });
+
+            document.querySelectorAll('#moonraker-cameras-list input[type="checkbox"]').forEach(input => {
+                const uniqueId = input.dataset.uniqueId;
+                if (!settings[uniqueId]) settings[uniqueId] = {};
+                settings[uniqueId].moonraker_enabled = input.checked;
+            });
+
+            document.querySelectorAll('#moonraker-cameras-list input[type="radio"]').forEach(input => {
+                const uniqueId = input.dataset.uniqueId;
+                if (!settings[uniqueId]) settings[uniqueId] = {};
+                settings[uniqueId].moonraker_default = input.checked;
+                if (input.checked) defaultCamId = input.value;
+            });
+
+            fetch('/api/moonraker/cameras', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({settings: settings})
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (data.status === 'ok') {
+                    statusEl.textContent = 'Settings applied!';
+                    statusEl.style.color = '#4CAF50';
+                    moonrakerCameraSettings = settings;
+                    setTimeout(() => { statusEl.textContent = ''; }, 3000);
+                } else {
+                    statusEl.textContent = 'Error: ' + (data.message || 'Unknown error');
+                    statusEl.style.color = '#f44';
+                }
+            })
+            .catch(err => {
+                statusEl.textContent = 'Error: ' + err;
+                statusEl.style.color = '#f44';
+            });
+        }
+
+        // Load moonraker settings when cameras are loaded
+        function loadCamerasAndMoonraker() {
+            loadCameras();
+            loadMoonrakerCameraSettings();
+        }
+
+        function refreshPreview() {
+            const previewImg = document.getElementById('preview-img');
+            if (previewImg && currentTab === 'snapshot') {
+                previewImg.src = snapshotUrl + '?' + Date.now();
+            } else if (currentTab === 'mjpeg') {
+                const mjpegImg = document.getElementById('mjpeg-stream');
+                if (mjpegImg) mjpegImg.src = mjpegUrl + '?' + Date.now();
+            }
+        }
+
+        document.addEventListener('DOMContentLoaded', loadCamerasAndMoonraker);
+
+        // Show/hide settings based on encoder type
+        function updateEncoderVisibility() {
+            const encoderType = document.getElementById('encoder_type').value;
+            const isRkmpi = encoderType === 'rkmpi' || encoderType === 'rkmpi-yuyv';
+            document.querySelectorAll('.rkmpi-only').forEach(el => {
+                el.style.display = isRkmpi ? '' : 'none';
+            });
+            // rkmpi-mjpeg-only: skip-rate controls only for rkmpi (MJPEG mode)
+            document.querySelectorAll('.rkmpi-mjpeg-only').forEach(el => {
+                el.style.display = encoderType === 'rkmpi' ? '' : 'none';
+            });
+            // rkmpi-yuyv-only: settings specific to YUYV mode
+            document.querySelectorAll('.rkmpi-yuyv-only').forEach(el => {
+                el.style.display = encoderType === 'rkmpi-yuyv' ? '' : 'none';
+            });
+            // Camera resolution notes - show appropriate note for encoder type
+            document.querySelectorAll('.rkmpi-mjpeg-note').forEach(el => {
+                el.style.display = encoderType === 'rkmpi' ? '' : 'none';
+            });
+            document.querySelectorAll('.rkmpi-yuyv-note').forEach(el => {
+                el.style.display = encoderType === 'rkmpi-yuyv' ? '' : 'none';
+            });
+        }
+
+        // Handle encoder type change - requires restart
+        function handleEncoderChange(select) {
+            const newType = select.value;
+            if (newType === currentEncoderType) {
+                updateEncoderVisibility();
+                return;
+            }
+
+            // Confirm with user
+            if (!confirm('Changing encoder type requires a restart.\nThe page will reload automatically when ready.\n\nContinue?')) {
+                select.value = currentEncoderType;
+                return;
+            }
+
+            // Show loading overlay
+            const overlay = document.getElementById('loading-overlay');
+            const statusEl = document.getElementById('loading-status');
+            overlay.classList.add('active');
+            statusEl.textContent = 'Saving settings...';
+
+            // Save all current form settings with the new encoder type
+            const formData = new FormData(document.getElementById('settings-form'));
+            const data = new URLSearchParams();
+            data.append('encoder_type', newType);
+            data.append('autolanmode', formData.has('autolanmode') ? '1' : '0');
+            data.append('logging', formData.has('logging') ? '1' : '0');
+            data.append('h264_enabled', formData.has('h264_enabled') ? '1' : '0');
+            data.append('skip_ratio', document.querySelector('[name=skip_ratio]').value);
+            data.append('auto_skip', formData.has('auto_skip') ? '1' : '0');
+            data.append('target_cpu', document.querySelector('[name=target_cpu]').value);
+            data.append('bitrate', document.querySelector('[name=bitrate]').value);
+            data.append('mjpeg_fps', document.querySelector('[name=mjpeg_fps]').value);
+            data.append('h264_resolution', document.querySelector('[name=h264_resolution]')?.value || '1280x720');
+            // Display capture settings
+            data.append('display_enabled', formData.has('display_enabled') ? 'on' : '');
+            data.append('display_fps', document.querySelector('[name=display_fps]').value);
+            // ACProxyCam FLV proxy
+            if (formData.has('acproxycam_flv_proxy')) {
+                data.append('acproxycam_flv_proxy', '1');
+            }
+
+            // Save settings, then restart
+            // Stop stats polling during restart to avoid connection errors
+            if (statsInterval) {
+                clearInterval(statsInterval);
+                statsInterval = null;
+            }
+
+            fetch('/control', {
+                method: 'POST',
+                body: data
+            }).then(() => {
+                statusEl.textContent = 'Requesting restart...';
+                return fetch('/api/restart');
+            }).then(() => {
+                statusEl.textContent = 'Waiting for server to restart...';
+                // Poll until server is back
+                pollForRestart();
+            }).catch(err => {
+                statusEl.textContent = 'Error: ' + err.message;
+                setTimeout(() => {
+                    overlay.classList.remove('active');
+                    select.value = currentEncoderType;
+                }, 3000);
+            });
+        }
+
+        // Poll server until it comes back online with a NEW session ID
+        function pollForRestart() {
+            const statusEl = document.getElementById('loading-status');
+            const oldSessionId = currentSessionId;
+            let attempts = 0;
+            const maxAttempts = 45;
+
+            const poll = () => {
+                attempts++;
+                statusEl.textContent = 'Waiting for new server... (' + attempts + 's)';
+
+                fetch('/api/stats', { cache: 'no-store' })
+                    .then(r => r.json())
+                    .then(data => {
+                        // Check if this is a NEW server instance
+                        if (data.session_id && data.session_id !== oldSessionId) {
+                            statusEl.textContent = 'Server restarted! Reloading...';
+                            setTimeout(() => location.reload(), 500);
+                        } else {
+                            // Still the old server, keep polling
+                            statusEl.textContent = 'Waiting for restart... (' + attempts + 's)';
+                            if (attempts >= maxAttempts) {
+                                statusEl.textContent = 'Timeout - please refresh manually';
+                                setTimeout(() => location.reload(), 2000);
+                            } else {
+                                setTimeout(poll, 1000);
+                            }
+                        }
+                    })
+                    .catch(() => {
+                        // Server not responding (expected during restart)
+                        if (attempts >= maxAttempts) {
+                            statusEl.textContent = 'Timeout - please refresh manually';
+                            setTimeout(() => location.reload(), 2000);
+                        } else {
+                            setTimeout(poll, 1000);
+                        }
+                    });
+            };
+
+            // Wait a moment for server to shut down, then start polling
+            setTimeout(poll, 2000);
+        }
+
+        // Tab switching
+        let currentTab = 'snapshot';
+
+        function switchTab(tab) {
+            currentTab = tab;
+            document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+            document.querySelectorAll('.tabs button').forEach(el => el.classList.remove('active'));
+            document.getElementById('tab-' + tab).classList.add('active');
+            event.target.classList.add('active');
+
+            // Handle stream states
+            if (tab === 'snapshot') {
+                // Refresh snapshot when switching to tab
+                const img = document.getElementById('preview-img');
+                img.src = snapshotUrl + '?' + Date.now();
+            } else if (tab === 'mjpeg') {
+                startMjpegStream();
+            } else {
+                stopMjpegStream();
+            }
+            if (tab === 'display') {
+                startDisplayStream();
+            } else {
+                stopDisplayStream();
+            }
+            // Don't auto-start FLV player on tab switch - user clicks Play
+            if (tab !== 'flv') {
+                stopFlvPlayer();
+            }
+        }
+
+        // MJPEG stream
+        function startMjpegStream() {
+            const img = document.getElementById('mjpeg-stream');
+            img.src = mjpegUrl;
+            img.style.display = 'block';
+            mjpegActive = true;
+        }
+        function stopMjpegStream() {
+            const img = document.getElementById('mjpeg-stream');
+            img.src = '';
+            img.style.display = 'none';
+            mjpegActive = false;
+        }
+
+        // Display stream (printer LCD framebuffer)
+        let displayActive = false;
+        const DISPLAY_WIDTH = 800;
+        const DISPLAY_HEIGHT = 480;
+
+        function startDisplayStream() {
+            const img = document.getElementById('display-stream');
+            img.src = displayUrl;
+            img.style.display = 'block';
+            img.style.cursor = 'crosshair';
+            displayActive = true;
+        }
+        function stopDisplayStream() {
+            const img = document.getElementById('display-stream');
+            img.src = '';
+            img.style.display = 'none';
+            displayActive = false;
+        }
+
+        // Touch control for display stream
+        function handleDisplayClick(event) {
+            const img = event.target;
+            const rect = img.getBoundingClientRect();
+
+            // Calculate click position relative to image (0-1)
+            const relX = (event.clientX - rect.left) / rect.width;
+            const relY = (event.clientY - rect.top) / rect.height;
+
+            // Scale to display coordinates
+            const x = Math.round(relX * DISPLAY_WIDTH);
+            const y = Math.round(relY * DISPLAY_HEIGHT);
+
+            // Send touch command
+            fetch('/api/touch', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({x: x, y: y, duration: 100})
+            })
+            .then(r => r.json())
+            .then(data => {
+                console.log('Touch:', data);
+            })
+            .catch(e => console.error('Touch error:', e));
+        }
+
+        // Initialize display click handler
+        document.addEventListener('DOMContentLoaded', function() {
+            const displayImg = document.getElementById('display-stream');
+            if (displayImg) {
+                displayImg.addEventListener('click', handleDisplayClick);
+            }
+        });
+
+        // LED control
+        function controlLed(on) {
+            fetch('/api/led/' + (on ? 'on' : 'off'))
+                .then(r => r.json())
+                .then(data => {
+                    console.log('LED:', data);
+                })
+                .catch(e => console.error('LED error:', e));
+        }
+
+        // Camera controls
+        let cameraControlsExpanded = false;
+        let cameraControlsLoaded = false;
+
+        function toggleCameraControls() {
+            const panel = document.getElementById('camera-controls-panel');
+            const arrow = document.getElementById('camera-controls-arrow');
+            cameraControlsExpanded = !cameraControlsExpanded;
+            panel.style.display = cameraControlsExpanded ? 'block' : 'none';
+            arrow.innerHTML = cameraControlsExpanded ? '&#9660;' : '&#9654;';
+
+            if (cameraControlsExpanded && !cameraControlsLoaded) {
+                loadCameraControls();
+            }
+        }
+
+        function loadCameraControls() {
+            fetch('/api/camera/controls')
+                .then(r => r.json())
+                .then(data => {
+                    // Update all sliders and selects with current values
+                    Object.keys(data).forEach(key => {
+                        const ctrl = data[key];
+                        const el = document.getElementById('cam-' + key.replace(/_/g, '-'));
+                        const valEl = document.getElementById('cam-' + key.replace(/_/g, '-') + '-val');
+
+                        if (el) {
+                            el.value = ctrl.value;
+                            if (valEl) {
+                                if (key === 'wb_temp') {
+                                    valEl.textContent = ctrl.value + 'K';
+                                } else {
+                                    valEl.textContent = ctrl.value;
+                                }
+                            }
+                        }
+                    });
+                    updateWbTempState();
+                    cameraControlsLoaded = true;
+                })
+                .catch(e => console.error('Failed to load camera controls:', e));
+        }
+
+        function setCameraControl(control, value) {
+            // Update display value immediately
+            const valEl = document.getElementById('cam-' + control.replace(/_/g, '-') + '-val');
+            if (valEl) {
+                if (control === 'wb_temp') {
+                    valEl.textContent = value + 'K';
+                } else {
+                    valEl.textContent = value;
+                }
+            }
+
+            // Send to server with active camera ID
+            fetch('/api/camera/set', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({control: control, value: parseInt(value), camera_id: activeCameraId})
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (data.status !== 'ok') {
+                    console.error('Camera control error:', data);
+                }
+            })
+            .catch(e => console.error('Camera control error:', e));
+        }
+
+        function resetCameraDefaults() {
+            if (!confirm('Reset all camera settings to defaults?')) return;
+
+            fetch('/api/camera/reset', {method: 'POST'})
+                .then(r => r.json())
+                .then(data => {
+                    if (data.status === 'ok') {
+                        cameraControlsLoaded = false;
+                        loadCameraControls();
+                    }
+                })
+                .catch(e => console.error('Reset error:', e));
+        }
+
+        function updateWbTempState() {
+            const wbAuto = document.getElementById('cam-wb-auto');
+            const wbTemp = document.getElementById('cam-wb-temp');
+            if (wbAuto && wbTemp) {
+                wbTemp.disabled = wbAuto.value === '1';
+                wbTemp.style.opacity = wbAuto.value === '1' ? '0.5' : '1';
+            }
+        }
+
+        // Open FLV in fullscreen window
+        function openFlvFullscreen() {
+            const w = screen.availWidth;
+            const h = screen.availHeight;
+            const flvStreamUrl = 'http://' + location.hostname + ':' + FLV_PORT + '/flv';
+            const html = `<!DOCTYPE html>
+<html><head><title>H.264 Stream</title>
+<script src="https://cdn.jsdelivr.net/npm/flv.js@1.6.2/dist/flv.min.js"><\/script>
+<style>body{margin:0;background:#000;overflow:hidden}video{width:100vw;height:100vh;object-fit:contain}</style>
+</head><body>
+<video id="v" muted autoplay></video>
+<script>
+if(flvjs.isSupported()){
+  var p=flvjs.createPlayer({type:'flv',isLive:true,url:'${flvStreamUrl}'},{enableWorker:false,enableStashBuffer:false});
+  p.attachMediaElement(document.getElementById('v'));
+  p.load();p.play();
+}
+<\/script></body></html>`;
+            const win = window.open('', '_blank', 'width='+w+',height='+h);
+            win.document.write(html);
+            win.document.close();
+        }
+
+        // FLV player using flv.js
+        function startFlvPlayer() {
+            if (flvPlayerBusy) return;
+            const statusEl = document.getElementById('flv-status');
+
+            // Stop existing player first
+            if (flvPlayer) {
+                flvPlayerBusy = true;
+                try {
+                    flvPlayer.pause();
+                    flvPlayer.unload();
+                    flvPlayer.detachMediaElement();
+                    flvPlayer.destroy();
+                } catch(e) {}
+                flvPlayer = null;
+                // Wait a bit before creating new player
+                setTimeout(createFlvPlayer, 200);
+            } else {
+                createFlvPlayer();
+            }
+        }
+
+        function createFlvPlayer() {
+            flvPlayerBusy = false;
+            const statusEl = document.getElementById('flv-status');
+            const videoElement = document.getElementById('flv-player');
+
+            if (!flvjs.isSupported()) {
+                statusEl.textContent = 'FLV.js not supported';
+                return;
+            }
+
+            statusEl.textContent = 'Connecting...';
+
+            flvPlayer = flvjs.createPlayer({
+                type: 'flv',
+                isLive: true,
+                url: 'http://' + location.hostname + ':' + FLV_PORT + '/flv'
+            }, {
+                enableWorker: false,
+                enableStashBuffer: false,
+                stashInitialSize: 128,
+                lazyLoad: false
+            });
+
+            flvPlayer.on(flvjs.Events.ERROR, (e, t) => {
+                statusEl.textContent = 'Error: ' + t;
+            });
+
+            flvPlayer.on(flvjs.Events.LOADING_COMPLETE, () => {
+                statusEl.textContent = 'Stream ended';
+            });
+
+            flvPlayer.attachMediaElement(videoElement);
+            flvPlayer.load();
+
+            // Handle play promise properly
+            const playPromise = videoElement.play();
+            if (playPromise !== undefined) {
+                playPromise.then(() => {
+                    statusEl.textContent = 'Playing';
+                }).catch(err => {
+                    statusEl.textContent = 'Click Play';
+                });
+            }
+        }
+
+        function stopFlvPlayer() {
+            if (flvPlayerBusy) return;
+            const statusEl = document.getElementById('flv-status');
+            const videoElement = document.getElementById('flv-player');
+
+            if (flvPlayer) {
+                flvPlayerBusy = true;
+                try {
+                    videoElement.pause();
+                    flvPlayer.unload();
+                    flvPlayer.detachMediaElement();
+                    flvPlayer.destroy();
+                } catch(e) {}
+                flvPlayer = null;
+                flvPlayerBusy = false;
+            }
+            statusEl.textContent = 'Stopped';
+        }
+
+        // FPS percentage helpers
+        let currentMjpegFps = 20;  // Will be updated from stats
+        let currentMaxCameraFps = $max_camera_fps;
+        let savedSkipRatio = $skip_ratio;
+
+        function pctToSkipRatio(pct) {
+            // 100% = skip_ratio 1 (all frames)
+            // 0% = skip_ratio = mjpegFps (1 fps output)
+            if (pct <= 0) return Math.max(1, Math.round(currentMjpegFps));
+            if (pct >= 100) return 1;
+            return Math.max(1, Math.round(100 / pct));
+        }
+
+        function skipRatioToPct(ratio) {
+            if (ratio <= 1) return 100;
+            return Math.max(1, Math.min(100, Math.round(100 / ratio)));
+        }
+
+        function updateFpsLabel() {
+            const pct = parseInt(document.getElementById('fps_pct_input').value) || 0;
+            const skipRatio = pctToSkipRatio(pct);
+            const estFps = (currentMjpegFps / skipRatio).toFixed(1);
+            document.getElementById('fps_label').textContent = '~' + estFps + ' fps';
+            document.getElementById('skip_ratio_hidden').value = skipRatio;
+        }
+
+        function updateMjpegFpsLabel() {
+            const fps = parseInt(document.getElementById('mjpeg_fps_input').value) || 10;
+            const label = document.getElementById('mjpeg_fps_label');
+            if (fps !== currentMjpegFpsTarget) {
+                label.textContent = '(Requires restart)';
+                label.style.color = '#f90';
+            } else {
+                label.textContent = '(Camera source rate)';
+                label.style.color = '#888';
+            }
+        }
+
+        function toggleAutoSkip(enabled) {
+            document.getElementById('fps_pct_slider').disabled = enabled;
+            document.getElementById('fps_pct_input').disabled = enabled;
+            document.querySelector('[name=target_cpu]').disabled = !enabled;
+
+            // When disabling auto-skip, restore the saved manual setting
+            if (!enabled) {
+                const pct = skipRatioToPct(savedSkipRatio);
+                document.getElementById('fps_pct_slider').value = pct;
+                document.getElementById('fps_pct_input').value = pct;
+                document.getElementById('skip_ratio_hidden').value = savedSkipRatio;
+                updateFpsLabel();
+            }
+        }
+
+        function toggleProxySettings(proxyEnabled) {
+            document.querySelectorAll('.h264-local-setting').forEach(el => {
+                el.style.display = proxyEnabled ? 'none' : '';
+            });
+        }
+
+        function updateDisplaySettings() {
+            const enabled = document.querySelector('[name=display_enabled]').checked;
+            document.getElementById('display_fps_select').disabled = !enabled;
+        }
+
+        // Timelapse settings UI functions
+        function updateTimelapseSettings() {
+            const enabled = document.getElementById('timelapse_enabled').checked;
+            document.querySelectorAll('.timelapse-setting').forEach(el => {
+                el.style.display = enabled ? '' : 'none';
+            });
+            if (enabled) {
+                updateTimelapseModeSettings();
+                updateVariableFpsSettings();
+                checkUsbStatus();
+                checkMoonrakerStatus();
+            }
+        }
+
+        function updateTimelapseModeSettings() {
+            const mode = document.getElementById('timelapse_mode').value;
+            document.querySelectorAll('.hyperlapse-only').forEach(el => {
+                el.style.display = mode === 'hyperlapse' ? '' : 'none';
+            });
+        }
+
+        function updateVariableFpsSettings() {
+            const enabled = document.getElementById('timelapse_variable_fps')?.checked || false;
+            document.querySelectorAll('.variable-fps-setting').forEach(el => {
+                el.style.display = enabled ? '' : 'none';
+            });
+        }
+
+        function checkUsbStatus() {
+            fetch('/api/timelapse/storage')
+                .then(r => r.json())
+                .then(data => {
+                    const statusEl = document.getElementById('usb_status');
+                    if (data.usb_mounted) {
+                        statusEl.innerHTML = '&bull; Mounted';
+                        statusEl.style.color = '#4CAF50';
+                    } else {
+                        statusEl.innerHTML = 'o Not detected';
+                        statusEl.style.color = '#888';
+                    }
+                })
+                .catch(() => {
+                    const statusEl = document.getElementById('usb_status');
+                    statusEl.textContent = '? Unknown';
+                    statusEl.style.color = '#f90';
+                });
+        }
+
+        function checkMoonrakerStatus() {
+            fetch('/api/timelapse/moonraker')
+                .then(r => r.json())
+                .then(data => {
+                    const statusEl = document.getElementById('moonraker_status');
+                    if (data.connected) {
+                        statusEl.innerHTML = '&bull; Connected';
+                        statusEl.style.color = '#4CAF50';
+                        if (data.print_state && data.print_state !== 'standby') {
+                            statusEl.innerHTML += ' (' + data.print_state + ')';
+                        }
+                    } else {
+                        statusEl.innerHTML = 'o Disconnected';
+                        statusEl.style.color = '#888';
+                    }
+                })
+                .catch(() => {
+                    const statusEl = document.getElementById('moonraker_status');
+                    statusEl.innerHTML = '? Unknown';
+                    statusEl.style.color = '#f90';
+                });
+        }
+
+        function updateStorageSettings() {
+            const storage = document.getElementById('timelapse_storage').value;
+            document.querySelectorAll('.usb-path-setting').forEach(el => {
+                el.style.display = storage === 'usb' ? '' : 'none';
+            });
+        }
+
+        // Folder picker for USB path
+        let folderPickerModal = null;
+        let currentPickerPath = '/mnt/udisk';
+
+        function openFolderPicker() {
+            if (!folderPickerModal) {
+                folderPickerModal = document.createElement('div');
+                folderPickerModal.id = 'folder-picker-modal';
+                folderPickerModal.innerHTML = `
+                    <div style="position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.7);z-index:1000;display:flex;align-items:center;justify-content:center;">
+                        <div style="background:#222;border-radius:8px;padding:20px;width:400px;max-width:90%;max-height:80vh;display:flex;flex-direction:column;">
+                            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:15px;">
+                                <h3 style="margin:0;">Select Folder</h3>
+                                <button onclick="closeFolderPicker()" style="background:none;border:none;color:#fff;font-size:20px;cursor:pointer;">&times;</button>
+                            </div>
+                            <div id="picker-path" style="font-family:monospace;background:#333;padding:8px;border-radius:4px;margin-bottom:10px;word-break:break-all;"></div>
+                            <div id="picker-list" style="flex:1;overflow-y:auto;border:1px solid #444;border-radius:4px;min-height:200px;max-height:300px;"></div>
+                            <div style="display:flex;gap:10px;margin-top:15px;">
+                                <button onclick="createNewFolder()" class="secondary" style="flex:1;">New Folder</button>
+                                <button onclick="selectCurrentFolder()" style="flex:1;">Select This Folder</button>
+                            </div>
+                        </div>
+                    </div>
+                `;
+                document.body.appendChild(folderPickerModal);
+            }
+            folderPickerModal.style.display = 'block';
+            currentPickerPath = '/mnt/udisk';
+            loadFolderContents(currentPickerPath);
+        }
+
+        function closeFolderPicker() {
+            if (folderPickerModal) {
+                folderPickerModal.style.display = 'none';
+            }
+        }
+
+        function loadFolderContents(path) {
+            currentPickerPath = path;
+            document.getElementById('picker-path').textContent = path;
+            document.getElementById('picker-list').innerHTML = '<div style="padding:20px;text-align:center;color:#888;">Loading...</div>';
+
+            fetch('/api/timelapse/browse?path=' + encodeURIComponent(path))
+                .then(r => r.json())
+                .then(data => {
+                    if (data.error) {
+                        document.getElementById('picker-list').innerHTML = '<div style="padding:20px;text-align:center;color:#f44;">Error: ' + data.error + '</div>';
+                        return;
+                    }
+                    const listEl = document.getElementById('picker-list');
+                    listEl.innerHTML = '';
+
+                    // Parent directory link
+                    if (path !== '/mnt/udisk') {
+                        const parent = path.substring(0, path.lastIndexOf('/')) || '/mnt/udisk';
+                        const parentDiv = document.createElement('div');
+                        parentDiv.style.cssText = 'padding:10px;cursor:pointer;border-bottom:1px solid #333;display:flex;align-items:center;gap:10px;';
+                        parentDiv.innerHTML = '<span>&#128194;</span> <span>..</span>';
+                        parentDiv.onmouseover = function() { this.style.background='#333'; };
+                        parentDiv.onmouseout = function() { this.style.background=''; };
+                        parentDiv.onclick = function() { loadFolderContents(parent); };
+                        listEl.appendChild(parentDiv);
+                    }
+
+                    // Folder entries
+                    if (data.folders && data.folders.length > 0) {
+                        data.folders.forEach(function(folder) {
+                            const fullPath = path + '/' + folder;
+                            const div = document.createElement('div');
+                            div.style.cssText = 'padding:10px;cursor:pointer;border-bottom:1px solid #333;display:flex;align-items:center;gap:10px;';
+                            div.innerHTML = '<span>&#128193;</span> <span>' + folder + '</span>';
+                            div.onmouseover = function() { this.style.background='#333'; };
+                            div.onmouseout = function() { this.style.background=''; };
+                            div.onclick = function() { loadFolderContents(fullPath); };
+                            listEl.appendChild(div);
+                        });
+                    }
+
+                    if (listEl.children.length === 0) {
+                        listEl.innerHTML = '<div style="padding:20px;text-align:center;color:#888;">Empty folder</div>';
+                    }
+                })
+                .catch(err => {
+                    document.getElementById('picker-list').innerHTML = '<div style="padding:20px;text-align:center;color:#f44;">Failed to load</div>';
+                });
+        }
+
+        function selectCurrentFolder() {
+            document.getElementById('timelapse_usb_path').value = currentPickerPath;
+            closeFolderPicker();
+        }
+
+        function createNewFolder() {
+            const name = prompt('Enter new folder name:');
+            if (!name) return;
+            fetch('/api/timelapse/mkdir', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({path: currentPickerPath + '/' + name})
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (data.success) {
+                    loadFolderContents(currentPickerPath);
+                } else {
+                    alert('Failed to create folder: ' + (data.error || 'Unknown error'));
+                }
+            })
+            .catch(() => alert('Failed to create folder'));
+        }
+
+        // Update stats every second
+        function updateStats() {
+            fetch('/api/stats')
+                .then(r => r.json())
+                .then(data => {
+                    document.getElementById('stat-cpu-total').textContent = data.cpu.total + '%';
+                    document.getElementById('stat-mjpeg-fps').textContent = data.fps.mjpeg;
+                    document.getElementById('stat-h264-fps').textContent = data.fps.h264;
+                    document.getElementById('stat-cpu-encoder').textContent = data.encoder_cpu + '%';
+                    document.getElementById('stat-cpu-streamer').textContent = data.streamer_cpu + '%';
+                    // Update client count
+                    if (data.clients) {
+                        const totalClients = (data.clients.mjpeg || 0) + (data.clients.flv || 0);
+                        document.getElementById('stat-clients').textContent = totalClients;
+                    }
+                    // Update MJPEG FPS for percentage calculations
+                    if (data.fps.mjpeg > 0) {
+                        currentMjpegFps = data.fps.mjpeg;
+                        updateFpsLabel();
+                    }
+                    // Keep saved_skip_ratio in sync with server
+                    if (data.saved_skip_ratio) {
+                        savedSkipRatio = data.saved_skip_ratio;
+                    }
+                    // Update slider only if auto_skip checkbox is CHECKED (local UI state)
+                    const autoSkipCheckbox = document.querySelector('[name=auto_skip]');
+                    if (autoSkipCheckbox && autoSkipCheckbox.checked) {
+                        const pct = skipRatioToPct(data.skip_ratio);
+                        document.getElementById('fps_pct_slider').value = pct;
+                        document.getElementById('fps_pct_input').value = pct;
+                        document.getElementById('skip_ratio_hidden').value = data.skip_ratio;
+                        updateFpsLabel();
+                    }
+                })
+                .catch(() => {});
+        }
+        // Start stats update - poll every 2 seconds to reduce CPU
+        if (!statsInterval) {
+            statsInterval = setInterval(updateStats, 2000);
+        }
+        // Initialize FPS labels on load
+        updateFpsLabel();
+        updateMjpegFpsLabel();
+
+        // Handle form submission
+        document.getElementById('settings-form').addEventListener('submit', function(e) {
+            e.preventDefault();
+            const formData = new FormData(this);
+            const data = new URLSearchParams();
+            data.append('encoder_type', document.querySelector('[name=encoder_type]').value);
+            data.append('autolanmode', formData.has('autolanmode') ? '1' : '0');
+            data.append('logging', formData.has('logging') ? '1' : '0');
+            data.append('h264_enabled', formData.has('h264_enabled') ? '1' : '0');
+            data.append('skip_ratio', document.querySelector('[name=skip_ratio]').value);
+            data.append('auto_skip', formData.has('auto_skip') ? '1' : '0');
+            data.append('target_cpu', document.querySelector('[name=target_cpu]').value);
+            data.append('bitrate', document.querySelector('[name=bitrate]').value);
+            data.append('h264_resolution', document.querySelector('[name=h264_resolution]')?.value || '1280x720');
+            // Get mjpeg_fps from the correct slider based on encoder type
+            const selectedEncoderType = document.querySelector('[name=encoder_type]').value;
+            const mjpegFpsValue = selectedEncoderType === 'rkmpi-yuyv'
+                ? document.getElementById('mjpeg_fps_slider_yuyv').value
+                : document.getElementById('mjpeg_fps_slider').value;
+            data.append('mjpeg_fps', mjpegFpsValue);
+            // Display capture settings
+            if (formData.has('display_enabled')) {
+                data.append('display_enabled', 'on');
+            }
+            data.append('display_fps', document.querySelector('[name=display_fps]').value);
+            // ACProxyCam FLV proxy
+            if (formData.has('acproxycam_flv_proxy')) {
+                data.append('acproxycam_flv_proxy', '1');
+            }
+
+            // Check if settings require restart
+            const newMjpegFps = parseInt(mjpegFpsValue) || 10;
+            const newLogging = formData.has('logging');
+            const newBitrate = parseInt(document.querySelector('[name=bitrate]').value) || 512;
+            const newH264Resolution = document.querySelector('[name=h264_resolution]')?.value || '1280x720';
+            const needsRkmpiRestart = (newMjpegFps !== currentMjpegFpsTarget) && currentEncoderType === 'rkmpi';
+            const needsLoggingRestart = (newLogging !== currentLogging);
+            const needsBitrateRestart = (newBitrate !== currentBitrate) && (currentEncoderType === 'rkmpi' || currentEncoderType === 'rkmpi-yuyv');
+            const needsResolutionRestart = (newH264Resolution !== currentH264Resolution) && (currentEncoderType === 'rkmpi' || currentEncoderType === 'rkmpi-yuyv');
+            const needsRestart = needsRkmpiRestart || needsLoggingRestart || needsBitrateRestart || needsResolutionRestart;
+
+            if (needsRestart) {
+                // Show loading overlay and trigger restart
+                const overlay = document.getElementById('loading-overlay');
+                const statusEl = document.getElementById('loading-status');
+                overlay.classList.add('active');
+                statusEl.textContent = 'Saving settings...';
+
+                // Stop stats polling during restart to avoid connection errors
+                if (statsInterval) {
+                    clearInterval(statsInterval);
+                    statsInterval = null;
+                }
+
+                fetch('/control', {
+                    method: 'POST',
+                    body: data
+                }).then(() => {
+                    statusEl.textContent = 'Restarting encoder...';
+                    return fetch('/api/restart');
+                }).then(() => {
+                    statusEl.textContent = 'Waiting for encoder...';
+                    pollForRestart();
+                }).catch(err => {
+                    overlay.classList.remove('active');
+                    alert('Restart failed: ' + err);
+                });
+            } else {
+                fetch('/control', {
+                    method: 'POST',
+                    body: data
+                }).then(() => location.reload());
+            }
+        });
+
+        // Timelapse form submission
+        const timelapseForm = document.getElementById('timelapse-form');
+        if (timelapseForm) {
+            timelapseForm.addEventListener('submit', function(e) {
+                e.preventDefault();
+                const formData = new FormData(this);
+                const data = new URLSearchParams();
+
+                // Boolean settings
+                data.append('timelapse_enabled', formData.has('timelapse_enabled') ? '1' : '0');
+                data.append('timelapse_variable_fps', formData.has('timelapse_variable_fps') ? '1' : '0');
+                data.append('timelapse_flip_x', formData.has('timelapse_flip_x') ? '1' : '0');
+                data.append('timelapse_flip_y', formData.has('timelapse_flip_y') ? '1' : '0');
+
+                // String/number settings
+                data.append('timelapse_mode', formData.get('timelapse_mode') || 'layer');
+                data.append('timelapse_hyperlapse_interval', formData.get('timelapse_hyperlapse_interval') || '30');
+                data.append('timelapse_storage', formData.get('timelapse_storage') || 'internal');
+                data.append('timelapse_usb_path', formData.get('timelapse_usb_path') || '/mnt/udisk/timelapse');
+                data.append('moonraker_host', formData.get('moonraker_host') || '127.0.0.1');
+                data.append('moonraker_port', formData.get('moonraker_port') || '7125');
+                data.append('timelapse_output_fps', formData.get('timelapse_output_fps') || '30');
+                data.append('timelapse_target_length', formData.get('timelapse_target_length') || '10');
+                data.append('timelapse_variable_fps_min', formData.get('timelapse_variable_fps_min') || '5');
+                data.append('timelapse_variable_fps_max', formData.get('timelapse_variable_fps_max') || '60');
+                data.append('timelapse_crf', formData.get('timelapse_crf') || '23');
+                data.append('timelapse_duplicate_last_frame', formData.get('timelapse_duplicate_last_frame') || '0');
+                data.append('timelapse_stream_delay', formData.get('timelapse_stream_delay') || '0.05');
+                data.append('timelapse_end_delay', formData.get('timelapse_end_delay') || '5.0');
+
+                fetch('/api/timelapse/settings', {
+                    method: 'POST',
+                    body: data
+                }).then(r => r.json())
+                .then(data => {
+                    if (data.status === 'ok') {
+                        // Refresh status indicators
+                        checkUsbStatus();
+                        checkMoonrakerStatus();
+                        alert('Timelapse settings saved');
+                    } else {
+                        alert('Error saving settings: ' + (data.message || 'Unknown error'));
+                    }
+                })
+                .catch(err => alert('Error: ' + err));
+            });
+        }
+
+        // Initialize UI on page load
+        document.addEventListener('DOMContentLoaded', function() {
+            updateEncoderVisibility();
+            updateTimelapseSettings();
+            // Hide H.264 local settings when ACProxyCam FLV proxy is enabled
+            const proxyCheckbox = document.querySelector('[name=acproxycam_flv_proxy]');
+            if (proxyCheckbox) {
+                toggleProxySettings(proxyCheckbox.checked);
+            }
+        });
+
+        // Snapshot preview is static - click image to refresh (reduces CPU usage)
+    </script>
+</body>
+</html>

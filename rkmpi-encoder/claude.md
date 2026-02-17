@@ -233,9 +233,9 @@ When multiple cameras are connected, USB bandwidth limits typically require:
 
 ### Per-Camera Control Files
 
-Each encoder instance uses separate command and control files to avoid interference:
-- `--cmd-file <path>`: Where h264_server.py writes commands (FPS, resolution, camera controls)
-- `--ctrl-file <path>`: Where encoder writes stats and reads camera control values
+Each encoder instance uses separate command and control files:
+- `--cmd-file <path>`: Where the primary encoder writes commands (FPS, resolution, camera controls)
+- `--ctrl-file <path>`: Where encoder writes stats (FPS, client counts) for monitoring
 
 ### Resource Constraints
 
@@ -319,27 +319,75 @@ Auto-detected from `/userdata/app/gk/config/api.cfg` (JSON format with `modelId`
 - CPU fallback available if RGA copy or rotation fails
 - Timing instrumentation available via `-DDISPLAY_TIMING` compile flag
 
-## Output Pipes
+## Primary Mode (--primary)
 
-The encoder creates and writes to:
-- `/tmp/mjpeg.pipe` - Raw MJPEG frames (for snapshot/MJPEG stream)
-- `/tmp/h264.pipe` - H.264 Annex-B NALUs (for FLV stream)
+In primary mode, rkmpi_enc acts as the **sole application process** for h264-streamer, handling everything that was previously split between Python and C:
 
-## Integration with h264-streamer
-
-The h264_server.py spawns this encoder as a subprocess:
-
-```python
-cmd = [
-    encoder_path,
-    '-w', str(width),
-    '-h', str(height),
-    '-f', str(framerate),
-    '-s', str(skip_ratio)
-]
-if not h264_enabled:
-    cmd.append('--no-h264')
+```bash
+./rkmpi_enc --primary --config /path/to/config.json --template-dir /path/to/app/ \
+    -S -N -v -d /dev/video10 -w 1280 -h 720 -f 10 -b 512
 ```
+
+### Features in Primary Mode
+
+- **Control Server** (port 8081) — Web UI, REST API, config persistence
+- **Multi-Camera Management** — Auto-detect cameras, spawn/manage secondary encoder instances
+- **Camera Detection** — Discover cameras via `/dev/v4l/by-id/`, resolve USB ports
+- **Config Persistence** — Read/write JSON config file with all settings
+- **CPU Monitoring** — Track system and per-process CPU usage
+- **Moonraker WebSocket Client** — Advanced timelapse via Moonraker (when timelapse enabled)
+- **ACProxyCam FLV Proxy** — Transparent FLV byte proxy to ACProxyCam
+
+### Primary Mode Options
+
+| Option | Description |
+|--------|-------------|
+| `--primary` | Enable primary mode (all-in-one) |
+| `--config <path>` | JSON config file path |
+| `--template-dir <path>` | Directory with HTML templates (control.html, etc.) |
+| `--control-port <port>` | Control server port (default: 8081) |
+
+### Control Server
+
+The control server (`control_server.c`) runs on port 8081 and provides:
+- **Web UI** (`/control`) — Settings management, live preview, camera controls
+- **REST API** — Stats, config, camera management, timelapse management
+- **HTML Templates** — Loaded from `--template-dir` with `{{variable}}` substitution
+- **Config Persistence** — Reads/writes JSON config file on settings changes
+- **Timelapse File Management** — List, serve, delete, thumbnail generation
+- **Touch Injection** — POST `/api/touch` for remote touchscreen control
+- **Moonraker Camera Provisioning** — Configure cameras in Moonraker dashboard
+
+### Config Management
+
+Settings are persisted as JSON. The `config.c` module handles read/write:
+- `config_load()` — Read config file into `AppConfig` struct
+- `config_save()` — Write `AppConfig` to JSON file
+- All settings have string values in JSON (for compatibility with form POST data)
+
+### Multi-Camera Management
+
+The primary encoder discovers cameras (`camera_detect.c`) and manages secondary instances (`process_manager.c`):
+- Auto-detect USB cameras via `/dev/v4l/by-id/` symlinks
+- Sort by USB port (internal camera first, port 1.3)
+- Spawn secondary `rkmpi_enc` instances with `--no-flv` for CAM#2-4
+- Monitor secondary processes, restart on crash
+
+### Moonraker WebSocket Client
+
+When `timelapse_enabled` is true, the Moonraker client (`moonraker_client.c`) runs:
+- Connects to Moonraker via WebSocket on `moonraker_host:moonraker_port`
+- Subscribes to `print_stats` and `virtual_sdcard` objects
+- Calls `timelapse_init()`, `timelapse_capture_frame()`, `timelapse_finalize()` directly
+- `timelapse_set_custom_mode(1)` prevents RPC timelapse conflicts
+- Auto-reconnects with 5s delay on disconnection
+
+### CPU Monitor
+
+The CPU monitor (`cpu_monitor.c`) tracks:
+- Total system CPU usage from `/proc/stat`
+- Per-process CPU usage from `/proc/<pid>/stat`
+- Updated periodically by the control server stats reader
 
 ## Camera Detection
 
@@ -417,10 +465,32 @@ export LD_LIBRARY_PATH=/oem/usr/lib:$LD_LIBRARY_PATH
 
 ## File Locations
 
-- Source: `rkmpi_enc.c` (this directory)
-- Makefile: `Makefile`
-- SDK headers: `include/`
-- Printer libs: `lib-printer/`
+### Source Files
+- `rkmpi_enc.c` - Main encoder with primary mode orchestration
+- `control_server.c/h` - Control HTTP server, REST API, web UI
+- `config.c/h` - JSON config persistence
+- `moonraker_client.c/h` - Moonraker WebSocket client
+- `camera_detect.c/h` - USB camera discovery
+- `process_manager.c/h` - Secondary encoder process management
+- `cpu_monitor.c/h` - CPU usage tracking
+- `touch_inject.c/h` - Touch event injection
+- `lan_mode.c/h` - LAN mode management
+- `http_server.c/h` - Streaming HTTP server
+- `flv_mux.c/h` - FLV muxer
+- `frame_buffer.c/h` - Frame buffer management
+- `mqtt_client.c/h` - MQTT client
+- `rpc_client.c/h` - RPC client
+- `timelapse.c/h` - Timelapse frame capture and finalization
+- `timelapse_venc.c/h` - Hardware VENC timelapse encoding
+- `display_capture.c/h` - LCD framebuffer capture
+- `json_util.c/h` - JSON utilities
+- `cJSON.c/h` - JSON parser library
+
+### Other
+- `Makefile` - Build system
+- `include/` - SDK headers
+- `lib-printer/` - Printer runtime libraries
+- `openssl-arm/` - OpenSSL headers + static libraries
 - Built binary: `rkmpi_enc`
 - h264-streamer copy: `../h264-streamer/29-h264-streamer/rkmpi_enc`
 
@@ -472,14 +542,14 @@ minimp4 muxer → .mp4 file
 - Print completion detected via `print_stats.state` in RPC status
 
 **Custom Mode (Advanced)**
-- Triggered by h264_server.py via Moonraker integration
-- Timelapse commands received via control file
+- Triggered by Moonraker WebSocket client (`moonraker_client.c`) in primary mode
+- Timelapse functions called directly in-process (no IPC needed)
 - Ignores Anycubic RPC timelapse commands when active
 - Supports configurable FPS, CRF, variable FPS, and flip options
 
-### Control File Commands
+### Control File Commands (Legacy)
 
-The encoder reads commands from a control file (default: `/tmp/rkmpi.ctrl`):
+In non-primary mode, the encoder reads timelapse commands from a control file (default: `/tmp/h264_cmd`). In primary mode, timelapse is driven directly by the Moonraker client — no control file needed.
 
 | Command | Description |
 |---------|-------------|
@@ -570,8 +640,15 @@ Default output directory: `/useremain/app/gk/Time-lapse-Video/`
 - `timelapse_venc.h` - Hardware VENC encoding API
 - `timelapse_venc.c` - VENC encoder with minimp4 muxer
 - `minimp4.h` - Header-only MP4 muxer library (public domain)
-- `rpc_client.c` - RPC command handlers (legacy mode)
-- `rkmpi_enc.c` - Control file parsing for custom mode
+- `rpc_client.c` - RPC command handlers (native Anycubic timelapse)
+- `moonraker_client.c` - Moonraker WebSocket client (advanced timelapse)
+- `control_server.c` - Control page, REST API, config, timelapse file management
+- `config.c` - JSON config persistence
+- `camera_detect.c` - USB camera discovery
+- `process_manager.c` - Secondary encoder process management
+- `cpu_monitor.c` - System/process CPU tracking
+- `touch_inject.c` - Touch event injection
+- `lan_mode.c` - LAN mode management via local binary API
 
 ---
 

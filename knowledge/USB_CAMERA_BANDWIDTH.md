@@ -199,7 +199,7 @@ This indicates the USB controller cannot allocate isochronous bandwidth for the 
 
 ### Dynamic Resolution Detection
 
-The h264_server.py detects supported resolutions via V4L2 ioctls:
+Camera detection (`camera_detect.c`) detects supported resolutions via V4L2 ioctls. The original Python implementation:
 
 ```python
 def detect_camera_resolutions(device, pixel_format='YUYV'):

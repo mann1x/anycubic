@@ -80,7 +80,7 @@ V4L2 camera controls reference for USB cameras on Anycubic printers.
 - Available V4L2 controls (brightness, contrast, exposure, etc.)
 - Control IDs and ranges for UVC cameras
 - Control dependencies (auto vs manual modes)
-- Implementation in rkmpi_enc and h264_server.py
+- Implementation in rkmpi_enc and control_server
 - Control file format (`/tmp/h264_ctrl`)
 - API endpoints for real-time adjustment
 

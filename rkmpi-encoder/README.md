@@ -9,6 +9,10 @@ Hardware H.264/JPEG encoder for RV1106-based Anycubic 3D printers.
 - **Hardware MJPEG Encoding** - For snapshots and MJPEG streaming
 - **Display Capture** - Stream the printer's LCD via RGA hardware rotation
 - **Built-in Servers** - HTTP, MQTT, and RPC servers for streaming and control
+- **Primary Mode** - All-in-one application process with control server, multi-camera management, config persistence
+- **Control Server** - Web UI, REST API, config management on port 8081
+- **Moonraker Client** - WebSocket client for advanced timelapse via Moonraker
+- **Multi-Camera Management** - Auto-detect and manage up to 4 USB cameras
 - **Timelapse Recording** - Layer-by-layer or interval-based capture to MP4
 - **MQTT Keepalive** - Automatic PINGREQ to prevent broker disconnections
 
@@ -78,6 +82,10 @@ Hardware H.264/JPEG encoder for RV1106-based Anycubic 3D printers.
 | `-N, --no-stdout` | Disable stdout (use with -S) | off |
 | `--streaming-port <n>` | MJPEG HTTP port | 8080 |
 | `--mode <mode>` | Operating mode (see below) | go-klipper |
+| `--primary` | Primary mode (all-in-one with control server) | off |
+| `--config <path>` | JSON config file path (primary mode) | none |
+| `--template-dir <path>` | HTML template directory (primary mode) | app dir |
+| `--control-port <n>` | Control server port (primary mode) | 8081 |
 | `--no-flv` | Disable FLV server (for secondary cameras) | off |
 | `--cmd-file <path>` | Command file path | /tmp/h264_cmd |
 | `--ctrl-file <path>` | Control/stats file path | /tmp/h264_ctrl |
@@ -291,13 +299,21 @@ export LD_LIBRARY_PATH=/oem/usr/lib:$LD_LIBRARY_PATH
 
 | File | Description |
 |------|-------------|
-| `rkmpi_enc.c` | Main encoder source |
-| `display_capture.c` | Display capture implementation |
-| `http_server.c` | Built-in HTTP server |
+| `rkmpi_enc.c` | Main encoder with primary mode orchestration |
+| `control_server.c` | Control HTTP server, REST API, web UI |
+| `config.c` | JSON config persistence |
+| `moonraker_client.c` | Moonraker WebSocket client for timelapse |
+| `camera_detect.c` | USB camera discovery |
+| `process_manager.c` | Secondary encoder process management |
+| `cpu_monitor.c` | CPU usage tracking |
+| `touch_inject.c` | Touch event injection |
+| `lan_mode.c` | LAN mode management |
+| `http_server.c` | Streaming HTTP server |
 | `mqtt_client.c` | MQTT client for camera control |
 | `rpc_client.c` | RPC client for timelapse |
 | `timelapse.c` | Timelapse recording logic |
 | `timelapse_venc.c` | Hardware VENC timelapse encoding |
+| `display_capture.c` | Display capture implementation |
 | `flv_mux.c` | FLV container muxer |
 | `minimp4.h` | MP4 muxer (header-only library) |
 
@@ -319,7 +335,7 @@ The VENC encoder uses channel 2, separate from live streaming (channel 0), so ti
 | Mode | Trigger | Description |
 |------|---------|-------------|
 | RPC (Legacy) | Anycubic firmware | `openDelayCamera` / `startLanCapture` RPC commands |
-| Custom | h264_server.py | Moonraker integration via control file |
+| Custom | moonraker_client.c | Moonraker WebSocket integration (direct calls in primary mode) |
 
 ### Control File Commands
 

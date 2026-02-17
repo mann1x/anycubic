@@ -1,96 +1,99 @@
 # h264-streamer App
 
-USB camera streaming app for Rinkhals with hardware H.264 encoding using the RV1106 VENC.
-
----
-
-## ⛔ CRITICAL: NEVER KILL PYTHON PROCESSES ⛔
-
-```
-██████████████████████████████████████████████████████████████████████████████
-██                                                                          ██
-██   NEVER USE: killall python                                              ██
-██   NEVER USE: pkill python                                                ██
-██   NEVER USE: pkill -f python                                             ██
-██                                                                          ██
-██   This DESTROYS the printer! Moonraker, Klipper, and other critical      ██
-██   services run as Python processes. Killing all Python = BRICK.          ██
-██                                                                          ██
-██   ALWAYS USE app.sh FOR PROCESS MANAGEMENT:                              ██
-██                                                                          ██
-██   # Stop h264-streamer:                                                  ██
-██   /useremain/home/rinkhals/apps/29-h264-streamer/app.sh stop             ██
-██                                                                          ██
-██   # Start h264-streamer:                                                 ██
-██   /useremain/home/rinkhals/apps/29-h264-streamer/app.sh start            ██
-██                                                                          ██
-██   If you need to kill h264_server.py specifically:                       ██
-██   pkill -f h264_server.py   (NOT just "python"!)                         ██
-██                                                                          ██
-██████████████████████████████████████████████████████████████████████████████
-```
+USB camera streaming app for Rinkhals with hardware H.264 encoding using the RV1106 VENC. Pure C implementation — no Python interpreter required.
 
 ---
 
 ## Overview
 
-This app provides HTTP endpoints for streaming video from a USB camera:
+This app provides HTTP endpoints for streaming video from USB cameras, with a built-in control web UI, REST API, multi-camera management, timelapse recording, and Moonraker integration.
 
-**Main server (port 8080, configurable via `port` property):**
+**Streaming server (port 8080, configurable via `streaming_port` property):**
 - `/stream` - MJPEG multipart stream (USB camera)
 - `/snapshot` - Single JPEG frame (USB camera)
-- `/display` - MJPEG stream of printer LCD framebuffer (5 fps)
+- `/display` - MJPEG stream of printer LCD framebuffer (configurable fps)
 - `/display/snapshot` - Single JPEG of printer LCD
+- `/flv` - H.264 in FLV container
+
+**Control server (port 8081, configurable via `control_port` property):**
 - `/control` - Web UI with settings, FPS/CPU monitoring, and live stream preview
 - `/status` - JSON status
-- `/api/stats` - JSON stats (FPS, CPU, settings) with 1s refresh
+- `/api/stats` - JSON stats (FPS, CPU, settings)
+- `/api/config` - Current configuration as JSON
+- `/api/camera/controls` - Camera V4L2 controls
+- `/api/cameras` - Multi-camera list with status
+- `/api/moonraker/cameras` - Moonraker camera provisioning
+- `/api/timelapse/*` - Timelapse management API
+- `/api/acproxycam/flv` - ACProxyCam FLV proxy status
+- `/api/touch` - Touch injection
+- `/api/restart` - Restart the application
+- `/timelapse` - Timelapse management web UI
 
 **FLV server (port 18088, fixed for Anycubic slicer):**
-- `/flv` - H.264 in FLV container
+- `/flv` - H.264 in FLV container (legacy endpoint, same stream as :8080/flv)
 
 ## Architecture
 
-**rkmpi mode (MJPEG capture):**
+The app runs as a single `rkmpi_enc --primary` process that handles everything:
+
 ```
-USB Camera (MJPEG) → rkmpi_enc → stdout (MJPEG multipart) → h264_server.py → HTTP
-                         ↓
-                    TurboJPEG decode → NV12 → VENC → H.264 FIFO
+USB Camera (V4L2 MJPEG/YUYV)
+    ↓
+rkmpi_enc --primary
+    ├── TurboJPEG decode → NV12 → VENC Ch0 → H.264 → FLV server (:8080/flv, :18088/flv)
+    ├── MJPEG passthrough/encode → HTTP server (:8080/stream, /snapshot)
+    ├── Display capture → RGA → VENC Ch2 → MJPEG (:8080/display)
+    ├── Control server (:8081) — web UI, REST API, config persistence
+    ├── MQTT client — camera commands from Anycubic firmware
+    ├── RPC client — timelapse commands from Anycubic slicer
+    ├── Moonraker WebSocket client — advanced timelapse via Moonraker
+    ├── Multi-camera management — detect, spawn, manage secondary cameras
+    └── Config management — JSON config persistence, live config updates
 ```
 
-**rkmpi-yuyv mode (YUYV capture with HW JPEG):**
+### Process Hierarchy
+
 ```
-USB Camera (YUYV) → rkmpi_enc → YUYV→NV12 (CPU) → VENC Ch0 → H.264 FIFO
-                                       ↓
-                                   VENC Ch1 → JPEG → stdout → h264_server.py → HTTP
+h264_monitor.sh          # Reads config, builds CLI args, launches primary encoder
+  └── rkmpi_enc --primary  # Single process handling everything
+        ├── Secondary rkmpi_enc instances (--no-flv, per camera)
+        └── Moonraker WebSocket thread (if timelapse enabled)
 ```
 
 ## Components
 
-### h264_server.py
-Python HTTP server that:
-- Manages LAN mode via local binary API (port 18086)
-- Kills gkcam when LAN mode is enabled (to free the camera)
-- Spawns rkmpi_enc subprocess (one per enabled camera)
-- Reads MJPEG from encoder stdout and H.264 from FIFO
-- Provides FLV muxing for H.264 streams
-- Monitors CPU usage
-- Multi-camera management (up to 4 cameras)
+### rkmpi_enc (--primary mode)
 
-### rkmpi_enc
-Native binary encoder built with RV1106 SDK:
-- V4L2 capture from USB camera (MJPEG or YUYV)
-- In MJPEG mode: TurboJPEG software JPEG decoding
-- In YUYV mode: CPU YUYV→NV12 conversion + hardware JPEG encoding (VENC Ch1)
-- RKMPI VENC hardware H.264 encoding (VENC Ch0)
-- Outputs MJPEG to stdout and H.264 to FIFO
+The encoder binary in primary mode is the sole application process:
+
+- **HTTP Streaming** — MJPEG, H.264/FLV, display capture on port 8080
+- **Control Server** — Web UI, REST API, config management on port 8081
+- **LAN Mode Management** — Queries/enables LAN mode via local binary API (port 18086)
+- **gkcam Integration** — Kills gkcam to free the USB camera
+- **MQTT Client** — Handles camera commands from firmware (port 9883 TLS)
+- **RPC Client** — Handles timelapse commands from Anycubic slicer (port 18086)
+- **Moonraker Client** — WebSocket client for advanced timelapse via Moonraker
+- **Multi-Camera Manager** — Auto-detects cameras, spawns secondary encoder instances
+- **Camera Detection** — Discovers cameras via `/dev/v4l/by-id/`, resolves USB ports
+- **Config Persistence** — Reads/writes JSON config file with all settings
+- **CPU Monitoring** — Tracks system and per-process CPU usage
 
 Source: `/shared/dev/anycubic/rkmpi-encoder/`
 
 ### app.sh
+
 App lifecycle management:
-- Reads `autolanmode` property from app.json
-- Sets up LD_LIBRARY_PATH for RKMPI libs
-- Manages process lifecycle
+- Reads `mode` and `streaming_port`/`control_port` properties from app.json
+- Delegates to h264_monitor.sh for process management
+- Stops/starts using `kill_by_name rkmpi_enc` and `kill_by_name h264_monitor`
+
+### h264_monitor.sh
+
+Startup script that reads config and launches the primary encoder:
+- Reads encoder settings from JSON config file (`29-h264-streamer.config`)
+- Detects primary camera device via `/dev/v4l/by-path/`
+- Builds rkmpi_enc CLI arguments
+- Launches `rkmpi_enc --primary --config <config_file> --template-dir <app_dir>`
 
 ## Local Binary API (Port 18086)
 
@@ -152,22 +155,29 @@ anycubic/anycubicCloud/v1/web/printer/{modelId}/{deviceId}/video
 
 ## Control Page Features
 
-The `/control` endpoint (on port 8081) provides a web UI with:
+The `/control` endpoint (on port 8081) provides a web UI served from `control.html`:
 - **Tab-based preview**: Snapshot, MJPEG Stream, H.264 Stream, Display Stream
 - **H.264 player**: Uses flv.js from CDN for live FLV playback in browser
-- **Display preview**: Shows printer LCD framebuffer (5 fps MJPEG)
+- **Display preview**: Shows printer LCD framebuffer (MJPEG)
 - **Performance stats**: Real-time MJPEG FPS, H.264 FPS, Total CPU, Encoder CPU
 - **Settings**:
   - Auto LAN mode toggle
   - H.264 encoding toggle
-  - **Frame Rate slider**: 0-100% with text input (100%=all frames, 0%=~1fps)
-  - **Auto Skip toggle**: CPU-based dynamic frame rate adjustment
-  - **Target CPU %**: Maximum CPU target when auto-skip enabled (30-90%)
+  - Encoder type selection (rkmpi/rkmpi-yuyv)
+  - Frame Rate slider with text input
+  - Auto Skip toggle with target CPU %
+  - Display capture toggle with FPS
+  - ACProxyCam FLV proxy toggle
+  - Camera V4L2 controls (brightness, contrast, etc.)
+- **Camera management**: Enable/disable secondary cameras, set resolution/FPS
+- **Moonraker Camera Settings**: Provision cameras to Moonraker with custom names
+- **Timelapse Settings**: Mode, storage, Moonraker connection, video output options
+- **Timelapse Manager**: Browse, preview, download, delete recordings
 
 ### Port Layout
-- **Port 8080**: Streaming endpoints (`/stream`, `/snapshot`, `/display`, `/display/snapshot`)
-- **Port 8081**: Control page (`/control`, `/api/*`)
-- **Port 18088**: FLV H.264 stream (`/flv`)
+- **Port 8080**: Streaming endpoints (`/stream`, `/snapshot`, `/display`, `/display/snapshot`, `/flv`)
+- **Port 8081**: Control page (`/control`, `/api/*`, `/timelapse`)
+- **Port 18088**: FLV H.264 stream (`/flv`, legacy endpoint for Anycubic slicer)
 
 ### API Stats Response (`/api/stats`)
 ```json
@@ -178,7 +188,12 @@ The `/control` endpoint (on port 8081) provides a web UI with:
   "skip_ratio": 2,
   "auto_skip": true,
   "target_cpu": 60,
-  "autolanmode": true
+  "autolanmode": true,
+  "display_enabled": true,
+  "display_fps": 5,
+  "display_clients": 0,
+  "encoder_type": "rkmpi",
+  "session_id": "abc123"
 }
 ```
 
@@ -186,16 +201,16 @@ The `/control` endpoint (on port 8081) provides a web UI with:
 
 ## Multi-Camera Support
 
-h264-streamer supports up to 4 USB cameras simultaneously, with per-camera settings and control.
+h264-streamer supports up to 4 USB cameras simultaneously, with per-camera settings and control. The primary rkmpi_enc process manages secondary encoder instances.
 
 ### Port Allocation
 
-| Camera | Streaming Port | Control File | Description |
-|--------|---------------|--------------|-------------|
-| CAM#1 | 8080 | /tmp/h264_cmd | Primary camera (full H.264 + MJPEG) |
-| CAM#2 | 8082 | /tmp/h264_cmd_2 | Secondary camera (MJPEG only) |
-| CAM#3 | 8083 | /tmp/h264_cmd_3 | Secondary camera (MJPEG only) |
-| CAM#4 | 8084 | /tmp/h264_cmd_4 | Secondary camera (MJPEG only) |
+| Camera | Streaming Port | Description |
+|--------|---------------|-------------|
+| CAM#1 | 8080 | Primary camera (full H.264 + MJPEG) |
+| CAM#2 | 8082 | Secondary camera (MJPEG only) |
+| CAM#3 | 8083 | Secondary camera (MJPEG only) |
+| CAM#4 | 8084 | Secondary camera (MJPEG only) |
 
 **Note:** Secondary cameras use `--no-flv` mode which disables H.264/FLV to avoid VENC resource conflicts.
 
@@ -206,21 +221,9 @@ Cameras are discovered via `/dev/v4l/by-id/` symlinks and sorted with the intern
 - **id**: Camera number (1-4, assigned after sorting)
 - **streaming_port**: Port for this camera's encoder
 
-### Dynamic Resolution Detection
-
-Resolutions are detected dynamically via V4L2 `VIDIOC_ENUM_FRAMESIZES` ioctl:
-```python
-def detect_camera_resolutions(device, pixel_format='YUYV'):
-    """Detect all supported resolutions for a camera using V4L2 ioctls."""
-    # Uses VIDIOC_ENUM_FRAMESIZES to enumerate discrete or stepwise sizes
-    # Returns list of (width, height) tuples sorted by resolution
-```
-
-This allows the UI to show only resolutions actually supported by each camera.
-
 ### Per-Camera Settings
 
-Each camera has its own settings stored by unique_id:
+Each camera has its own settings stored by unique_id in the config file:
 ```json
 {
   "cameras": {
@@ -230,11 +233,6 @@ Each camera has its own settings stored by unique_id:
       "resolution": "640x480",
       "cam_brightness": 0,
       "cam_contrast": 32
-    },
-    "usb-Another_Camera-video-index0": {
-      "enabled": false,
-      "mjpeg_fps": 5,
-      "resolution": "640x480"
     }
   }
 }
@@ -251,7 +249,7 @@ Secondary cameras (CAM#2-4) support:
 - Multiple 720p MJPEG cameras can exhaust bandwidth
 - Secondary cameras typically need 640x480 or lower
 
-### API Endpoints
+### Camera API Endpoints
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
@@ -259,6 +257,8 @@ Secondary cameras (CAM#2-4) support:
 | `/api/camera/enable` | POST | Enable camera, start its encoder |
 | `/api/camera/disable` | POST | Disable camera, stop its encoder |
 | `/api/camera/settings` | POST | Update camera resolution/FPS (requires restart) |
+| `/api/camera/controls` | GET | Get V4L2 controls for current camera |
+| `/api/camera/set` | POST | Apply V4L2 control change |
 
 ### Camera List API Response (`/api/cameras`)
 ```json
@@ -276,65 +276,10 @@ Secondary cameras (CAM#2-4) support:
       "resolution": "1280x720",
       "fps": 10,
       "resolutions": [[1280, 720], [640, 480], [320, 240]]
-    },
-    {
-      "id": 2,
-      "unique_id": "usb-Another_Camera-video-index0",
-      "name": "Another Camera",
-      "device": "/dev/video12",
-      "usb_port": "1.4",
-      "enabled": false,
-      "streaming_port": 8082,
-      "is_primary": false,
-      "resolution": "640x480",
-      "fps": 5,
-      "resolutions": [[640, 480], [320, 240]]
     }
   ],
   "active_camera_id": 1
 }
-```
-
-### Control Page UI
-
-**Camera Selector Row:**
-- Shows `CAM#1`, `CAM#2`, etc. buttons next to Live Preview tabs
-- Only visible when multiple cameras are detected
-- Disabled cameras shown grayed out
-- Active camera highlighted
-
-**Additional Cameras Settings Panel:**
-- Shows settings for CAM#2-4 when secondary cameras are detected
-- Enable/disable toggle per camera
-- Resolution dropdown (dynamically populated)
-- FPS slider
-- Settings require "Apply & Restart Encoder" to take effect
-
-**Camera Controls Panel:**
-- Controls apply to the currently active camera
-- Switching cameras updates controls to show that camera's settings
-
-### Encoder Lifecycle
-
-```python
-def start_camera_encoder(self, camera_id):
-    """Start encoder for a specific camera."""
-    cam = self.get_camera_by_id(camera_id)
-    settings = self.camera_settings.get(cam['unique_id'], {})
-
-    cmd = [
-        self.encoder_path, '-S', '-N', '-v',
-        '-d', cam['device'],
-        '-w', str(width), '-h', str(height),
-        '-f', str(fps),
-        '--streaming-port', str(cam['streaming_port']),
-        '--cmd-file', self._get_camera_cmd_file(camera_id),
-        '--ctrl-file', self._get_camera_ctrl_file(camera_id),
-    ]
-
-    # Secondary cameras: disable H.264, use YUYV mode
-    if not cam['is_primary']:
-        cmd.extend(['--no-flv', '-y'])
 ```
 
 ### USB Bandwidth Troubleshooting
@@ -346,8 +291,6 @@ This indicates USB bandwidth exhaustion. Solutions:
 2. Reduce frame rate on all cameras
 3. Disable cameras not in use
 4. Some cameras work better with YUYV mode at lower resolutions
-
-The control page shows bandwidth warnings when cameras fail to start.
 
 ---
 
@@ -363,58 +306,12 @@ The control page includes a panel to configure which cameras are provisioned to 
 - **Immediate provisioning**: Changes apply immediately to Moonraker without restart
 - **Persistent settings**: Settings saved to config and restored on restart
 
-### UI Panel
-
-The "Moonraker Camera Settings" panel (below Timelapse Settings) shows a table with:
-
-| Column | Description |
-|--------|-------------|
-| Camera | Camera ID, name, and port |
-| Name in Moonraker | Editable text input for webcam name |
-| Provision | Checkbox to enable/disable Moonraker provisioning |
-| Default | Radio button to select dashboard default (one only) |
-
 ### API Endpoints
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/api/moonraker/cameras` | GET | Get cameras with Moonraker settings |
 | `/api/moonraker/cameras` | POST | Save settings and provision to Moonraker |
-
-### GET Response
-```json
-{
-  "cameras": [
-    {"id": 1, "name": "HD Camera", "unique_id": "usb-...", "streaming_port": 8080, "is_primary": true},
-    {"id": 2, "name": "Camera 2", "unique_id": "usb-...", "streaming_port": 8082, "is_primary": false}
-  ],
-  "settings": {
-    "usb-SunplusIT_Inc_HD_Camera-video-index0": {
-      "moonraker_enabled": true,
-      "moonraker_name": "USB Camera",
-      "moonraker_default": true
-    }
-  }
-}
-```
-
-### POST Request
-```json
-{
-  "settings": {
-    "usb-SunplusIT_Inc_HD_Camera-video-index0": {
-      "moonraker_enabled": true,
-      "moonraker_name": "Bed Camera",
-      "moonraker_default": true
-    },
-    "usb-Another_Camera-video-index0": {
-      "moonraker_enabled": true,
-      "moonraker_name": "Nozzle Cam",
-      "moonraker_default": false
-    }
-  }
-}
-```
 
 ### Config Storage
 
@@ -451,8 +348,8 @@ USB Camera ──MJPEG──> rkmpi_enc :8080/stream ──MJPEG──> ACProxyC
                       (--no-flv, no H.264)              MJPEG→H.264 encoding
                                                          /flv endpoint
                                                               │
-Slicer ──> :18088/flv ──> h264_server.py ─────HTTP GET────────┘
-           (Python proxy)  transparent byte proxy
+Slicer ──> :18088/flv ──> control_server ─────HTTP GET────────┘
+           (C proxy)      transparent byte proxy
 ```
 
 ### Configuration
@@ -461,24 +358,17 @@ Slicer ──> :18088/flv ──> h264_server.py ─────HTTP GET──�
 - **API**: `GET/POST /api/acproxycam/flv` for status and announcement
 
 ### How It Works
-1. When enabled, `start_camera_encoder()` adds `--no-flv` to rkmpi_enc (disables VENC, saves CPU)
-2. `_run_flv_server()` starts on port 18088 (reuses existing dead code path)
+1. When enabled, rkmpi_enc starts with `--no-flv` (disables VENC H.264, saves CPU)
+2. The control server listens on port 18088 for FLV connections
 3. ACProxyCam announces its `/flv` URL via `POST /api/acproxycam/flv` (periodic re-announcement every 30s)
-4. When slicer connects to `:18088/flv`, `_serve_flv_stream_proxied()` opens upstream connection to ACProxyCam
+4. When slicer connects to `:18088/flv`, the proxy opens upstream connection to ACProxyCam
 5. Raw FLV bytes are forwarded transparently (no parsing)
-6. RPC/MQTT responders still spawn on first FLV client (needed for slicer protocol)
-
-### State Variables
-```python
-self.acproxycam_flv_proxy = False    # Enable/disable proxy mode
-self.acproxycam_flv_url = None       # Set by POST /api/acproxycam/flv
-self.acproxycam_flv_last_seen = 0    # Timestamp of last announcement
-```
+6. RPC/MQTT responders handle slicer protocol integration
 
 ### Edge Cases
 - ACProxyCam not ready: proxy retries every 2s for ~30s, then closes client (slicer reconnects)
 - ACProxyCam goes down: upstream read returns empty → client closed (slicer reconnects)
-- Proxy toggled off: `restart_encoders()` restarts rkmpi_enc with native FLV
+- Proxy toggled off: encoder restarts with native FLV
 - Multiple slicers: each gets own upstream connection to ACProxyCam
 
 ---
@@ -494,14 +384,10 @@ For Anycubic printers running **Rinkhals custom firmware**. This is the standard
 **Features:**
 - **LAN Mode Management** - Queries and auto-enables LAN mode via local binary API (port 18086)
 - **gkcam Integration** - Kills gkcam to free the USB camera, restarts it on shutdown
-- **MQTT/RPC Responders** - Handles timelapse commands from gkapi (openDelayCamera, startLanCapture, etc.)
-- **Camera Stream Control** - Sends startCapture/stopCapture via MQTT to manage gkcam state
+- **MQTT Client** - Handles camera commands from Anycubic firmware
+- **RPC Client** - Handles timelapse commands from Anycubic slicer
+- **Moonraker Client** - WebSocket timelapse integration (when enabled)
 - **Full Firmware Integration** - Works alongside Anycubic's native services
-
-**Use when:**
-- Running on an Anycubic printer with Rinkhals
-- You need timelapse recording support
-- You want the camera to work with the Anycubic slicer
 
 ### vanilla-klipper
 
@@ -514,23 +400,18 @@ For setups using **external Klipper** (e.g., on a Raspberry Pi) connected to the
 - **No MQTT/RPC** - Disables MQTT client and RPC responders
 - **Pure Camera Streaming** - Just captures from USB camera and serves HTTP streams
 
-**Use when:**
-- Using an external Raspberry Pi running Klipper
-- The printer's native firmware is not involved
-- You only need basic camera streaming without timelapse
-- Testing the encoder in isolation
-
 ### Mode Comparison
 
 | Feature | go-klipper | vanilla-klipper |
 |---------|------------|-----------------|
-| LAN mode management | ✅ | ❌ |
-| gkcam kill/restart | ✅ | ❌ |
-| MQTT/RPC responders | ✅ | ❌ |
-| Timelapse recording | ✅ | ❌ |
-| Anycubic slicer support | ✅ | ❌ |
-| Works without firmware | ❌ | ✅ |
-| External Klipper | ❌ | ✅ |
+| LAN mode management | Yes | No |
+| gkcam kill/restart | Yes | No |
+| MQTT client | Yes | No |
+| RPC client (timelapse) | Yes | No |
+| Moonraker client | Yes | No |
+| Anycubic slicer support | Yes | No |
+| Works without firmware | No | Yes |
+| External Klipper | No | Yes |
 
 ### Setting the Mode
 
@@ -541,51 +422,20 @@ For setups using **external Klipper** (e.g., on a Raspberry Pi) connected to the
 }
 ```
 
-**Via command line:**
-```bash
-python h264_server.py --mode vanilla-klipper
-```
-
 ---
 
 ## Properties (app.json)
 
 - `mode` (string, default: "go-klipper") - Operating mode: "go-klipper" or "vanilla-klipper"
-- `encoder_type` (string, default: "rkmpi-yuyv") - Encoder mode: "gkcam", "rkmpi", or "rkmpi-yuyv"
-- `gkcam_all_frames` (bool, default: false) - In gkcam mode, decode all frames (true) or keyframes only (false)
-- `autolanmode` (bool, default: true) - Automatically enable LAN mode on startup (go-klipper only)
-- `auto_skip` (bool, default: false) - Enable automatic skip ratio based on CPU usage (rkmpi only)
-- `target_cpu` (int, default: 60) - Target max CPU usage % for auto-skip (30-90, rkmpi only)
-- `bitrate` (int, default: 512) - H.264 bitrate in kbps (100-4000, rkmpi only)
-- `mjpeg_fps` (int, default: 10) - MJPEG camera framerate (2-30, rkmpi only). Actual rate depends on camera support.
-- `jpeg_quality` (int, default: 85) - JPEG quality for hardware encoding (1-99, rkmpi-yuyv only)
-- `port` (int, default: 8080) - Main HTTP server port (MJPEG, snapshots, control)
+- `streaming_port` (int, default: 8080) - Streaming server port
+- `control_port` (int, default: 8081) - Control server port
 - `logging` (bool, default: false) - Enable debug logging
 
-**Note:** The FLV endpoint is always on port 18088:
-- In **gkcam mode**: served by gkcam natively
-- In **rkmpi/rkmpi-yuyv mode**: served by h264-streamer
+**Note:** All other settings (encoder_type, bitrate, mjpeg_fps, h264_resolution, auto_skip, target_cpu, skip_ratio, jpeg_quality, autolanmode, display, timelapse, etc.) are stored in the JSON config file (`29-h264-streamer.config`) and managed via the control page API.
 
 ## Encoder Modes
 
-### gkcam mode (default)
-- Uses gkcam's built-in FLV stream at `:18088/flv`
-- Lower CPU usage (no encoding required)
-- Does NOT kill gkcam
-
-**Two sub-modes controlled by `gkcam_all_frames`:**
-
-1. **Keyframes only** (`gkcam_all_frames=false`, default):
-   - Decodes only H.264 keyframes (IDR) via ffmpeg single-frame decode
-   - ~1 FPS MJPEG output (keyframes typically arrive at 1/sec)
-   - Lowest CPU usage
-
-2. **All frames** (`gkcam_all_frames=true`):
-   - Uses streaming ffmpeg transcoder to decode all frames
-   - ~2 FPS MJPEG output (limited by transcoding overhead)
-   - Higher CPU usage but smoother video
-
-### rkmpi mode
+### rkmpi mode (default)
 - Uses rkmpi_enc binary for direct USB camera capture (MJPEG format)
 - Hardware H.264 encoding via RV1106 VENC
 - TurboJPEG software JPEG decoding (~15% CPU at 720p)
@@ -638,26 +488,39 @@ Located in `/oem/usr/lib/`:
 
 ## Building SWU Package
 
-SWU packages are built via the Rinkhals build system.
-
-### Build Scripts Location
-- **Local build script:** `/shared/dev/Rinkhals/build/swu-tools/h264-streamer/build-local.sh`
-- **Build tools:** `/shared/dev/Rinkhals/build/tools.sh`
+### Build Scripts
+- **Standalone build:** `./scripts/build-h264-swu.sh KS1 ./dist`
+- **Rinkhals build:** `/shared/dev/Rinkhals/build/swu-tools/h264-streamer/build-local.sh`
 
 ### Build All Models (Local)
 ```bash
 /shared/dev/Rinkhals/build/swu-tools/h264-streamer/build-local.sh
 ```
 
-This builds SWU packages for all Kobra models (K2P, K3, K3V2, KS1, KS1M, K3M) to `/shared/dev/Rinkhals/build/dist/`.
-
 ### Build Single Model
 ```bash
 /shared/dev/Rinkhals/build/swu-tools/h264-streamer/build-local.sh KS1
 ```
 
+### SWU Package Contents
+```
+h264-streamer-{MODEL}.swu    # Password-protected zip
+└── update_swu/
+    ├── setup.tar.gz         # Compressed tarball
+    ├── setup.tar.gz.md5     # Checksum
+    └── [contents]:
+        ├── update.sh        # Installer script
+        └── app/
+            ├── app.json     # Rinkhals app metadata
+            ├── app.sh       # Start/stop script
+            ├── h264_monitor.sh
+            ├── rkmpi_enc    # Encoder binary (all-in-one)
+            ├── control.html # Control page template
+            ├── index.html   # Homepage template
+            └── timelapse.html # Timelapse manager template
+```
+
 ### SWU Passwords by Model (Reference)
-Handled automatically by build scripts via `build/tools.sh`:
 - K2P, K3, K3V2: `U2FsdGVkX19deTfqpXHZnB5GeyQ/dtlbHjkUnwgCi+w=`
 - KS1, KS1M: `U2FsdGVkX1+lG6cHmshPLI/LaQr9cZCjA8HZt6Y8qmbB7riY`
 - K3M: `4DKXtEGStWHpPgZm8Xna9qluzAI8VJzpOsEIgd8brTLiXs8fLSu3vRx8o7fMf4h6`
@@ -688,9 +551,10 @@ All development is done in the **anycubic** repository. Rinkhals uses a symlink 
 - **Built SWU:** `/shared/dev/Rinkhals/build/dist/h264-streamer-KS1.swu`
 
 ### On Printer
-- App install path: `/useremain/home/rinkhals/apps/29-h264-streamer/` (SWU packages install apps here)
+- App install path: `/useremain/home/rinkhals/apps/29-h264-streamer/`
+- Config file: `/useremain/home/rinkhals/apps/29-h264-streamer.config`
 - RKMPI libraries: `/oem/usr/lib/`
-- FIFO pipes: `/tmp/mjpeg.pipe`, `/tmp/h264.pipe`
+- Application log: `/tmp/rinkhals/app-h264-streamer.log`
 
 ## Testing on Printer
 
@@ -710,8 +574,8 @@ sshpass -p 'rockchip' ssh root@$PRINTER_IP '/useremain/home/rinkhals/apps/29-h26
 # Copy encoder binary (from rkmpi-encoder)
 sshpass -p 'rockchip' scp /shared/dev/anycubic/rkmpi-encoder/rkmpi_enc root@$PRINTER_IP:/useremain/home/rinkhals/apps/29-h264-streamer/
 
-# Copy Python files (if changed)
-sshpass -p 'rockchip' scp /shared/dev/anycubic/h264-streamer/29-h264-streamer/h264_server.py root@$PRINTER_IP:/useremain/home/rinkhals/apps/29-h264-streamer/
+# Copy HTML templates (if changed)
+sshpass -p 'rockchip' scp /shared/dev/anycubic/h264-streamer/29-h264-streamer/*.html root@$PRINTER_IP:/useremain/home/rinkhals/apps/29-h264-streamer/
 
 # Start app
 sshpass -p 'rockchip' ssh root@$PRINTER_IP '/useremain/home/rinkhals/apps/29-h264-streamer/app.sh start'
@@ -720,15 +584,22 @@ sshpass -p 'rockchip' ssh root@$PRINTER_IP '/useremain/home/rinkhals/apps/29-h26
 curl http://$PRINTER_IP:8080/status
 curl http://$PRINTER_IP:8080/snapshot -o snapshot.jpg
 curl http://$PRINTER_IP:8080/display/snapshot -o display.jpg
+curl http://$PRINTER_IP:8081/api/stats
 ```
 
 ### Check logs
 ```bash
-# Main application log (h264_server.py + encoder output)
+# Main application log
 sshpass -p 'rockchip' ssh root@$PRINTER_IP 'tail -50 /tmp/rinkhals/app-h264-streamer.log'
+```
 
-# Encoder-only log (raw stderr from rkmpi_enc)
-sshpass -p 'rockchip' ssh root@$PRINTER_IP 'cat /tmp/rkmpi.log'
+### Process Management
+
+Use app.sh for all process management:
+```bash
+sshpass -p 'rockchip' ssh root@$PRINTER_IP '/useremain/home/rinkhals/apps/29-h264-streamer/app.sh stop'
+sshpass -p 'rockchip' ssh root@$PRINTER_IP '/useremain/home/rinkhals/apps/29-h264-streamer/app.sh start'
+sshpass -p 'rockchip' ssh root@$PRINTER_IP '/useremain/home/rinkhals/apps/29-h264-streamer/app.sh status'
 ```
 
 ## Camera Compatibility
@@ -750,48 +621,51 @@ Resolution detection falls back to 1280x720 if v4l2-ctl is not available.
 
 ### Modifying the Control Page
 
-The control page (`/control`) uses JavaScript to handle form submission. **Important:** When adding new form fields, you must update TWO places:
+The control page (`/control`) is served from `control.html` by the C control server. The HTML is loaded as a template with `{{variable}}` substitutions for injecting server state into the page.
 
-1. **HTML form** - Add the input/select element inside the `<form id="settings-form">` tag
-2. **JavaScript submit handler** - Add the field to the form data builder
+**Template Variables:**
+The control server replaces `{{variable_name}}` patterns in control.html with current values before serving. See `serve_control_page()` in `control_server.c` for the full list.
 
-The JavaScript form handler is around line 4163 in `h264_server.py`:
+**Adding New Settings:**
+1. Add HTML input/select in `control.html` inside the settings form
+2. Add JavaScript form handler to include the field in POST data
+3. Add POST handler parsing in `handle_control_post()` in `control_server.c`
+4. Add config field in `config.h` (`AppConfig` struct)
+5. Add JSON read/write in `config.c`
+6. Apply setting in `on_config_changed()` callback if needed
 
-```javascript
-document.getElementById('settings-form').addEventListener('submit', function(e) {
-    e.preventDefault();
-    const formData = new FormData(this);
-    const data = new URLSearchParams();
+### Control Server Implementation
 
-    // Each field must be explicitly added:
-    data.append('field_name', document.querySelector('[name=field_name]').value);
+The control server (`control_server.c`) handles:
+- HTML template loading and variable substitution
+- REST API endpoints for stats, config, cameras, timelapse
+- Form POST parsing for settings changes
+- Timelapse file management (list, serve, delete, thumbnails)
+- ACProxyCam FLV proxy coordination
+- Touch injection
+- Moonraker camera provisioning
 
-    // For checkboxes:
-    if (formData.has('checkbox_name')) {
-        data.append('checkbox_name', 'on');
-    }
-    // ...
-});
-```
+### Config File Format
 
-**Common mistake:** Adding a form field to the HTML but forgetting to add it to the JavaScript handler. The form uses `e.preventDefault()` and manually builds the POST data, so fields not explicitly added will NOT be submitted.
-
-**Checklist for new control page settings:**
-1. Add HTML input/select inside `<form id="settings-form">`
-2. Add `data.append()` call in JavaScript submit handler
-3. Add POST handler parsing in `_handle_control_post()` method
-4. Add to `write_ctrl_file()` if encoder needs to read it
-5. Add to `save_config()` for persistence
-6. Add to config loading in `main()` for startup
-
-### Process Management
-**⛔ See CRITICAL WARNING at top of this file! ⛔**
-
-Use app.sh for all process management:
-```bash
-sshpass -p 'rockchip' ssh root@$PRINTER_IP '/useremain/home/rinkhals/apps/29-h264-streamer/app.sh stop'
-sshpass -p 'rockchip' ssh root@$PRINTER_IP '/useremain/home/rinkhals/apps/29-h264-streamer/app.sh start'
-sshpass -p 'rockchip' ssh root@$PRINTER_IP '/useremain/home/rinkhals/apps/29-h264-streamer/app.sh status'
+Settings are persisted in `/useremain/home/rinkhals/apps/29-h264-streamer.config` as JSON:
+```json
+{
+  "encoder_type": "rkmpi",
+  "h264_enabled": "true",
+  "mjpeg_fps": "10",
+  "bitrate": "512",
+  "auto_skip": "false",
+  "target_cpu": "60",
+  "autolanmode": "true",
+  "display_enabled": "false",
+  "display_fps": "5",
+  "acproxycam_flv_proxy": "false",
+  "timelapse_enabled": "false",
+  "timelapse_mode": "layer",
+  "moonraker_host": "127.0.0.1",
+  "moonraker_port": "7125",
+  "cameras": { ... }
+}
 ```
 
 ## RV1106 Hardware Constraints
@@ -814,32 +688,6 @@ sshpass -p 'rockchip' ssh root@$PRINTER_IP '/useremain/home/rinkhals/apps/29-h26
 - **VDEC:** H.264/H.265/MJPEG hardware decoder (not used - TurboJPEG simpler)
 - **RGA:** 2D graphics accelerator for scaling/conversion
 
-### Why Software MJPEG Decode?
-Hardware MJPEG decode (VDEC) requires complex buffer management. At 720p15, TurboJPEG software decode uses only ~15% CPU and is much simpler to implement.
-
-## USB Camera Constraints
-
-### Bandwidth
-- USB 2.0: 480 Mbps theoretical, ~35-40 MB/s practical
-- MJPEG 720p30: ~3-8 MB/s (fits comfortably)
-- Raw YUYV 720p30: ~27 MB/s (too high, don't use)
-
-### Camera Requirements
-- UVC (USB Video Class) compliant
-- **Must support MJPEG output** (not just raw YUV)
-- Common compatible: Logitech C270/C920, generic HD webcams
-
-### Resolution/Format Support
-- **Preferred:** 1280x720 MJPEG @ 15fps
-- **Maximum practical:** 1920x1080 MJPEG @ 15fps
-- **Fallback:** 1280x720 if detection fails
-
-### Known Camera Behaviors
-- Some cameras report capabilities they can't sustain at full framerate
-- Dark scenes = larger MJPEG frames (less compression)
-- Cheap cameras may have unstable USB connections
-- Camera must be released by gkcam before h264-streamer can use it
-
 ## Performance Tuning
 
 ### skip_ratio Setting
@@ -855,34 +703,14 @@ When enabled, the encoder automatically adjusts skip_ratio based on CPU usage:
 - If CPU < target-10%: decreases skip_ratio (more frames)
 - Range: 1 (all frames) to 10 (max skip)
 
-This ensures the printer maintains at least 40% CPU headroom for other tasks.
-
-### h264_enabled Setting
-- `true` = Full H.264 encoding (higher CPU, lower bandwidth)
-- `false` = MJPEG only (lower CPU, higher bandwidth)
-
 ### Recommended Settings
 - **Monitoring:** 720p, 10-15 fps, skip_ratio=1, h264_enabled=true
 - **Auto-adjust:** auto_skip=true, target_cpu=60 (recommended for most users)
-- **Timelapse:** 720p, 1 fps, skip_ratio=0, h264_enabled=false
 - **Low resource:** 720p, 5 fps, skip_ratio=2, h264_enabled=false
-
-### Auto-Skip Test Results
-
-| Target CPU | Skip Ratio | Total CPU | Enc CPU | H.264 FPS | Status |
-|------------|------------|-----------|---------|-----------|--------|
-| 30% | 5 | 36.4% | 9.5% | 3.8 | LOW* |
-| 40% | 4 | 33.9% | 10.7% | 2.3 | OK |
-| 50% | 3 | 44.2% | 11.5% | 2.6 | OK |
-| 60% | 1 | 60.0% | 33.5% | 6.7 | OK |
-| 70% | 2 | 62.4% | 37.1% | 10.0 | OK |
-| 80% | 2 | 62.8% | 38.2% | 10.0 | OK |
-
-*30% target is below encoder baseline (~35% CPU minimum)
 
 ## Display Capture
 
-**Status:** ✅ **Fully supported** in rkmpi/rkmpi-yuyv modes with `--display` flag.
+**Status:** Fully supported in rkmpi/rkmpi-yuyv modes with `--display` flag.
 
 Captures the printer's LCD framebuffer (/dev/fb0) and streams it as MJPEG for remote viewing of the printer's touchscreen.
 
@@ -896,15 +724,6 @@ Captures the printer's LCD framebuffer (/dev/fb0) and streams it as MJPEG for re
 - **Configurable FPS**: 1-10 fps selectable via control page
 - **Auto-orientation**: Detects printer model and applies correct rotation
 - **Full hardware acceleration**: RGA rotation + RGA color conversion + VENC JPEG encoding
-- **CPU usage**: ~0-10% when active (full hardware pipeline)
-
-### How It Works
-1. Framebuffer is memory-mapped from /dev/fb0 (800×480 BGRX, 32bpp)
-2. Copied to DMA buffer (framebuffer mmap is slow/uncached)
-3. RGA hardware rotation/flip based on printer model
-4. RGA hardware color conversion BGRX → NV12
-5. VENC hardware encodes to JPEG
-6. Served via HTTP on `/display` endpoint
 
 ### Printer Model Orientation
 | Model | Orientation | RGA Operation |
@@ -913,25 +732,11 @@ Captures the printer's LCD framebuffer (/dev/fb0) and streams it as MJPEG for re
 | K3M | 270° rotation | `imrotate()` ROT_270 |
 | K3, K2P, K3V2 | 90° rotation | `imrotate()` ROT_90 |
 
-### Control Page Settings
-- **Display Capture toggle**: Enable/disable display streaming
-- **Display FPS**: 1, 2, 5, or 10 fps (lower = less CPU)
-
 ---
 
 ## Touch Control
 
-**Status:** ✅ **Fully supported** - Click on the display stream to inject touch events.
-
-Remote touch control allows interacting with the printer's touchscreen through the web interface. Click anywhere on the display stream image to send a touch event to the printer.
-
-### How It Works
-1. User clicks on the display stream image in the web browser
-2. Browser calculates click position relative to display dimensions
-3. POST request sent to `/api/touch` with coordinates
-4. Server transforms coordinates based on printer model orientation
-5. Touch event injected to `/dev/input/event0` (Linux input subsystem)
-6. Printer UI responds to the touch
+**Status:** Fully supported - Click on the display stream to inject touch events.
 
 ### API Endpoint
 
@@ -944,44 +749,25 @@ Remote touch control allows interacting with the printer's touchscreen through t
 }
 ```
 
-Response:
-```json
-{
-  "status": "ok",
-  "x": 400,
-  "y": 240,
-  "touch_x": 400,
-  "touch_y": 240,
-  "duration": 100
-}
-```
-
 ### Coordinate Transformation
-
-The touch panel is aligned with the native framebuffer (800×480), but the web display shows a rotated/flipped image depending on the printer model. The server automatically detects the model and applies the correct inverse transformation.
 
 | Model | Model ID | Display Size | Touch Transform |
 |-------|----------|--------------|-----------------|
-| KS1, KS1M | 20025, 20029 | 800×480 | `touch = (800-x, 480-y)` |
-| K3, K2P, K3V2 | 20024, 20021, 20027 | 480×800 | `touch = (y, 480-x)` |
-| K3M | 20026 | 480×800 | `touch = (800-y, x)` |
+| KS1, KS1M | 20025, 20029 | 800x480 | `touch = (800-x, 480-y)` |
+| K3, K2P, K3V2 | 20024, 20021, 20027 | 480x800 | `touch = (y, 480-x)` |
+| K3M | 20026 | 480x800 | `touch = (800-y, x)` |
 
 ### Touch Input Device
 - **Device:** `/dev/input/event0`
 - **Driver:** `hyn_ts` (Hynitron touch controller)
-- **Resolution:** 800×480 (native panel)
+- **Resolution:** 800x480 (native panel)
 - **Protocol:** Multi-touch Type B (Linux input subsystem)
 
-### Implementation
-- Touch injection: `inject_touch()` in `h264_server.py`
-- Coordinate transform: `transform_touch_coordinates()` in `h264_server.py`
-- Model detection: Reads `modelId` from `/userdata/app/gk/config/api.cfg`
+Implementation: `touch_inject.c` in rkmpi-encoder.
 
 ---
 
 ## Timelapse Recording
-
-**Status:** ✅ **Fully supported** in rkmpi/rkmpi-yuyv modes.
 
 h264-streamer supports two timelapse recording modes:
 
@@ -989,11 +775,10 @@ h264-streamer supports two timelapse recording modes:
 |---------|--------------------------|----------------------|
 | Trigger | Enable in slicer before slicing | Enable in control panel |
 | Layer detection | Slicer G-code → RPC commands | Moonraker WebSocket API |
-| Hyperlapse mode | ❌ | ✅ |
-| USB storage | ❌ | ✅ |
-| Variable FPS | ❌ | ✅ |
+| Hyperlapse mode | No | Yes |
+| USB storage | No | Yes |
+| Variable FPS | No | Yes |
 | Configuration | None needed | Full control |
-| Section | This section | [Advanced Timelapse](#advanced-timelapse-moonraker-integration) |
 
 **Note**: When Advanced Timelapse is enabled, Native timelapse commands are ignored to prevent conflicts.
 
@@ -1001,16 +786,16 @@ h264-streamer supports two timelapse recording modes:
 
 ### Native Anycubic Timelapse
 
-The native `rkmpi_enc` encoder includes a built-in RPC client that handles timelapse commands from the Anycubic slicer.
+The RPC client handles timelapse commands from the Anycubic slicer.
 
 #### How It Works
 
 1. Slicer sends print start with `timelapse.status=1`
 2. Firmware sends `openDelayCamera` RPC with gcode filepath
-3. `rkmpi_enc` RPC client receives command, initializes timelapse recording
+3. RPC client receives command, initializes timelapse recording
 4. On each layer change, firmware sends `startLanCapture` RPC
-5. `rkmpi_enc` captures JPEG frame from its internal frame buffer to temp storage
-6. On print complete (`print_stats.state == "complete"`), `rkmpi_enc` runs ffmpeg to assemble MP4
+5. rkmpi_enc captures JPEG frame from its internal frame buffer to temp storage
+6. On print complete (`print_stats.state == "complete"`), assembles MP4
 
 ### RPC Commands Handled
 
@@ -1021,57 +806,48 @@ The native `rkmpi_enc` encoder includes a built-in RPC client that handles timel
 | `stopLanCapture` | Reply only | No action needed |
 | `SetLed` | Reply only | LED controlled by firmware |
 
-### Print Completion Detection
-
-The RPC client monitors `print_stats.state` in status updates:
-- `"complete"` → `timelapse_finalize()` - Assemble MP4 with ffmpeg
-- `"cancelled"` or `"error"` → `timelapse_cancel()` - Clean up temp files
-
 ### Output Location
 
 - Videos: `/useremain/app/gk/Time-lapse-Video/`
-- Naming: `{gcode_name}_{seq}.mp4` (e.g., `Benchy_PLA_0.2_1h_01.mp4`)
+- Naming: `{gcode_name}_{seq}.mp4`
 - Thumbnail: `{gcode_name}_{seq}_{frames}.jpg` (last frame)
 
 ### Implementation Files
 
 - `rpc_client.c` - RPC client with timelapse command handlers
 - `timelapse.c` / `timelapse.h` - Frame capture and MP4 assembly
+- `timelapse_venc.c` / `timelapse_venc.h` - Hardware VENC encoding
 - Source: `/shared/dev/anycubic/rkmpi-encoder/`
-
-### Reference Data
-
-- Protocol doc: `/shared/dev/anycubic/knowledge/TIMELAPSE_PROTOCOL.md`
-- Timelapse captures: `/shared/dev/Rinkhals/docs/timelapse-captures/`
 
 ---
 
 ## Advanced Timelapse (Moonraker Integration)
 
-**Status:** ✅ **Fully supported** - Independent timelapse recording via Moonraker WebSocket API, inspired by [moonraker-timelapse](https://github.com/mainsail-crew/moonraker-timelapse).
+**Status:** Fully supported - Independent timelapse recording via Moonraker WebSocket API, inspired by [moonraker-timelapse](https://github.com/mainsail-crew/moonraker-timelapse).
 
 ### Overview
 
-When enabled, this mode captures timelapse frames independently of the Anycubic slicer's timelapse settings. It monitors print progress via Moonraker's WebSocket API and captures frames on layer changes or at fixed time intervals.
+When enabled, the Moonraker WebSocket client (`moonraker_client.c`) connects to Moonraker, subscribes to print status updates, and drives timelapse recording via direct function calls to the timelapse module. No IPC or control files needed — everything runs in-process.
 
 ### Features
 
-- **Layer Mode** - Capture frame on each layer change (`print_stats.info.current_layer`)
+- **Layer Mode** - Capture frame on each layer change
 - **Hyperlapse Mode** - Capture frames at configurable time intervals
 - **Variable FPS** - Auto-calculate output FPS based on frame count and target video length
 - **USB Storage** - Optional storage to USB drive at `/mnt/udisk`
 - **Custom Mode Override** - When enabled, Anycubic RPC timelapse commands are ignored
+- **Hardware VENC encoding** - Uses RV1106 hardware encoder for MP4 assembly (no ffmpeg)
 
 ### Configuration Settings
 
-All timelapse settings are available in the Timelapse Settings panel on the control page (`/control`).
+All timelapse settings are available in the Timelapse Settings panel on the control page.
 
 #### General Settings
 
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `timelapse_enabled` | false | Enable advanced timelapse recording |
-| `timelapse_mode` | layer | Capture mode: `layer` (on layer change) or `hyperlapse` (time-based) |
+| `timelapse_mode` | layer | Capture mode: `layer` or `hyperlapse` |
 | `timelapse_hyperlapse_interval` | 30 | Seconds between captures in hyperlapse mode (5-300) |
 
 #### Storage Settings
@@ -1079,7 +855,7 @@ All timelapse settings are available in the Timelapse Settings panel on the cont
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `timelapse_storage` | internal | Storage location: `internal` or `usb` |
-| `timelapse_usb_path` | /mnt/udisk/timelapse | USB output directory (folder picker available) |
+| `timelapse_usb_path` | /mnt/udisk/timelapse | USB output directory |
 
 #### Moonraker Connection
 
@@ -1093,27 +869,17 @@ All timelapse settings are available in the Timelapse Settings panel on the cont
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `timelapse_output_fps` | 30 | Video playback framerate (1-120 fps) |
-| `timelapse_crf` | 23 | H.264 quality factor (0=best/lossless, 51=worst) |
-| `timelapse_duplicate_last_frame` | 0 | Repeat final frame N times (creates pause at video end) |
+| `timelapse_crf` | 23 | H.264 quality factor (0=best, 51=worst) |
+| `timelapse_duplicate_last_frame` | 0 | Repeat final frame N times |
 
 #### Variable FPS Settings
-
-When enabled, the output FPS is calculated as: `fps = max(min, min(max, frames / target_length))`
 
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `timelapse_variable_fps` | false | Auto-calculate FPS based on frame count |
 | `timelapse_target_length` | 10 | Target video duration in seconds |
-| `timelapse_variable_fps_min` | 5 | Minimum FPS (prevents overly slow videos) |
-| `timelapse_variable_fps_max` | 60 | Maximum FPS (prevents frame rate issues) |
-
-#### Capture Settings
-
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `timelapse_stream_delay` | 0.05 | Delay (seconds) after layer change before capture (allows print head to stabilize) |
-| `timelapse_flip_x` | false | Horizontal flip (mirror) |
-| `timelapse_flip_y` | false | Vertical flip |
+| `timelapse_variable_fps_min` | 5 | Minimum FPS |
+| `timelapse_variable_fps_max` | 60 | Maximum FPS |
 
 ### API Endpoints
 
@@ -1128,59 +894,40 @@ When enabled, the output FPS is calculated as: `fps = max(min, min(max, frames /
 1. **Enable** timelapse in control panel settings
 2. **Print start**: MoonrakerClient detects `print_stats.state == "printing"`
 3. **Frame capture**:
-   - Layer mode: On `print_stats.info.current_layer` change
+   - Layer mode: On layer change (via `virtual_sdcard.current_layer` or `print_stats.info.current_layer`)
    - Hyperlapse: At configured interval (timer thread)
-4. **Print complete**: Sends `timelapse_finalize` command to encoder
-5. **Video assembly**: ffmpeg assembles frames with configured FPS, CRF, and flip settings
-6. **Print cancel**: Sends `timelapse_cancel` to discard temporary frames
+4. **Print complete**: Calls `timelapse_finalize()` directly — assembles MP4 via hardware VENC
+5. **Print cancel**: Calls `timelapse_cancel()` to clean up
 
 ### MoonrakerClient Implementation
 
-The `MoonrakerClient` class (`h264_server.py`) provides:
-- **WebSocket connection** to Moonraker (pure Python, no external dependencies)
-- **JSON-RPC 2.0** message handling
-- **Subscription** to `print_stats` object for state monitoring
-- **Automatic reconnection** on connection loss
+The `MoonrakerClient` (`moonraker_client.c`) provides:
+- **Minimal WebSocket client** (RFC 6455) — text frames, ping/pong, no compression
+- **JSON-RPC 2.0** subscription to `print_stats` + `virtual_sdcard` objects
+- **Direct timelapse calls** — `timelapse_init()`, `timelapse_capture_frame()`, `timelapse_finalize()` called in-process
+- **Automatic reconnection** with 5s delay on connection loss
+- **Custom mode** — `timelapse_set_custom_mode(1)` prevents RPC timelapse conflicts
 
-### Control File Commands
+### Moonraker Status API
 
-h264_server.py communicates with rkmpi_enc via the control file:
-
-| Command | Description |
-|---------|-------------|
-| `timelapse_init:<gcode>:<output_dir>` | Initialize custom timelapse |
-| `timelapse_capture` | Capture single frame |
-| `timelapse_finalize` | Assemble video from frames |
-| `timelapse_cancel` | Discard frames, cleanup |
-| `timelapse_fps:<n>` | Set output FPS |
-| `timelapse_crf:<n>` | Set H.264 quality |
-| `timelapse_variable_fps:<0\|1>:<min>:<max>:<target>:<dup>` | Configure variable FPS |
-| `timelapse_flip:<flip_x>:<flip_y>` | Set flip options |
-| `timelapse_output_dir:<path>` | Set output directory |
-| `timelapse_custom_mode:<0\|1>` | Enable/disable custom mode (ignores RPC commands) |
-
-### Custom Mode Flag
-
-When `timelapse_custom_mode:1` is sent to the encoder:
-- `openDelayCamera` RPC commands are acknowledged but ignored
-- `startLanCapture` RPC commands are acknowledged but do not capture frames
-- Print completion detection via RPC is disabled
-- h264_server.py handles all timelapse logic via Moonraker
-
-This allows the advanced timelapse to operate independently without interference from the Anycubic slicer's built-in timelapse commands.
-
-### Notes
-
-- Requires rkmpi encoder mode (not gkcam) for frame capture
-- USB storage requires a mounted USB drive at `/mnt/udisk`
-- Variable FPS calculates: `fps = max(min_fps, min(max_fps, frames / target_length))`
-- Flip options use ffmpeg video filters: `hflip`, `vflip`, or `hflip,vflip`
+**GET `/api/timelapse/moonraker`**
+```json
+{
+  "connected": true,
+  "print_state": "printing",
+  "current_layer": 42,
+  "total_layers": 200,
+  "filename": "benchy.gcode",
+  "timelapse_active": true,
+  "timelapse_frames": 41
+}
+```
 
 ---
 
 ## Timelapse Management UI
 
-**Status:** ✅ **Fully supported** - Web interface for browsing, previewing, downloading, and deleting timelapse recordings.
+**Status:** Fully supported - Web interface for browsing, previewing, downloading, and deleting timelapse recordings.
 
 ### Access
 
@@ -1197,7 +944,6 @@ This allows the advanced timelapse to operate independently without interference
 - **Download** - Download MP4 files directly
 - **Delete** - Remove recordings with confirmation dialog
 - **Sorting** - Sort by date (newest/oldest), name, or size
-- **Summary** - Total recording count and storage used
 
 ### API Endpoints
 
@@ -1205,40 +951,9 @@ This allows the advanced timelapse to operate independently without interference
 |----------|--------|-------------|
 | `/timelapse` | GET | Timelapse manager HTML page |
 | `/api/timelapse/list?storage=internal\|usb` | GET | JSON list of recordings with metadata |
-| `/api/timelapse/thumb/<name>?storage=...` | GET | Serve thumbnail JPEG (auto-generates if missing) |
+| `/api/timelapse/thumb/<name>?storage=...` | GET | Serve thumbnail JPEG |
 | `/api/timelapse/video/<name>?storage=...` | GET | Serve MP4 video (supports HTTP Range) |
 | `/api/timelapse/delete/<name>?storage=...` | DELETE | Delete recording and thumbnail |
-
-### List API Response
-
-**GET `/api/timelapse/list`**
-```json
-{
-  "recordings": [
-    {
-      "name": "Benchy_PLA_0.2_1h_01",
-      "mp4": "Benchy_PLA_0.2_1h_01.mp4",
-      "thumbnail": "Benchy_PLA_0.2_1h_01_126.jpg",
-      "size": 2200000,
-      "frames": 126,
-      "duration": 12.6,
-      "mtime": 1706889600
-    }
-  ],
-  "total_size": 12900000,
-  "count": 5
-}
-```
-
-### Delete API Response
-
-**DELETE `/api/timelapse/delete/<name>`**
-```json
-{
-  "success": true,
-  "deleted": ["Benchy_PLA_0.2_1h_01.mp4", "Benchy_PLA_0.2_1h_01_126.jpg"]
-}
-```
 
 ### File Storage
 
@@ -1247,30 +962,8 @@ This allows the advanced timelapse to operate independently without interference
 | Internal | `/useremain/app/gk/Time-lapse-Video/` |
 | USB | `/mnt/udisk/Time-lapse-Video/` |
 
-| File Type | Pattern |
-|-----------|---------|
-| Video | `{gcode_name}_{sequence}.mp4` |
-| Thumbnail | `{gcode_name}_{sequence}_{frames}.jpg` |
-
-### Thumbnail Generation
-
-When a thumbnail doesn't exist, the system auto-generates it:
-1. Uses `ffprobe` to extract video duration and frame count
-2. Uses `ffmpeg` to extract the last frame as JPEG thumbnail
-3. Saves thumbnail with frame count in filename
-
 ### Security
 
 - **Path Traversal Protection** - Filenames are sanitized to prevent `../` attacks
-- **Directory Restriction** - Only files within `TIMELAPSE_DIR` can be accessed
+- **Directory Restriction** - Only files within timelapse directories can be accessed
 - **Extension Validation** - Only `.mp4` and `.jpg` files are served
-
-### Implementation
-
-- **Constants:** `TIMELAPSE_DIR`, `TIMELAPSE_FPS` (10 fps for duration calculation)
-- **Methods:**
-  - `_serve_timelapse_page()` - Serves HTML/CSS/JS page
-  - `_serve_timelapse_list()` - Scans directory, returns JSON
-  - `_serve_timelapse_thumb()` - Serves JPEG thumbnails
-  - `_serve_timelapse_video()` - Serves MP4 with Range support for seeking
-  - `_handle_timelapse_delete()` - Deletes MP4 and matching thumbnail
