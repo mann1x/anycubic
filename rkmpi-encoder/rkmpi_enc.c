@@ -2149,7 +2149,7 @@ int main(int argc, char *argv[]) {
         }
 
         /* Start MQTT/RPC responders (go-klipper mode only, primary camera only) */
-        if (!cfg.vanilla_klipper && !cfg.no_flv) {
+        if (!cfg.vanilla_klipper) {
             /* Start MQTT video responder */
             if (mqtt_client_start() == 0) {
                 mqtt_initialized = 1;
@@ -2165,8 +2165,6 @@ int main(int argc, char *argv[]) {
             } else {
                 log_error("  RPC responder: failed to start\n");
             }
-        } else if (cfg.no_flv) {
-            log_info("  MQTT/RPC: disabled (secondary camera)\n");
         } else {
             log_info("  MQTT/RPC: disabled (vanilla-klipper mode)\n");
         }

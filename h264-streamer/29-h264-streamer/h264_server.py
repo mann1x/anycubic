@@ -3165,11 +3165,6 @@ class StreamerApp:
         self.flv_client_count = 0
         self.flv_client_lock = threading.Lock()
 
-        # Responder subprocesses (spawned when FLV clients connect, killed when they disconnect)
-        # Run in separate processes to avoid GIL contention that causes CPU spikes
-        self.rpc_subprocess = None
-        self.mqtt_subprocess = None
-
         # ACProxyCam FLV proxy - offload H.264 encoding to ACProxyCam
         self.acproxycam_flv_proxy = getattr(args, 'acproxycam_flv_proxy', False)
         self.acproxycam_flv_url = None           # Set by POST /api/acproxycam/flv
@@ -3763,10 +3758,6 @@ class StreamerApp:
         if self.acproxycam_flv_proxy:
             threading.Thread(target=self._run_flv_server, daemon=True).start()
             print(f"FLV proxy server started on port {self.FLV_PORT}", flush=True)
-            # Start MQTT/RPC responders immediately so the slicer's startCapture
-            # is handled before any FLV client connects (rkmpi_enc --no-flv disables
-            # its built-in MQTT/RPC, so we must provide them)
-            self._spawn_responder_subprocesses()
 
         return True
 
@@ -4906,60 +4897,6 @@ class StreamerApp:
             return self.gkcam_reader.get_jpeg(max_age=0.5)
         return None
 
-    def _spawn_responder_subprocesses(self):
-        """Spawn RPC and MQTT responder subprocesses (for slicer protocol)."""
-        script_path = os.path.abspath(__file__)
-
-        if self.rpc_subprocess is None:
-            try:
-                self.rpc_subprocess = subprocess.Popen(
-                    ['python', script_path, '--rpc-responder'],
-                    stdout=None,
-                    stderr=subprocess.STDOUT
-                )
-                print(f"RPC subprocess spawned (PID {self.rpc_subprocess.pid})", flush=True)
-            except Exception as e:
-                print(f"Failed to spawn RPC subprocess: {e}", flush=True)
-
-        if self.mqtt_subprocess is None:
-            try:
-                self.mqtt_subprocess = subprocess.Popen(
-                    ['python', script_path, '--mqtt-responder'],
-                    stdout=None,
-                    stderr=subprocess.STDOUT
-                )
-                print(f"MQTT subprocess spawned (PID {self.mqtt_subprocess.pid})", flush=True)
-            except Exception as e:
-                print(f"Failed to spawn MQTT subprocess: {e}", flush=True)
-
-    def _kill_responder_subprocesses(self):
-        """Kill RPC and MQTT responder subprocesses."""
-        if self.rpc_subprocess is not None:
-            try:
-                self.rpc_subprocess.terminate()
-                self.rpc_subprocess.wait(timeout=2)
-                print(f"RPC subprocess terminated", flush=True)
-            except Exception as e:
-                print(f"Error terminating RPC subprocess: {e}", flush=True)
-                try:
-                    self.rpc_subprocess.kill()
-                except:
-                    pass
-            self.rpc_subprocess = None
-
-        if self.mqtt_subprocess is not None:
-            try:
-                self.mqtt_subprocess.terminate()
-                self.mqtt_subprocess.wait(timeout=2)
-                print(f"MQTT subprocess terminated", flush=True)
-            except Exception as e:
-                print(f"Error terminating MQTT subprocess: {e}", flush=True)
-                try:
-                    self.mqtt_subprocess.kill()
-                except:
-                    pass
-            self.mqtt_subprocess = None
-
     def _serve_flv_stream(self, client):
         """Serve FLV stream - dispatch to local or proxied handler"""
         if self.acproxycam_flv_proxy:
@@ -5018,14 +4955,9 @@ class StreamerApp:
 
     def _serve_flv_stream_local(self, client):
         """Serve FLV stream from local H.264 buffer (original implementation)"""
-        # Track client and spawn responder subprocesses when first client connects
         with self.flv_client_lock:
             self.flv_client_count += 1
             print(f"FLV client connected (total: {self.flv_client_count})", flush=True)
-
-            # Spawn responder subprocesses when first client connects
-            if self.flv_client_count == 1:
-                self._spawn_responder_subprocesses()
 
         try:
             # Match gkcam's HTTP headers exactly to prevent slicer disconnection
@@ -5119,10 +5051,6 @@ class StreamerApp:
             with self.flv_client_lock:
                 self.flv_client_count -= 1
                 print(f"FLV client disconnected (total: {self.flv_client_count})", flush=True)
-
-                # Kill responder subprocesses when last client disconnects
-                if self.flv_client_count == 0:
-                    self._kill_responder_subprocesses()
 
     def _serve_control_page(self, client):
         """Serve control page HTML"""
@@ -7299,13 +7227,10 @@ if(flvjs.isSupported()){{
 
         # Restart encoders if proxy mode changed (adds/removes --no-flv + starts/stops FLV proxy server)
         if old_proxy != self.acproxycam_flv_proxy and self.is_rkmpi_mode():
-            if not self.acproxycam_flv_proxy:
-                self._kill_responder_subprocesses()
             self.restart_encoders()
             if self.acproxycam_flv_proxy:
                 threading.Thread(target=self._run_flv_server, daemon=True).start()
                 print(f"FLV proxy server started on port {self.FLV_PORT}", flush=True)
-                self._spawn_responder_subprocesses()
 
         # Re-provision moonraker cameras with updated settings
         if self.current_ip:
@@ -9554,29 +9479,6 @@ addStream('Display Snapshot',streamBase+'/display/snapshot');
             except subprocess.TimeoutExpired:
                 self.encoder_process.kill()
 
-        # Stop MQTT/RPC responder subprocesses
-        if self.rpc_subprocess:
-            try:
-                self.rpc_subprocess.terminate()
-                self.rpc_subprocess.wait(timeout=2)
-            except:
-                try:
-                    self.rpc_subprocess.kill()
-                except:
-                    pass
-            self.rpc_subprocess = None
-
-        if self.mqtt_subprocess:
-            try:
-                self.mqtt_subprocess.terminate()
-                self.mqtt_subprocess.wait(timeout=2)
-            except:
-                try:
-                    self.mqtt_subprocess.kill()
-                except:
-                    pass
-            self.mqtt_subprocess = None
-
         # Stop Moonraker client
         self._stop_moonraker_client()
 
@@ -9926,8 +9828,6 @@ def run_flv_server_standalone(fifo_path, width, height):
     cached_pps = None
     client_count = 0
     client_lock = threading.Lock()
-    rpc_subprocess = None
-    mqtt_subprocess = None
 
     def h264_reader():
         nonlocal cached_sps, cached_pps
@@ -9978,32 +9878,11 @@ def run_flv_server_standalone(fifo_path, width, height):
                 time.sleep(1)
 
     def serve_client(client):
-        nonlocal client_count, rpc_subprocess, mqtt_subprocess
+        nonlocal client_count
 
-        # Spawn responder subprocesses on first client
         with client_lock:
             client_count += 1
             print(f"FLV client connected (total: {client_count})", flush=True)
-
-            if client_count == 1:
-                script_path = os.path.abspath(__file__)
-                try:
-                    rpc_subprocess = subprocess.Popen(
-                        ['python', script_path, '--rpc-responder'],
-                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT
-                    )
-                    print(f"RPC subprocess spawned (PID {rpc_subprocess.pid})", flush=True)
-                except Exception as e:
-                    print(f"Failed to spawn RPC: {e}", flush=True)
-
-                try:
-                    mqtt_subprocess = subprocess.Popen(
-                        ['python', script_path, '--mqtt-responder'],
-                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT
-                    )
-                    print(f"MQTT subprocess spawned (PID {mqtt_subprocess.pid})", flush=True)
-                except Exception as e:
-                    print(f"Failed to spawn MQTT: {e}", flush=True)
 
         try:
             # Read HTTP request
@@ -10074,35 +9953,9 @@ def run_flv_server_standalone(fifo_path, width, height):
             except OSError:
                 pass
 
-            # Kill subprocesses when last client disconnects
             with client_lock:
                 client_count -= 1
                 print(f"FLV client disconnected (total: {client_count})", flush=True)
-
-                if client_count == 0:
-                    if rpc_subprocess:
-                        try:
-                            rpc_subprocess.terminate()
-                            rpc_subprocess.wait(timeout=2)
-                        except:
-                            try:
-                                rpc_subprocess.kill()
-                            except:
-                                pass
-                        rpc_subprocess = None
-                        print("RPC subprocess terminated", flush=True)
-
-                    if mqtt_subprocess:
-                        try:
-                            mqtt_subprocess.terminate()
-                            mqtt_subprocess.wait(timeout=2)
-                        except:
-                            try:
-                                mqtt_subprocess.kill()
-                            except:
-                                pass
-                        mqtt_subprocess = None
-                        print("MQTT subprocess terminated", flush=True)
 
     # Start H.264 reader thread
     threading.Thread(target=h264_reader, daemon=True).start()
