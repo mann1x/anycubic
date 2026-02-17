@@ -2320,13 +2320,43 @@ static void *control_server_thread(void *arg) {
             }
         }
 
-        /* Periodic: update CPU stats */
+        /* Periodic: update CPU stats (every 2s) */
         static time_t last_cpu_update = 0;
         time_t now = time(NULL);
         if (now - last_cpu_update >= 2) {
             cpu_monitor_update(&srv->cpu_monitor);
             read_encoder_stats(srv);
             last_cpu_update = now;
+        }
+
+        /* Periodic: IP change detection + WiFi optimization (every 30s) */
+        static time_t last_net_check = 0;
+        static char last_ip[64] = {0};
+        static int route_fixed = 0;
+        static int wifi_optimized = 0;
+        if (now - last_net_check >= 30) {
+            last_net_check = now;
+
+            /* Check for IP changes */
+            char current_ip[64] = {0};
+            if (get_ip_address(current_ip, sizeof(current_ip)) == 0) {
+                if (last_ip[0] && strcmp(current_ip, last_ip) != 0) {
+                    fprintf(stderr, "Network: IP changed %s -> %s\n", last_ip, current_ip);
+                    control_server_provision_moonraker(srv);
+                    route_fixed = 0;  /* Re-check routes on IP change */
+                }
+                strncpy(last_ip, current_ip, sizeof(last_ip) - 1);
+            }
+
+            /* Fix WiFi route priority (retry until successful) */
+            if (!route_fixed) {
+                route_fixed = wifi_fix_route_priority();
+            }
+
+            /* Optimize WiFi driver (one-shot) */
+            if (!wifi_optimized) {
+                wifi_optimized = wifi_optimize_driver();
+            }
         }
     }
 
