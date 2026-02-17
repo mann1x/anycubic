@@ -434,7 +434,11 @@ static void serve_control_page(ControlServer *srv, int fd) {
     snprintf(tc_str, sizeof(tc_str), "%d", cfg->target_cpu);
     snprintf(jq_str, sizeof(jq_str), "%d", cfg->jpeg_quality);
     snprintf(dfps_str, sizeof(dfps_str), "%d", cfg->display_fps);
-    snprintf(mcfps_str, sizeof(mcfps_str), "%d", srv->max_camera_fps > 0 ? srv->max_camera_fps : 30);
+    /* Use V4L2-reported max FPS (hardware capability), not runtime-measured rate */
+    int hw_max_fps = 30;
+    if (srv->cameras && srv->num_cameras > 0 && srv->cameras[0].max_fps > 0)
+        hw_max_fps = srv->cameras[0].max_fps;
+    snprintf(mcfps_str, sizeof(mcfps_str), "%d", hw_max_fps);
 
     /* Timelapse strings */
     char tl_hi_str[8], tl_ofps_str[8], tl_tl_str[8];
@@ -1720,6 +1724,18 @@ static void serve_cameras(ControlServer *srv, int fd) {
         cJSON_AddBoolToObject(obj, "enabled", cam->enabled);
         cJSON_AddNumberToObject(obj, "streaming_port", cam->streaming_port);
 
+        /* Supported resolutions */
+        if (cam->num_resolutions > 0) {
+            cJSON *res_arr = cJSON_CreateArray();
+            for (int j = 0; j < cam->num_resolutions; j++) {
+                char res_str[16];
+                snprintf(res_str, sizeof(res_str), "%dx%d",
+                         cam->resolutions[j].width, cam->resolutions[j].height);
+                cJSON_AddItemToArray(res_arr, cJSON_CreateString(res_str));
+            }
+            cJSON_AddItemToObject(obj, "supported_resolutions", res_arr);
+        }
+
         /* Check running status from managed processes */
         int running = 0;
         if (cam->camera_id == 1) {
@@ -1740,6 +1756,12 @@ static void serve_cameras(ControlServer *srv, int fd) {
             for (int j = 0; j < srv->num_managed; j++) {
                 if (srv->managed_procs[j].camera_id == cam->camera_id) {
                     ManagedProcess *mp = &srv->managed_procs[j];
+
+                    /* Error: user enabled but procmgr disabled it (restart limit) */
+                    if (cam->enabled && !mp->enabled && mp->pid <= 0) {
+                        cJSON_AddStringToObject(obj, "error",
+                            "Camera crashed repeatedly (check resolution/USB bandwidth)");
+                    }
                     int ow = mp->override_width > 0 ? mp->override_width : 640;
                     int oh = mp->override_height > 0 ? mp->override_height : 480;
                     char res[16];
@@ -1873,7 +1895,7 @@ static void handle_moonraker_cameras_post(ControlServer *srv, int fd,
 
     /* Return success */
     cJSON *resp = cJSON_CreateObject();
-    cJSON_AddBoolToObject(resp, "ok", 1);
+    cJSON_AddStringToObject(resp, "status", "ok");
     send_json_response(fd, 200, resp);
     cJSON_Delete(resp);
 }

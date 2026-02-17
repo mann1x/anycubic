@@ -9,6 +9,12 @@
 #define CAMERA_DETECT_H
 
 #define CAMERA_MAX  4
+#define CAMERA_MAX_RESOLUTIONS 16
+
+typedef struct {
+    int width;
+    int height;
+} CameraResolution;
 
 typedef struct {
     char device[32];            /* "/dev/video10" */
@@ -24,6 +30,8 @@ typedef struct {
     int camera_id;              /* 1-based ID assigned during detection */
     int enabled;                /* Whether this camera should be started */
     int streaming_port;         /* Port assigned (8080, 8082, 8083, 8084) */
+    CameraResolution resolutions[CAMERA_MAX_RESOLUTIONS];
+    int num_resolutions;        /* Number of entries in resolutions[] */
 } CameraInfo;
 
 /*

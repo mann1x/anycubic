@@ -152,6 +152,61 @@ int camera_detect_resolution(const char *device, int *width, int *height) {
     return -1;
 }
 
+int camera_detect_all_resolutions(const char *device,
+                                   CameraResolution *out, int max_res,
+                                   int has_mjpeg) {
+    int fd = open(device, O_RDWR);
+    if (fd < 0) return 0;
+
+    int count = 0;
+
+    /* Query resolutions for the preferred format (MJPEG if available, else YUYV) */
+    unsigned int fmt = has_mjpeg ? V4L2_PIX_FMT_MJPEG : V4L2_PIX_FMT_YUYV;
+    struct v4l2_frmsizeenum frmsize;
+    memset(&frmsize, 0, sizeof(frmsize));
+    frmsize.pixel_format = fmt;
+
+    while (ioctl(fd, VIDIOC_ENUM_FRAMESIZES, &frmsize) == 0 && count < max_res) {
+        if (frmsize.type == V4L2_FRMSIZE_TYPE_DISCRETE) {
+            out[count].width = frmsize.discrete.width;
+            out[count].height = frmsize.discrete.height;
+            count++;
+        }
+        frmsize.index++;
+    }
+
+    /* If MJPEG had no results and camera also supports YUYV, try YUYV */
+    if (count == 0 && has_mjpeg) {
+        memset(&frmsize, 0, sizeof(frmsize));
+        frmsize.pixel_format = V4L2_PIX_FMT_YUYV;
+        while (ioctl(fd, VIDIOC_ENUM_FRAMESIZES, &frmsize) == 0 && count < max_res) {
+            if (frmsize.type == V4L2_FRMSIZE_TYPE_DISCRETE) {
+                out[count].width = frmsize.discrete.width;
+                out[count].height = frmsize.discrete.height;
+                count++;
+            }
+            frmsize.index++;
+        }
+    }
+
+    close(fd);
+
+    /* Sort by pixel count descending (largest first) */
+    for (int i = 0; i < count - 1; i++) {
+        for (int j = i + 1; j < count; j++) {
+            int pi = out[i].width * out[i].height;
+            int pj = out[j].width * out[j].height;
+            if (pj > pi) {
+                CameraResolution tmp = out[i];
+                out[i] = out[j];
+                out[j] = tmp;
+            }
+        }
+    }
+
+    return count;
+}
+
 int camera_detect_max_fps(const char *device, int width, int height) {
     int fd = open(device, O_RDWR);
     if (fd < 0) return 0;
@@ -306,6 +361,11 @@ int camera_detect_all(CameraInfo *cameras, int max_cameras,
 
         /* Detect formats */
         camera_detect_formats(cam->device, &cam->has_mjpeg, &cam->has_yuyv);
+
+        /* Detect all supported resolutions */
+        cam->num_resolutions = camera_detect_all_resolutions(
+            cam->device, cam->resolutions, CAMERA_MAX_RESOLUTIONS,
+            cam->has_mjpeg);
 
         /* Detect resolution */
         camera_detect_resolution(cam->device, &cam->width, &cam->height);

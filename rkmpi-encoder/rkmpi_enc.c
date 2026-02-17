@@ -2498,8 +2498,46 @@ int main(int argc, char *argv[]) {
                 usleep(1000);
                 continue;
             }
-            log_error("VIDIOC_DQBUF failed: %s\n", strerror(errno));
-            break;
+            log_error("VIDIOC_DQBUF failed: %s (attempting recovery)\n", strerror(errno));
+
+            /* V4L2 capture recovery: stop, re-queue buffers, restart streaming.
+             * This handles USB bandwidth disruptions from secondary cameras. */
+            enum v4l2_buf_type stop_type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+            ioctl(v4l2_fd, VIDIOC_STREAMOFF, &stop_type);
+
+            int recovered = 0;
+            for (int retry = 0; retry < 5 && g_running; retry++) {
+                sleep(1 + retry);  /* Progressive backoff: 1s, 2s, 3s, 4s, 5s */
+
+                /* Re-queue all buffers */
+                int qbuf_ok = 1;
+                for (int i = 0; i < buffer_count; i++) {
+                    struct v4l2_buffer qbuf = {0};
+                    qbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+                    qbuf.memory = V4L2_MEMORY_MMAP;
+                    qbuf.index = i;
+                    if (ioctl(v4l2_fd, VIDIOC_QBUF, &qbuf) < 0) {
+                        qbuf_ok = 0;
+                        break;
+                    }
+                }
+                if (!qbuf_ok) continue;
+
+                /* Restart streaming */
+                if (ioctl(v4l2_fd, VIDIOC_STREAMON, &stop_type) == 0) {
+                    log_info("V4L2 capture recovered after %d retries\n", retry + 1);
+                    recovered = 1;
+                    break;
+                }
+                log_error("V4L2 recovery attempt %d failed: %s\n",
+                          retry + 1, strerror(errno));
+            }
+
+            if (!recovered) {
+                log_error("V4L2 capture recovery failed, exiting\n");
+                break;
+            }
+            continue;
         }
         TIMING_END(v4l2_dqbuf);
 

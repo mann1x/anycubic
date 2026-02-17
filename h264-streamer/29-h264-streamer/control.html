@@ -848,7 +848,13 @@
                 .then(r => r.json())
                 .then(data => {
                     cameras = data.cameras || [];
-                    activeCameraId = data.active_camera_id || 1;
+                    // If active camera is no longer running/enabled, switch to primary
+                    if (activeCameraId !== 1) {
+                        const activeCam = cameras.find(c => c.id === activeCameraId);
+                        if (!activeCam || !activeCam.enabled || !activeCam.running || activeCam.error) {
+                            switchCamera(1);
+                        }
+                    }
                     renderCameraSelector();
                 })
                 .catch(err => console.log('Camera load error:', err));
@@ -1027,6 +1033,10 @@
             .then(r => r.json())
             .then(data => {
                 if (data.status === 'ok') {
+                    // If disabling the currently active camera, switch to primary
+                    if (!enabled && id === activeCameraId) {
+                        switchCamera(1);
+                    }
                     // Reload camera list to get updated state
                     loadCameras();
                 } else {
@@ -1123,7 +1133,7 @@
                     moonrakerCameraSettings = settings;
                     setTimeout(() => { statusEl.textContent = ''; }, 3000);
                 } else {
-                    statusEl.textContent = 'Error: ' + (data.message || 'Unknown error');
+                    statusEl.textContent = 'Error: ' + (data.error || 'Unknown error');
                     statusEl.style.color = '#f44';
                 }
             })
@@ -1150,6 +1160,11 @@
         }
 
         document.addEventListener('DOMContentLoaded', loadCamerasAndMoonraker);
+
+        // Poll camera status every 5s to detect async errors/crashes
+        setInterval(function() {
+            if (cameras.length > 1) loadCameras();
+        }, 5000);
 
         // Show/hide settings based on encoder type
         function updateEncoderVisibility() {
@@ -2008,7 +2023,7 @@ if(flvjs.isSupported()){
                         checkMoonrakerStatus();
                         alert('Timelapse settings saved');
                     } else {
-                        alert('Error saving settings: ' + (data.message || 'Unknown error'));
+                        alert('Error saving settings: ' + (data.error || 'Unknown error'));
                     }
                 })
                 .catch(err => alert('Error: ' + err));
