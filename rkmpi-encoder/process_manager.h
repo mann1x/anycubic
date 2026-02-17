@@ -35,6 +35,7 @@ typedef struct {
     int override_width;         /* 0 = default (640) */
     int override_height;        /* 0 = default (480) */
     int force_mjpeg;            /* 1 = use MJPEG instead of YUYV */
+    int override_fps;           /* 0 = use global mjpeg_fps */
 } ManagedProcess;
 
 /*

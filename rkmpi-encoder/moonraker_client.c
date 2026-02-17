@@ -798,7 +798,7 @@ static void *moonraker_thread_func(void *arg) {
             close(mc->fd);
             mc->fd = -1;
             mc->connected = 0;
-            timelapse_set_custom_mode(0);
+            /* Keep custom mode enabled — will retry connection */
             for (int i = 0; i < RECONNECT_DELAY && mc->running; i++)
                 sleep(1);
             continue;
@@ -856,8 +856,9 @@ disconnected:
         }
         mc->connected = 0;
 
-        /* Only release custom mode if no active timelapse */
-        if (!mc->timelapse_active) {
+        /* Keep custom mode enabled during reconnects to prevent MQTT
+         * timelapse commands from interfering during the gap */
+        if (!mc->running && !mc->timelapse_active) {
             timelapse_set_custom_mode(0);
         }
 

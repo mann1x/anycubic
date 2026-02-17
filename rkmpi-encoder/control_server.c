@@ -1747,6 +1747,9 @@ static void serve_cameras(ControlServer *srv, int fd) {
                     cJSON_AddStringToObject(obj, "configured_resolution", res);
                     cJSON_AddStringToObject(obj, "capture_mode",
                                              mp->force_mjpeg ? "mjpeg" : "yuyv");
+                    int cam_fps = mp->override_fps > 0 ? mp->override_fps :
+                                  (srv->config->mjpeg_fps > 0 ? srv->config->mjpeg_fps : 10);
+                    cJSON_AddNumberToObject(obj, "mjpeg_fps", cam_fps);
                     break;
                 }
             }
@@ -1875,6 +1878,43 @@ static void handle_moonraker_cameras_post(ControlServer *srv, int fd,
     cJSON_Delete(resp);
 }
 
+/* Load per-camera encoder overrides from cameras_json config.
+ * Looks up by camera unique_id, loads resolution/mode/fps overrides. */
+void control_server_load_camera_overrides(ManagedProcess *proc,
+                                           const CameraInfo *cam,
+                                           const AppConfig *cfg) {
+    if (!proc || !cam || !cfg || !cfg->cameras_json[0]) return;
+    if (!cam->unique_id[0]) return;
+
+    cJSON *root = cJSON_Parse(cfg->cameras_json);
+    if (!root) return;
+
+    cJSON *entry = cJSON_GetObjectItem(root, cam->unique_id);
+    if (entry) {
+        /* Resolution */
+        cJSON *res = cJSON_GetObjectItem(entry, "resolution");
+        if (res && res->valuestring) {
+            int w = 0, h = 0;
+            if (sscanf(res->valuestring, "%dx%d", &w, &h) == 2 && w > 0 && h > 0) {
+                proc->override_width = w;
+                proc->override_height = h;
+            }
+        }
+        /* Capture mode */
+        cJSON *mode = cJSON_GetObjectItem(entry, "capture_mode");
+        if (mode && mode->valuestring) {
+            proc->force_mjpeg = (strcmp(mode->valuestring, "mjpeg") == 0) ? 1 : 0;
+        }
+        /* FPS */
+        cJSON *fps = cJSON_GetObjectItem(entry, "mjpeg_fps");
+        if (fps && cJSON_IsNumber(fps) && fps->valueint >= 2 && fps->valueint <= 30) {
+            proc->override_fps = fps->valueint;
+        }
+    }
+
+    cJSON_Delete(root);
+}
+
 static void handle_camera_enable(ControlServer *srv, int fd,
                                   const char *body) {
     FormParam params[8];
@@ -1906,6 +1946,28 @@ static void handle_camera_enable(ControlServer *srv, int fd,
 
     cam->enabled = 1;
 
+    /* Persist enabled state to config */
+    if (cam->unique_id[0]) {
+        cJSON *existing = srv->config->cameras_json[0] ?
+            cJSON_Parse(srv->config->cameras_json) : NULL;
+        if (!existing) existing = cJSON_CreateObject();
+        cJSON *entry = cJSON_GetObjectItem(existing, cam->unique_id);
+        if (!entry) {
+            entry = cJSON_CreateObject();
+            cJSON_AddItemToObject(existing, cam->unique_id, entry);
+        }
+        cJSON_DeleteItemFromObject(entry, "enabled");
+        cJSON_AddBoolToObject(entry, "enabled", 1);
+        char *json_str = cJSON_PrintUnformatted(existing);
+        if (json_str) {
+            strncpy(srv->config->cameras_json, json_str,
+                    sizeof(srv->config->cameras_json) - 1);
+            free(json_str);
+        }
+        cJSON_Delete(existing);
+        config_save(srv->config, srv->config->config_file);
+    }
+
     /* Start the process if not already running */
     char binary_path[256];
     ssize_t len = readlink("/proc/self/exe", binary_path,
@@ -1923,6 +1985,8 @@ static void handle_camera_enable(ControlServer *srv, int fd,
         if (!proc && srv->num_managed < CAMERA_MAX) {
             proc = &srv->managed_procs[srv->num_managed];
             srv->num_managed++;
+            /* Load saved per-camera overrides from config */
+            control_server_load_camera_overrides(proc, cam, srv->config);
         }
         if (proc && proc->pid <= 0) {
             proc->enabled = 1;
@@ -1955,11 +2019,35 @@ static void handle_camera_disable(ControlServer *srv, int fd,
     }
 
     /* Find camera and disable */
+    CameraInfo *cam = NULL;
     for (int i = 0; i < srv->num_cameras; i++) {
         if (srv->cameras[i].camera_id == cam_id) {
             srv->cameras[i].enabled = 0;
+            cam = &srv->cameras[i];
             break;
         }
+    }
+
+    /* Persist disabled state to config */
+    if (cam && cam->unique_id[0]) {
+        cJSON *existing = srv->config->cameras_json[0] ?
+            cJSON_Parse(srv->config->cameras_json) : NULL;
+        if (!existing) existing = cJSON_CreateObject();
+        cJSON *entry = cJSON_GetObjectItem(existing, cam->unique_id);
+        if (!entry) {
+            entry = cJSON_CreateObject();
+            cJSON_AddItemToObject(existing, cam->unique_id, entry);
+        }
+        cJSON_DeleteItemFromObject(entry, "enabled");
+        cJSON_AddBoolToObject(entry, "enabled", 0);
+        char *json_str = cJSON_PrintUnformatted(existing);
+        if (json_str) {
+            strncpy(srv->config->cameras_json, json_str,
+                    sizeof(srv->config->cameras_json) - 1);
+            free(json_str);
+        }
+        cJSON_Delete(existing);
+        config_save(srv->config, srv->config->config_file);
     }
 
     /* Stop the process */
@@ -2020,6 +2108,65 @@ static void handle_camera_settings(ControlServer *srv, int fd,
         proc->force_mjpeg = (strcmp(mode, "mjpeg") == 0) ? 1 : 0;
     }
 
+    /* Parse per-camera FPS */
+    const char *fps_str = form_get(params, np, "mjpeg_fps");
+    int new_fps = 0;
+    if (fps_str) {
+        new_fps = atoi(fps_str);
+        if (new_fps >= 2 && new_fps <= 30 && proc) {
+            proc->override_fps = new_fps;
+        }
+    }
+
+    /* Persist per-camera settings to cameras_json */
+    if (proc) {
+        /* Find camera unique_id */
+        const char *unique_id = NULL;
+        for (int i = 0; i < srv->num_cameras; i++) {
+            if (srv->cameras[i].camera_id == cam_id) {
+                unique_id = srv->cameras[i].unique_id;
+                break;
+            }
+        }
+        if (unique_id && unique_id[0]) {
+            cJSON *existing = NULL;
+            if (srv->config->cameras_json[0])
+                existing = cJSON_Parse(srv->config->cameras_json);
+            if (!existing) existing = cJSON_CreateObject();
+
+            cJSON *cam_entry = cJSON_GetObjectItem(existing, unique_id);
+            if (!cam_entry) {
+                cam_entry = cJSON_CreateObject();
+                cJSON_AddItemToObject(existing, unique_id, cam_entry);
+            }
+
+            /* Save encoder settings */
+            if (proc->override_width > 0 && proc->override_height > 0) {
+                char res_buf[16];
+                snprintf(res_buf, sizeof(res_buf), "%dx%d",
+                         proc->override_width, proc->override_height);
+                cJSON_DeleteItemFromObject(cam_entry, "resolution");
+                cJSON_AddStringToObject(cam_entry, "resolution", res_buf);
+            }
+            cJSON_DeleteItemFromObject(cam_entry, "capture_mode");
+            cJSON_AddStringToObject(cam_entry, "capture_mode",
+                                     proc->force_mjpeg ? "mjpeg" : "yuyv");
+            if (proc->override_fps > 0) {
+                cJSON_DeleteItemFromObject(cam_entry, "mjpeg_fps");
+                cJSON_AddNumberToObject(cam_entry, "mjpeg_fps", proc->override_fps);
+            }
+
+            char *json_str = cJSON_PrintUnformatted(existing);
+            if (json_str) {
+                strncpy(srv->config->cameras_json, json_str,
+                        sizeof(srv->config->cameras_json) - 1);
+                free(json_str);
+            }
+            cJSON_Delete(existing);
+            config_save(srv->config, srv->config->config_file);
+        }
+    }
+
     /* If camera is running, restart it with new settings */
     int restarted = 0;
     if (proc && proc->pid > 0) {
@@ -2052,6 +2199,7 @@ static void handle_camera_settings(ControlServer *srv, int fd,
         cJSON_AddStringToObject(root, "resolution", res_str);
     }
     if (mode) cJSON_AddStringToObject(root, "capture_mode", mode);
+    if (new_fps > 0) cJSON_AddNumberToObject(root, "mjpeg_fps", new_fps);
     cJSON_AddBoolToObject(root, "restarted", restarted);
     send_json_response(fd, 200, root);
     cJSON_Delete(root);

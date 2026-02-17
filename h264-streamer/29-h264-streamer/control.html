@@ -871,7 +871,9 @@
                 const isEnabled = cam.enabled;
                 const isPrimary = cam.is_primary;
                 const hasError = cam.error != null;
-                const title = `${cam.name} (${cam.resolution} ${cam.mode}, port ${cam.streaming_port})${isEnabled ? '' : ' - disabled'}${hasError ? ' - ERROR' : ''}`;
+                const camRes = cam.configured_resolution || (cam.width + 'x' + cam.height);
+                const camMode = cam.capture_mode || (cam.has_mjpeg ? 'mjpeg' : 'yuyv');
+                const title = `${cam.name} (${camRes} ${camMode}, port ${cam.streaming_port})${isEnabled ? '' : ' - disabled'}${hasError ? ' - ERROR' : ''}`;
 
                 // Primary camera button (cannot be disabled)
                 if (isPrimary) {
@@ -903,10 +905,10 @@
             panel.style.display = 'block';
             let html = '<div style="font-size:12px;color:#888;margin-bottom:8px;">Additional Cameras Settings:</div>';
             secondaryCams.forEach(cam => {
-                const statusColor = cam.error ? '#f44' : (cam.status === 'running' ? '#4CAF50' : '#888');
-                const statusText = cam.error ? 'Error' : (cam.status === 'running' ? 'Running' : (cam.enabled ? 'Starting...' : 'Disabled'));
+                const statusColor = cam.error ? '#f44' : (cam.running ? '#4CAF50' : '#888');
+                const statusText = cam.error ? 'Error' : (cam.running ? 'Running' : (cam.enabled ? 'Starting...' : 'Disabled'));
                 const enabledChecked = cam.enabled ? 'checked' : '';
-                const res = cam.resolution || '640x480';
+                const res = cam.configured_resolution || (cam.width + 'x' + cam.height);
                 const fps = cam.mjpeg_fps || 10;
 
                 html += `<div style="background:#222;padding:8px;margin-bottom:8px;border-radius:4px;">`;
@@ -951,8 +953,8 @@
             showStatus(`Applying ${res} @ ${fps}fps to CAM#${camId}...`);
             fetch('/api/camera/settings', {
                 method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({id: camId, resolution: res, mjpeg_fps: fps})
+                headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                body: 'id=' + camId + '&resolution=' + encodeURIComponent(res) + '&mjpeg_fps=' + fps
             })
             .then(r => r.json())
             .then(data => {
@@ -964,7 +966,7 @@
                         showStatus(`CAM#${camId}: Settings applied (${res} @ ${fps}fps)`);
                     }, 3500);
                 } else {
-                    showStatus('Error: ' + (data.message || 'Unknown error'), 'error');
+                    showStatus('Error: ' + (data.error || 'Unknown error'), 'error');
                 }
             })
             .catch(e => showStatus('Error: ' + e, 'error'));
@@ -1019,8 +1021,8 @@
 
             fetch(endpoint, {
                 method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({id: id})
+                headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                body: 'id=' + id
             })
             .then(r => r.json())
             .then(data => {
@@ -1028,7 +1030,7 @@
                     // Reload camera list to get updated state
                     loadCameras();
                 } else {
-                    alert('Camera toggle failed: ' + data.message);
+                    alert('Camera toggle failed: ' + (data.error || 'Unknown error'));
                 }
             })
             .catch(err => alert('Camera toggle error: ' + err));

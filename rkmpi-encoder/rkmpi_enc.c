@@ -68,6 +68,7 @@
 #include "camera_detect.h"
 #include "process_manager.h"
 #include "moonraker_client.h"
+#include "cJSON.h"
 
 /* Forward declarations */
 static void log_info(const char *fmt, ...);
@@ -2016,6 +2017,13 @@ int main(int argc, char *argv[]) {
         g_ctrl.auto_skip = app_config.auto_skip;
         g_ctrl.target_cpu = app_config.target_cpu;
 
+        /* Apply MJPEG FPS from config (overrides CLI -f) */
+        if (app_config.mjpeg_fps >= 2 && app_config.mjpeg_fps <= 30) {
+            g_mjpeg_ctrl.target_fps = app_config.mjpeg_fps;
+            g_mjpeg_ctrl.target_interval = 1000000 / g_mjpeg_ctrl.target_fps;
+            cfg.fps = g_mjpeg_ctrl.target_fps;
+        }
+
         /* When ACProxyCam FLV proxy is enabled, disable local H.264 encoding
          * since ACProxyCam handles encoding on the PC side */
         if (app_config.acproxycam_flv_proxy) {
@@ -2078,6 +2086,24 @@ int main(int argc, char *argv[]) {
             ? cfg.internal_usb_port : "1.3";
         num_cameras = camera_detect_all(detected_cameras, CAMERA_MAX, usb_port);
 
+        /* Load enabled state from config for secondary cameras */
+        if (num_cameras > 1 && app_config.cameras_json[0]) {
+            cJSON *cam_cfg = cJSON_Parse(app_config.cameras_json);
+            if (cam_cfg) {
+                for (int i = 1; i < num_cameras; i++) {
+                    if (!detected_cameras[i].unique_id[0]) continue;
+                    cJSON *entry = cJSON_GetObjectItem(cam_cfg,
+                                       detected_cameras[i].unique_id);
+                    if (entry) {
+                        cJSON *en = cJSON_GetObjectItem(entry, "enabled");
+                        if (en && cJSON_IsBool(en))
+                            detected_cameras[i].enabled = cJSON_IsTrue(en);
+                    }
+                }
+                cJSON_Delete(cam_cfg);
+            }
+        }
+
         if (num_cameras > 1) {
             /* Get path to our own binary for fork/exec */
             char binary_path[256];
@@ -2090,6 +2116,9 @@ int main(int argc, char *argv[]) {
                 for (int i = 1; i < num_cameras; i++) {
                     if (!detected_cameras[i].enabled) continue;
                     ManagedProcess *proc = &managed_procs[num_managed];
+                    /* Load saved per-camera overrides (resolution, mode, fps) */
+                    control_server_load_camera_overrides(proc, &detected_cameras[i],
+                                                         &app_config);
                     if (procmgr_start_camera(proc, &detected_cameras[i],
                                               &app_config, binary_path) == 0) {
                         num_managed++;

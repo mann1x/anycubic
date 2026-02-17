@@ -47,7 +47,9 @@ static int build_secondary_args(char **argv, int max_args,
     snprintf(port_str, sizeof(port_str), "%d", cam->streaming_port);
     snprintf(width_str, sizeof(width_str), "%d", width);
     snprintf(height_str, sizeof(height_str), "%d", height);
-    snprintf(fps_str, sizeof(fps_str), "%d", cfg->mjpeg_fps > 0 ? cfg->mjpeg_fps : 10);
+    int fps = proc->override_fps > 0 ? proc->override_fps :
+              (cfg->mjpeg_fps > 0 ? cfg->mjpeg_fps : 10);
+    snprintf(fps_str, sizeof(fps_str), "%d", fps);
     snprintf(bitrate_str, sizeof(bitrate_str), "%d", cfg->bitrate > 0 ? cfg->bitrate : 512);
     snprintf(quality_str, sizeof(quality_str), "%d", cfg->jpeg_quality > 0 ? cfg->jpeg_quality : 85);
 

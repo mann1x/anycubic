@@ -119,6 +119,13 @@ void control_server_set_cameras(CameraInfo *cameras, int num_cameras,
  * Uses per-camera settings from config cameras_json. */
 void control_server_provision_moonraker(ControlServer *srv);
 
+/* Load per-camera encoder overrides from cameras_json into ManagedProcess.
+ * Looks up camera by unique_id in the cameras_json config.
+ * Sets override_width, override_height, force_mjpeg, override_fps. */
+void control_server_load_camera_overrides(ManagedProcess *proc,
+                                           const CameraInfo *cam,
+                                           const AppConfig *cfg);
+
 /* Forward declaration for moonraker client */
 struct MoonrakerClient;
 
