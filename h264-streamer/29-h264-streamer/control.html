@@ -414,7 +414,7 @@
                         <span class="label">H.264 Encoding:</span>
                         <div class="control">
                             <label class="toggle">
-                                <input type="checkbox" name="h264_enabled" $h264_enabled_checked>
+                                <input type="checkbox" name="h264_enabled" $h264_enabled_checked onchange="updateStatusPorts()">
                                 <span class="slider"></span>
                             </label>
                         </div>
@@ -783,14 +783,7 @@
                 <span class="label">Encoder:</span>
                 <span class="value" id="status-encoder">$encoder_type</span>
             </div>
-            <div class="row rkmpi-only">
-                <span class="label">Streaming Port:</span>
-                <span class="value">$streaming_port</span>
-            </div>
-            <div class="row rkmpi-only">
-                <span class="label">Control Port:</span>
-                <span class="value">$control_port</span>
-            </div>
+            <div id="status-ports"></div>
         </div>
     </div>
 
@@ -871,6 +864,7 @@
                         }
                     }
                     renderCameraSelector();
+                    updateStatusPorts();
                 })
                 .catch(err => console.log('Camera load error:', err));
         }
@@ -910,6 +904,64 @@
             }).join('');
 
             updateCameraStatusPanel();
+        }
+
+        function updateStatusPorts() {
+            const panel = document.getElementById('status-ports');
+            if (!panel) return;
+            const host = location.hostname;
+            const sp = streamingPort;
+            const cp = controlPort;
+            const h264cb = document.querySelector('[name=h264_enabled]');
+            const h264on = h264cb && h264cb.checked;
+            const proxycb = document.querySelector('[name=acproxycam_flv_proxy]');
+            const proxyon = proxycb && proxycb.checked;
+            const dispcb = document.querySelector('[name=display_enabled]');
+            const dispon = dispcb && dispcb.checked;
+            const hasFlv = h264on || proxyon;
+            const lnk = (port, path) => '<a href="http://' + host + ':' + port + path + '" target="_blank" style="color:#888;">' + path + '</a>';
+            let html = '';
+
+            // Primary streaming port + endpoints
+            html += '<div class="row rkmpi-only"><span class="label">Streaming Port (CAM#1):</span>';
+            html += '<span class="value">' + sp + '</span></div>';
+            html += '<div class="row rkmpi-only" style="margin-top:-4px;"><span class="label"></span>';
+            html += '<span class="value" style="font-size:11px;color:#888;">';
+            html += lnk(sp, '/stream') + ' ' + lnk(sp, '/snapshot');
+            if (dispon) html += ' ' + lnk(sp, '/display') + ' ' + lnk(sp, '/display/snapshot');
+            html += '</span></div>';
+
+            // Secondary camera ports
+            const secondary = cameras.filter(c => !c.is_primary && c.enabled && c.running);
+            secondary.forEach(cam => {
+                const p = cam.streaming_port;
+                html += '<div class="row rkmpi-only"><span class="label">Streaming Port (CAM#' + cam.id + '):</span>';
+                html += '<span class="value">' + p + '</span></div>';
+                html += '<div class="row rkmpi-only" style="margin-top:-4px;"><span class="label"></span>';
+                html += '<span class="value" style="font-size:11px;color:#888;">';
+                html += lnk(p, '/stream') + ' ' + lnk(p, '/snapshot');
+                html += '</span></div>';
+            });
+
+            // FLV port (H.264 encoder or ACProxyCam proxy)
+            if (hasFlv) {
+                html += '<div class="row rkmpi-only"><span class="label">FLV Port:</span>';
+                html += '<span class="value">' + FLV_PORT + '</span></div>';
+                html += '<div class="row rkmpi-only" style="margin-top:-4px;"><span class="label"></span>';
+                html += '<span class="value" style="font-size:11px;color:#888;">';
+                html += lnk(FLV_PORT, '/flv');
+                html += '</span></div>';
+            }
+
+            // Control port + endpoints
+            html += '<div class="row rkmpi-only"><span class="label">Control Port:</span>';
+            html += '<span class="value">' + cp + '</span></div>';
+            html += '<div class="row rkmpi-only" style="margin-top:-4px;"><span class="label"></span>';
+            html += '<span class="value" style="font-size:11px;color:#888;">';
+            html += lnk(cp, '/control') + ' ' + lnk(cp, '/timelapse') + ' ' + lnk(cp, '/status') + ' ' + lnk(cp, '/api/stats') + ' ' + lnk(cp, '/api/cameras');
+            html += '</span></div>';
+
+            panel.innerHTML = html;
         }
 
         function updateCameraStatusPanel() {
@@ -1207,6 +1259,7 @@
 
         // Load moonraker settings when cameras are loaded
         function loadCamerasAndMoonraker() {
+            updateStatusPorts();
             loadCameras();
             loadMoonrakerCameraSettings();
             loadNetworkInterfaces();
@@ -1751,11 +1804,13 @@ if(flvjs.isSupported()){
             document.querySelectorAll('.h264-local-setting').forEach(el => {
                 el.style.display = proxyEnabled ? 'none' : '';
             });
+            updateStatusPorts();
         }
 
         function updateDisplaySettings() {
             const enabled = document.querySelector('[name=display_enabled]').checked;
             document.getElementById('display_fps_select').disabled = !enabled;
+            updateStatusPorts();
         }
 
         // Timelapse settings UI functions
