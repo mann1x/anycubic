@@ -65,6 +65,8 @@
         .stat-label { font-size: 12px; color: #888; }
         #flv-player { width: 100%; max-height: 480px; }
         .player-controls { margin-top: 10px; }
+        .stream-overlay { position:absolute; top:6px; left:6px; background:rgba(0,0,0,0.7); color:#ccc; font-size:11px; font-family:monospace; padding:3px 7px; border-radius:3px; pointer-events:none; z-index:5; line-height:1.4; }
+        .stream-overlay.error { color:#f44; }
         /* Loading overlay for restart */
         .loading-overlay {
             display: none;
@@ -204,12 +206,14 @@
                     <img src="/snapshot" id="preview-img" onclick="this.src='/snapshot?'+Date.now()">
                     <p style="color:#888;font-size:12px">Click image to refresh</p>
                 </div>
-                <div id="tab-mjpeg" class="tab-content">
+                <div id="tab-mjpeg" class="tab-content" style="position:relative;">
                     <img id="mjpeg-stream" style="display:none">
+                    <div id="mjpeg-overlay" class="stream-overlay" style="display:none"></div>
                     <p style="color:#888;font-size:12px">Live MJPEG stream</p>
                 </div>
-                <div id="tab-flv" class="tab-content">
+                <div id="tab-flv" class="tab-content" style="position:relative;">
                     <video id="flv-player" muted autoplay></video>
+                    <div id="flv-overlay" class="stream-overlay" style="display:none"></div>
                     <div class="player-controls">
                         <button onclick="startFlvPlayer()">Play</button>
                         <button class="secondary" onclick="stopFlvPlayer()">Stop</button>
@@ -1452,15 +1456,21 @@
         // MJPEG stream
         function startMjpegStream() {
             const img = document.getElementById('mjpeg-stream');
+            mjpegStreamError = false;
+            img.onerror = () => { mjpegStreamError = true; };
             img.src = mjpegUrl;
             img.style.display = 'block';
             mjpegActive = true;
         }
         function stopMjpegStream() {
             const img = document.getElementById('mjpeg-stream');
+            img.onerror = null;
             img.src = '';
             img.style.display = 'none';
             mjpegActive = false;
+            mjpegStreamError = false;
+            const mo = document.getElementById('mjpeg-overlay');
+            if (mo) mo.style.display = 'none';
         }
 
         // Display stream (printer LCD framebuffer)
@@ -1708,10 +1718,20 @@ if(flvjs.isSupported()){
 
             flvPlayer.on(flvjs.Events.ERROR, (e, t) => {
                 statusEl.textContent = 'Error: ' + t;
+                const fo = document.getElementById('flv-overlay');
+                if (fo) { fo.textContent = 'Stream error: ' + t; fo.className = 'stream-overlay error'; fo.style.display = ''; }
             });
 
             flvPlayer.on(flvjs.Events.LOADING_COMPLETE, () => {
                 statusEl.textContent = 'Stream ended';
+                const fo = document.getElementById('flv-overlay');
+                if (fo) { fo.textContent = 'Stream ended'; fo.className = 'stream-overlay error'; fo.style.display = ''; }
+            });
+
+            flvPlayer.on(flvjs.Events.STATISTICS_INFO, (s) => {
+                if (s.speed !== undefined) {
+                    flvBitrateKbps = Math.round(s.speed * 8);
+                }
             });
 
             flvPlayer.attachMediaElement(videoElement);
@@ -1745,6 +1765,9 @@ if(flvjs.isSupported()){
                 flvPlayerBusy = false;
             }
             statusEl.textContent = 'Stopped';
+            flvBitrateKbps = 0;
+            const fo = document.getElementById('flv-overlay');
+            if (fo) fo.style.display = 'none';
         }
 
         // FPS percentage helpers
@@ -2034,9 +2057,61 @@ if(flvjs.isSupported()){
                         document.getElementById('skip_ratio_hidden').value = data.skip_ratio;
                         updateFpsLabel();
                     }
+                    // Update stream overlays
+                    updateStreamOverlays(data);
                 })
-                .catch(() => {});
+                .catch(() => {
+                    // Stats fetch failed — encoder likely down
+                    const mo = document.getElementById('mjpeg-overlay');
+                    if (mjpegActive && mo) {
+                        mo.textContent = 'Stream disconnected';
+                        mo.className = 'stream-overlay error';
+                        mo.style.display = '';
+                    }
+                });
         }
+
+        let mjpegStreamError = false;
+        let flvBitrateKbps = 0;
+        let prevFlvBytes = 0;
+        let prevFlvTime = 0;
+
+        function updateStreamOverlays(data) {
+            // MJPEG overlay
+            const mo = document.getElementById('mjpeg-overlay');
+            if (mjpegActive && mo) {
+                const fps = data.fps.mjpeg;
+                if (mjpegStreamError || fps <= 0) {
+                    mo.textContent = mjpegStreamError ? 'Stream error' : 'No stream';
+                    mo.className = 'stream-overlay error';
+                } else {
+                    mo.textContent = fps + ' fps';
+                    mo.className = 'stream-overlay';
+                }
+                mo.style.display = '';
+            } else if (mo) {
+                mo.style.display = 'none';
+            }
+
+            // FLV overlay
+            const fo = document.getElementById('flv-overlay');
+            if (flvPlayer && fo) {
+                const fps = data.fps.h264;
+                let text = fps + ' fps';
+                if (flvBitrateKbps > 0) text += ' / ' + flvBitrateKbps + ' kbps';
+                if (fps <= 0) {
+                    fo.textContent = 'No stream';
+                    fo.className = 'stream-overlay error';
+                } else {
+                    fo.textContent = text;
+                    fo.className = 'stream-overlay';
+                }
+                fo.style.display = '';
+            } else if (fo) {
+                fo.style.display = 'none';
+            }
+        }
+
         // Start stats update - poll every 2 seconds to reduce CPU
         if (!statsInterval) {
             statsInterval = setInterval(updateStats, 2000);
