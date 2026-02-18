@@ -68,6 +68,12 @@ size_t frame_buffer_copy(FrameBuffer *fb, uint8_t *dst, size_t dst_size,
                          uint64_t *sequence_out, uint64_t *timestamp_out,
                          int *is_keyframe_out);
 
+/* Zero-copy frame access: returns pointer to internal buffer data.
+ * Pointer is valid for at least one frame period (~50ms at 20fps).
+ * Returns NULL if no frame available. */
+const uint8_t *frame_buffer_ref(FrameBuffer *fb, size_t *size_out,
+                                 uint64_t *sequence_out);
+
 /* Get current sequence number without waiting */
 uint64_t frame_buffer_get_sequence(FrameBuffer *fb);
 

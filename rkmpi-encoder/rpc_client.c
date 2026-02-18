@@ -4,6 +4,7 @@
  * Connects to port 18086 and handles video_stream_request messages.
  */
 
+#define _GNU_SOURCE
 #include "rpc_client.h"
 #include "timelapse.h"
 #include "cJSON.h"
@@ -410,6 +411,7 @@ int rpc_client_start(void) {
         rpc_log("Failed to create thread\n");
         return -1;
     }
+    pthread_setname_np(g_rpc_client.thread, "rpc");
 
     rpc_log("Started\n");
     return 0;

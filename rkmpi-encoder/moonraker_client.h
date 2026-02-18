@@ -29,7 +29,6 @@ typedef struct MoonrakerClient {
     int current_layer;
     int total_layers;
     char filename[256];
-    float print_duration;
 
     /* Timelapse state */
     volatile int timelapse_active;

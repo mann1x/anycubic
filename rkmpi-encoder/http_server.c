@@ -4,6 +4,7 @@
  * Minimal socket-based HTTP server for MJPEG and FLV streaming.
  */
 
+#define _GNU_SOURCE
 #include "http_server.h"
 #include "frame_buffer.h"
 #include "flv_mux.h"
@@ -20,6 +21,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
+#include <sys/uio.h>
 #include <time.h>
 
 /* Global server instances */
@@ -33,12 +35,105 @@ static int g_control_port = HTTP_CONTROL_PORT;
 static char g_flv_proxy_url[256] = "";
 static pthread_mutex_t g_flv_proxy_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* FLV proxy FPS tracking */
+static volatile float g_flv_proxy_fps = 0.0f;
+
 /* Forward declarations for FLV proxy */
 typedef struct {
     int client_fd;
     char url[256];
 } FlvProxyArg;
 static void *flv_proxy_thread(void *arg);
+
+/* FLV tag parser state machine for counting video frames */
+enum {
+    FLV_PARSE_HEADER,       /* Skipping 9-byte FLV header + 4-byte prev tag size */
+    FLV_PARSE_TAG_HEADER,   /* Reading 11-byte tag header */
+    FLV_PARSE_TAG_DATA,     /* Skipping tag data */
+    FLV_PARSE_PREV_SIZE     /* Skipping 4-byte previous tag size */
+};
+
+typedef struct {
+    int state;
+    int bytes_left;
+    uint8_t tag_hdr[11];
+    int tag_hdr_pos;
+    /* Stats */
+    int video_frames;
+    struct timespec last_time;
+} FlvTagCounter;
+
+static void flv_counter_init(FlvTagCounter *c) {
+    memset(c, 0, sizeof(*c));
+    c->state = FLV_PARSE_HEADER;
+    c->bytes_left = 9 + 4;  /* FLV header (9) + first PreviousTagSize0 (4) */
+    clock_gettime(CLOCK_MONOTONIC, &c->last_time);
+}
+
+/* Process buffer through FLV tag counter, update g_flv_proxy_fps */
+static void flv_count_tags(FlvTagCounter *c, const uint8_t *buf, int len) {
+    int i = 0;
+    while (i < len) {
+        switch (c->state) {
+        case FLV_PARSE_HEADER:
+        case FLV_PARSE_TAG_DATA:
+        case FLV_PARSE_PREV_SIZE: {
+            /* Skip bytes_left bytes */
+            int skip = len - i;
+            if (skip > c->bytes_left) skip = c->bytes_left;
+            i += skip;
+            c->bytes_left -= skip;
+            if (c->bytes_left == 0) {
+                if (c->state == FLV_PARSE_TAG_DATA) {
+                    c->state = FLV_PARSE_PREV_SIZE;
+                    c->bytes_left = 4;
+                } else {
+                    /* After header or prev_size, expect tag header */
+                    c->state = FLV_PARSE_TAG_HEADER;
+                    c->tag_hdr_pos = 0;
+                }
+            }
+            break;
+        }
+        case FLV_PARSE_TAG_HEADER: {
+            /* Collect 11-byte tag header */
+            int need = 11 - c->tag_hdr_pos;
+            int avail = len - i;
+            if (avail > need) avail = need;
+            memcpy(c->tag_hdr + c->tag_hdr_pos, buf + i, avail);
+            c->tag_hdr_pos += avail;
+            i += avail;
+            if (c->tag_hdr_pos == 11) {
+                /* Tag type is first byte: 0x09 = video */
+                if (c->tag_hdr[0] == 0x09)
+                    c->video_frames++;
+                /* Data size is bytes 1-3 (big-endian) */
+                uint32_t data_size = ((uint32_t)c->tag_hdr[1] << 16) |
+                                     ((uint32_t)c->tag_hdr[2] << 8) |
+                                     (uint32_t)c->tag_hdr[3];
+                c->state = FLV_PARSE_TAG_DATA;
+                c->bytes_left = (int)data_size;
+                if (c->bytes_left == 0) {
+                    c->state = FLV_PARSE_PREV_SIZE;
+                    c->bytes_left = 4;
+                }
+            }
+            break;
+        }
+        }
+    }
+
+    /* Compute FPS every 2 seconds */
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    double elapsed = (now.tv_sec - c->last_time.tv_sec) +
+                     (now.tv_nsec - c->last_time.tv_nsec) / 1e9;
+    if (elapsed >= 2.0) {
+        g_flv_proxy_fps = (float)(c->video_frames / elapsed);
+        c->video_frames = 0;
+        c->last_time = now;
+    }
+}
 
 void http_set_control_port(int port) {
     g_control_port = (port > 0) ? port : HTTP_CONTROL_PORT;
@@ -207,6 +302,11 @@ static void http_server_accept(HttpServer *srv) {
     int opt = 1;
     setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
 
+    /* Send buffer sized for streaming frames (~155KB).
+     * Kernel doubles this to 512KB effective. */
+    int sndbuf = 256 * 1024;
+    setsockopt(client_fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+
     HttpClient *client = &srv->clients[slot];
     memset(client, 0, sizeof(*client));
     client->fd = client_fd;
@@ -278,6 +378,26 @@ static int http_send(int fd, const void *data, size_t len) {
             return -1;
         }
         sent += n;
+    }
+    return 0;
+}
+
+/* Blocking streaming send via writev.
+ * Returns: 0=sent, -1=error (close client) */
+static int streaming_sendv(int fd, struct iovec *iov, int iovcnt) {
+    while (iovcnt > 0) {
+        ssize_t n = writev(fd, iov, iovcnt);
+        if (n < 0)
+            return -1;
+        while (iovcnt > 0 && (size_t)n >= iov->iov_len) {
+            n -= iov->iov_len;
+            iov++;
+            iovcnt--;
+        }
+        if (iovcnt > 0 && n > 0) {
+            iov->iov_base = (char *)iov->iov_base + n;
+            iov->iov_len -= n;
+        }
     }
     return 0;
 }
@@ -644,6 +764,7 @@ static void http_handle_client_read(HttpServer *srv, HttpClient *client) {
                         pthread_attr_init(&attr);
                         pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
                         if (pthread_create(&pt, &attr, flv_proxy_thread, pa) == 0) {
+                            pthread_setname_np(pt, "flv_proxy");
                             /* fd ownership transferred to proxy thread */
                             client->fd = -1;
                             client->state = CLIENT_STATE_CLOSING;
@@ -719,56 +840,72 @@ static void http_close_client(HttpServer *srv, int slot) {
  * MJPEG Server Thread
  * ============================================================================ */
 
+/* Check for new connections and requests (non-blocking, returns immediately) */
+static void mjpeg_check_connections(HttpServer *srv) {
+    fd_set read_fds;
+    FD_ZERO(&read_fds);
+    FD_SET(srv->listen_fd, &read_fds);
+    int max_fd = srv->listen_fd;
+
+    for (int i = 0; i < HTTP_MAX_CLIENTS; i++) {
+        if (srv->clients[i].fd > 0 && srv->clients[i].state == CLIENT_STATE_IDLE) {
+            FD_SET(srv->clients[i].fd, &read_fds);
+            if (srv->clients[i].fd > max_fd) max_fd = srv->clients[i].fd;
+        }
+    }
+
+    struct timeval tv = { .tv_sec = 0, .tv_usec = 0 };  /* immediate return */
+    int ret = select(max_fd + 1, &read_fds, NULL, NULL, &tv);
+    if (ret <= 0) return;
+
+    if (FD_ISSET(srv->listen_fd, &read_fds))
+        http_server_accept(srv);
+
+    for (int i = 0; i < HTTP_MAX_CLIENTS; i++) {
+        if (srv->clients[i].fd > 0 && FD_ISSET(srv->clients[i].fd, &read_fds))
+            http_handle_client_read(srv, &srv->clients[i]);
+    }
+}
+
+/* Switch streaming client to blocking mode with send timeout.
+ * Disable TCP_NODELAY (enable Nagle) for streaming — with TCP_CORK
+ * per frame, the kernel batches segments optimally. */
+static void make_streaming_socket(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0)
+        fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
+
+    struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    /* Disable TCP_NODELAY for streaming (was set in accept for request parsing).
+     * With TCP_CORK per frame, this lets the kernel batch optimally. */
+    int off = 0;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &off, sizeof(off));
+}
+
 static void *mjpeg_server_thread(void *arg) {
     MjpegServerThread *st = (MjpegServerThread *)arg;
     HttpServer *srv = &st->server;
 
-    uint8_t *jpeg_buf = malloc(FRAME_BUFFER_MAX_JPEG);
+    uint8_t *camera_buf = malloc(FRAME_BUFFER_MAX_JPEG);
     uint8_t *display_buf = malloc(FRAME_BUFFER_MAX_DISPLAY);
     char header_buf[256];
 
+    uint64_t last_camera_seq = 0;
+    uint64_t last_display_seq = 0;
+
     while (st->running && srv->running) {
-#ifdef ENCODER_TIMING
         HTTP_TIMING_START(total_iter);
-#endif
-        fd_set read_fds;
-        FD_ZERO(&read_fds);
-        FD_SET(srv->listen_fd, &read_fds);
 
-        int max_fd = srv->listen_fd;
-
-        for (int i = 0; i < HTTP_MAX_CLIENTS; i++) {
-            if (srv->clients[i].fd > 0 && srv->clients[i].state == CLIENT_STATE_IDLE) {
-                FD_SET(srv->clients[i].fd, &read_fds);
-                if (srv->clients[i].fd > max_fd) {
-                    max_fd = srv->clients[i].fd;
-                }
-            }
-        }
-
+        /* 1. Check for new connections and client requests (non-blocking) */
         HTTP_TIMING_START(select_time);
-        struct timeval tv = { .tv_sec = 0, .tv_usec = 50000 };  /* 50ms timeout */
-        int ret = select(max_fd + 1, &read_fds, NULL, NULL, &tv);
+        mjpeg_check_connections(srv);
         HTTP_TIMING_END(&g_mjpeg_timing, select_time);
 
-        if (ret > 0) {
-            /* Check for new connections */
-            if (FD_ISSET(srv->listen_fd, &read_fds)) {
-                http_server_accept(srv);
-            }
-
-            /* Check for client requests */
-            for (int i = 0; i < HTTP_MAX_CLIENTS; i++) {
-                if (srv->clients[i].fd > 0 && FD_ISSET(srv->clients[i].fd, &read_fds)) {
-                    http_handle_client_read(srv, &srv->clients[i]);
-                }
-            }
-        }
-
-        /* Stream frames to connected clients */
-        uint64_t camera_seq = frame_buffer_get_sequence(&g_jpeg_buffer);
-        uint64_t display_seq = frame_buffer_get_sequence(&g_display_buffer);
-
+        /* Count streaming clients and switch new ones to blocking mode */
+        int has_camera_clients = 0;
+        int has_display_clients = 0;
         uint64_t now = get_time_us();
 
         for (int i = 0; i < HTTP_MAX_CLIENTS; i++) {
@@ -779,9 +916,9 @@ static void *mjpeg_server_thread(void *arg) {
                 continue;
             }
 
-            /* Close idle connections that haven't sent a request */
+            /* Close idle connections */
             if (client->fd > 0 && client->state == CLIENT_STATE_IDLE) {
-                uint64_t idle_time = (now - client->connect_time) / 1000000;  /* seconds */
+                uint64_t idle_time = (now - client->connect_time) / 1000000;
                 if (idle_time >= HTTP_IDLE_TIMEOUT_SEC) {
                     log_info("HTTP[%d]: Closing idle connection (slot %d, %llu sec)\n",
                              srv->port, i, (unsigned long long)idle_time);
@@ -791,66 +928,140 @@ static void *mjpeg_server_thread(void *arg) {
             }
 
             if (client->fd > 0 && client->state == CLIENT_STATE_STREAMING) {
-                FrameBuffer *buffer = NULL;
-                uint8_t *buf = NULL;
-                size_t buf_size = 0;
-                uint64_t current_seq = 0;
+                if (client->request == REQUEST_MJPEG_STREAM)
+                    has_camera_clients = 1;
+                else if (client->request == REQUEST_DISPLAY_STREAM)
+                    has_display_clients = 1;
 
-                /* Select source buffer based on request type */
-                if (client->request == REQUEST_MJPEG_STREAM) {
-                    buffer = &g_jpeg_buffer;
-                    buf = jpeg_buf;
-                    buf_size = FRAME_BUFFER_MAX_JPEG;
-                    current_seq = camera_seq;
-                } else if (client->request == REQUEST_DISPLAY_STREAM) {
-                    buffer = &g_display_buffer;
-                    buf = display_buf;
-                    buf_size = FRAME_BUFFER_MAX_DISPLAY;
-                    current_seq = display_seq;
-                }
-
-                if (buffer && buf && current_seq > client->last_frame_seq) {
-                    /* Warmup pacing: add delays during initial connection
-                     * to spread CPU load and prevent spikes that could affect printing */
-                    if (client->frames_sent < CLIENT_WARMUP_FRAMES) {
-                        usleep(CLIENT_WARMUP_DELAY_MS * 1000);
-                    }
-
-                    uint64_t seq;
-                    HTTP_TIMING_START(fb_copy_time);
-                    size_t jpeg_size = frame_buffer_copy(buffer, buf, buf_size, &seq, NULL, NULL);
-                    HTTP_TIMING_END(&g_mjpeg_timing, fb_copy_time);
-
-                    if (jpeg_size > 0) {
-                        /* Send multipart frame */
-                        int hlen = snprintf(header_buf, sizeof(header_buf),
-                            "--%s\r\nContent-Type: image/jpeg\r\nContent-Length: %zu\r\n\r\n",
-                            MJPEG_BOUNDARY, jpeg_size);
-
-                        HTTP_TIMING_START(net_send_time);
-                        if (http_send(client->fd, header_buf, hlen) < 0 ||
-                            http_send(client->fd, buf, jpeg_size) < 0 ||
-                            http_send(client->fd, "\r\n", 2) < 0) {
-                            client->state = CLIENT_STATE_CLOSING;
-                        } else {
-                            client->last_frame_seq = seq;
-                            client->frames_sent++;
-                        }
-                        HTTP_TIMING_END(&g_mjpeg_timing, net_send_time);
-                    }
+                /* Switch new streaming clients to blocking mode (once) */
+                if (client->frames_sent == 0 && client->header_sent) {
+                    make_streaming_socket(client->fd);
                 }
             }
         }
 
-#ifdef ENCODER_TIMING
+        /* 2. Wait for new frame using condvar (efficient sleep, no polling) */
+        if (has_camera_clients || has_display_clients) {
+            /* Wait on camera buffer (most frequent source).
+             * Short timeout to also check display frames and new connections. */
+            HTTP_TIMING_START(fb_copy_time);
+            frame_buffer_wait(&g_jpeg_buffer, last_camera_seq, 100);
+            HTTP_TIMING_END(&g_mjpeg_timing, fb_copy_time);
+        } else {
+            /* No streaming clients — sleep longer */
+            usleep(500000);
+            continue;
+        }
+
+        /* 3. Send camera frames to all MJPEG clients (one frame, all clients) */
+        uint64_t camera_seq = frame_buffer_get_sequence(&g_jpeg_buffer);
+        if (has_camera_clients && camera_seq > last_camera_seq) {
+            /* Copy frame to local buffer — safe from overwrites if writev blocks */
+            uint64_t seq;
+            size_t jpeg_size = frame_buffer_copy(&g_jpeg_buffer, camera_buf,
+                                                  FRAME_BUFFER_MAX_JPEG, &seq, NULL, NULL);
+
+            if (jpeg_size > 0) {
+                /* Build MJPEG multipart header ONCE for all clients */
+                int hlen = snprintf(header_buf, sizeof(header_buf),
+                    "--%s\r\nContent-Type: image/jpeg\r\nContent-Length: %zu\r\n\r\n",
+                    MJPEG_BOUNDARY, jpeg_size);
+
+                /* Send to every camera streaming client */
+                for (int i = 0; i < HTTP_MAX_CLIENTS; i++) {
+                    HttpClient *client = &srv->clients[i];
+                    if (client->fd <= 0 || client->state != CLIENT_STATE_STREAMING)
+                        continue;
+                    if (client->request != REQUEST_MJPEG_STREAM)
+                        continue;
+                    if (seq <= client->last_frame_seq)
+                        continue;
+
+                    /* Warmup pacing */
+                    if (client->frames_sent < CLIENT_WARMUP_FRAMES)
+                        usleep(CLIENT_WARMUP_DELAY_MS * 1000);
+
+                    HTTP_TIMING_START(net_send_time);
+
+                    /* Cork → writev → uncork: batch into full MSS segments */
+                    int cork = 1;
+                    setsockopt(client->fd, IPPROTO_TCP, TCP_CORK, &cork, sizeof(cork));
+
+                    struct iovec iov[3] = {
+                        { .iov_base = header_buf, .iov_len = hlen },
+                        { .iov_base = (void *)camera_buf, .iov_len = jpeg_size },
+                        { .iov_base = (void *)"\r\n", .iov_len = 2 }
+                    };
+                    if (streaming_sendv(client->fd, iov, 3) < 0) {
+                        client->state = CLIENT_STATE_CLOSING;
+                    } else {
+                        client->last_frame_seq = seq;
+                        client->frames_sent++;
+                    }
+
+                    cork = 0;
+                    setsockopt(client->fd, IPPROTO_TCP, TCP_CORK, &cork, sizeof(cork));
+
+                    HTTP_TIMING_END(&g_mjpeg_timing, net_send_time);
+                }
+                last_camera_seq = seq;
+            }
+        }
+
+        /* 4. Send display frames to display streaming clients */
+        uint64_t display_seq = frame_buffer_get_sequence(&g_display_buffer);
+        if (has_display_clients && display_seq > last_display_seq) {
+            uint64_t seq;
+            size_t jpeg_size = frame_buffer_copy(&g_display_buffer, display_buf,
+                                                  FRAME_BUFFER_MAX_DISPLAY, &seq, NULL, NULL);
+            if (jpeg_size > 0) {
+                int hlen = snprintf(header_buf, sizeof(header_buf),
+                    "--%s\r\nContent-Type: image/jpeg\r\nContent-Length: %zu\r\n\r\n",
+                    MJPEG_BOUNDARY, jpeg_size);
+
+                for (int i = 0; i < HTTP_MAX_CLIENTS; i++) {
+                    HttpClient *client = &srv->clients[i];
+                    if (client->fd <= 0 || client->state != CLIENT_STATE_STREAMING)
+                        continue;
+                    if (client->request != REQUEST_DISPLAY_STREAM)
+                        continue;
+                    if (seq <= client->last_frame_seq)
+                        continue;
+
+                    if (client->frames_sent < CLIENT_WARMUP_FRAMES)
+                        usleep(CLIENT_WARMUP_DELAY_MS * 1000);
+
+                    int cork = 1;
+                    setsockopt(client->fd, IPPROTO_TCP, TCP_CORK, &cork, sizeof(cork));
+
+                    struct iovec iov[3] = {
+                        { .iov_base = header_buf, .iov_len = hlen },
+                        { .iov_base = (void *)display_buf, .iov_len = jpeg_size },
+                        { .iov_base = (void *)"\r\n", .iov_len = 2 }
+                    };
+                    if (streaming_sendv(client->fd, iov, 3) < 0) {
+                        client->state = CLIENT_STATE_CLOSING;
+                    } else {
+                        client->last_frame_seq = seq;
+                        client->frames_sent++;
+                    }
+
+                    cork = 0;
+                    setsockopt(client->fd, IPPROTO_TCP, TCP_CORK, &cork, sizeof(cork));
+                }
+                last_display_seq = seq;
+            }
+        }
+
         HTTP_TIMING_END(&g_mjpeg_timing, total_iter);
+#ifdef ENCODER_TIMING
         g_mjpeg_timing.count++;
-        HTTP_TIMING_LOG("MJPEG", &g_mjpeg_timing);
 #endif
+        HTTP_TIMING_LOG("MJPEG", &g_mjpeg_timing);
     }
 
+    free(camera_buf);
     free(display_buf);
-    free(jpeg_buf);
     return NULL;
 }
 
@@ -873,6 +1084,7 @@ int mjpeg_server_start(int port) {
         http_server_cleanup(&g_mjpeg_server.server);
         return -1;
     }
+    pthread_setname_np(g_mjpeg_server.thread, "http_mjpeg");
 
     return 0;
 }
@@ -918,6 +1130,7 @@ static void *flv_server_thread(void *arg) {
         FD_SET(srv->listen_fd, &read_fds);
 
         int max_fd = srv->listen_fd;
+        int has_streaming = 0;
 
         for (int i = 0; i < HTTP_MAX_CLIENTS; i++) {
             if (srv->clients[i].fd > 0 && srv->clients[i].state == CLIENT_STATE_IDLE) {
@@ -926,10 +1139,16 @@ static void *flv_server_thread(void *arg) {
                     max_fd = srv->clients[i].fd;
                 }
             }
+            if (srv->clients[i].fd > 0 && srv->clients[i].state == CLIENT_STATE_STREAMING) {
+                has_streaming = 1;
+            }
         }
 
+        /* Short timeout when streaming, longer when idle */
         HTTP_TIMING_START(select_time);
-        struct timeval tv = { .tv_sec = 0, .tv_usec = 50000 };
+        struct timeval tv = has_streaming
+            ? (struct timeval){ .tv_sec = 0, .tv_usec = 50000 }   /* 50ms */
+            : (struct timeval){ .tv_sec = 0, .tv_usec = 500000 }; /* 500ms */
         int ret = select(max_fd + 1, &read_fds, NULL, NULL, &tv);
         HTTP_TIMING_END(&g_flv_timing, select_time);
 
@@ -1066,6 +1285,7 @@ int flv_server_start(int width, int height, int fps) {
         http_server_cleanup(&g_flv_server.server);
         return -1;
     }
+    pthread_setname_np(g_flv_server.thread, "http_flv");
 
     return 0;
 }
@@ -1103,6 +1323,10 @@ int flv_proxy_is_active(void) {
     int active = g_flv_proxy_url[0] != '\0';
     pthread_mutex_unlock(&g_flv_proxy_lock);
     return active;
+}
+
+float flv_proxy_get_fps(void) {
+    return g_flv_proxy_fps;
 }
 
 /* Parse "http://host:port/path" into components */
@@ -1225,11 +1449,19 @@ static void *flv_proxy_thread(void *arg) {
 
     fprintf(stderr, "FLV proxy: relaying from %s\n", url);
 
-    /* Transparent byte relay */
+    /* FLV tag counter for FPS tracking */
+    FlvTagCounter flv_counter;
+    flv_counter_init(&flv_counter);
+
+    /* Transparent byte relay with FLV tag counting */
     char buf[8192];
     while (g_flv_server.running) {
         ssize_t n = recv(upstream, buf, sizeof(buf), 0);
         if (n <= 0) break;
+
+        /* Count FLV video tags for FPS tracking */
+        flv_count_tags(&flv_counter, (const uint8_t *)buf, (int)n);
+
         ssize_t sent = 0;
         while (sent < n) {
             ssize_t w = send(client_fd, buf + sent, n - sent, MSG_NOSIGNAL);
@@ -1246,6 +1478,7 @@ static void *flv_proxy_thread(void *arg) {
 
 proxy_done:
     fprintf(stderr, "FLV proxy: client disconnected\n");
+    g_flv_proxy_fps = 0.0f;
     close(upstream);
     close(client_fd);
     return NULL;

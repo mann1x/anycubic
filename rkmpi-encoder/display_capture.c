@@ -3,6 +3,7 @@
  * Uses RGA for hardware color conversion/rotation + VENC for JPEG encoding
  */
 
+#define _GNU_SOURCE
 #include "display_capture.h"
 #include "frame_buffer.h"
 #include <stdio.h>
@@ -1126,6 +1127,7 @@ int display_capture_start(int fps) {
         g_display_running = 0;
         return -1;
     }
+    pthread_setname_np(g_display_thread, "display");
 
     log_info("Display capture ready (disabled, %d fps target, waiting for clients)\n", g_display_target_fps);
     return 0;

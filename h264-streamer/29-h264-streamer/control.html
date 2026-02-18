@@ -223,16 +223,16 @@
             </div>
             <div style="margin-top:10px;display:flex;justify-content:space-between;align-items:center;">
                 <div style="display:flex;gap:5px;">
-                    <button onclick="window.open(streamBase + '/stream', '_blank')" class="secondary" style="padding:5px 12px;font-size:12px;">Open MJPEG</button>
-                    <button onclick="window.open(streamBase + '/snapshot', '_blank')" class="secondary" style="padding:5px 12px;font-size:12px;">Open Snapshot</button>
+                    <button onclick="window.open(mjpegUrl, '_blank')" class="secondary" style="padding:5px 12px;font-size:12px;">Open MJPEG</button>
+                    <button onclick="window.open(snapshotUrl, '_blank')" class="secondary" style="padding:5px 12px;font-size:12px;">Open Snapshot</button>
                     <button onclick="openFlvFullscreen()" class="secondary" style="padding:5px 12px;font-size:12px;">Open FLV</button>
                     <button onclick="window.open(streamBase + '/display', '_blank')" class="secondary" style="padding:5px 12px;font-size:12px;">Open Display</button>
                     <button onclick="window.open('/timelapse', 'timelapse_' + location.hostname.replace(/\./g, '_'), 'width=900,height=700')" class="secondary" style="padding:5px 12px;font-size:12px;">Time Lapse</button>
                 </div>
                 <div style="display:flex;gap:5px;align-items:center;">
                     <span style="color:#888;font-size:12px;margin-right:5px;">LED:</span>
-                    <button onclick="controlLed(true)" style="padding:5px 12px;font-size:12px;">On</button>
-                    <button onclick="controlLed(false)" class="secondary" style="padding:5px 12px;font-size:12px;">Off</button>
+                    <button id="led-on-btn" onclick="controlLed(true)" style="padding:5px 12px;font-size:12px;">On</button>
+                    <button id="led-off-btn" onclick="controlLed(false)" class="secondary" style="padding:5px 12px;font-size:12px;">Off</button>
                 </div>
             </div>
         </div>
@@ -619,30 +619,6 @@
                 </div>
                 <div class="setting timelapse-setting" style="display:none; border-top: 1px solid #444; padding-top: 15px; margin-top: 15px;">
                     <div class="setting-row">
-                        <span class="label">Moonraker Host:</span>
-                        <div class="control">
-                            <input type="text" name="moonraker_host" value="$moonraker_host" style="width:120px;padding:8px;border-radius:4px;border:1px solid #555;background:#333;color:#fff;">
-                        </div>
-                    </div>
-                </div>
-                <div class="setting timelapse-setting" style="display:none;">
-                    <div class="setting-row">
-                        <span class="label">Moonraker Port:</span>
-                        <div class="control">
-                            <input type="number" name="moonraker_port" value="$moonraker_port" min="1" max="65535" style="width:80px;">
-                        </div>
-                    </div>
-                </div>
-                <div class="setting timelapse-setting" style="display:none;">
-                    <div class="setting-row">
-                        <span class="label">Connection Status:</span>
-                        <div class="control">
-                            <span id="moonraker_status" style="color:#888;">Not connected</span>
-                        </div>
-                    </div>
-                </div>
-                <div class="setting timelapse-setting" style="display:none; border-top: 1px solid #444; padding-top: 15px; margin-top: 15px;">
-                    <div class="setting-row">
                         <span class="label">Output FPS:</span>
                         <div class="control">
                             <input type="number" name="timelapse_output_fps" value="$timelapse_output_fps" min="1" max="120" style="width:60px;">
@@ -750,8 +726,47 @@
         </div>
 
         <div class="section">
-            <h2>Moonraker Camera Settings</h2>
-            <p style="color:#888;font-size:12px;margin-bottom:15px;">Configure which cameras are provisioned to Moonraker for the dashboard and web UI.</p>
+            <h2>Moonraker Settings</h2>
+            <p style="color:#888;font-size:12px;margin-bottom:15px;">Moonraker connection and camera provisioning for the dashboard and web UI.</p>
+            <div style="padding: 0 12%;">
+                <div class="setting">
+                    <div class="setting-row">
+                        <span class="label">Moonraker Host:</span>
+                        <div class="control">
+                            <input type="text" id="mr-settings-host" value="$moonraker_host" style="width:120px;padding:8px;border-radius:4px;border:1px solid #555;background:#333;color:#fff;">
+                        </div>
+                    </div>
+                </div>
+                <div class="setting">
+                    <div class="setting-row">
+                        <span class="label">Moonraker Port:</span>
+                        <div class="control">
+                            <input type="number" id="mr-settings-port" value="$moonraker_port" min="1" max="65535" style="width:80px;">
+                        </div>
+                    </div>
+                </div>
+                <div class="setting">
+                    <div class="setting-row">
+                        <span class="label">Connection Status:</span>
+                        <div class="control">
+                            <span id="moonraker_status" style="color:#888;">Not connected</span>
+                        </div>
+                    </div>
+                </div>
+                <div class="setting">
+                    <div class="setting-row">
+                        <span class="label">Camera IP:</span>
+                        <div class="control">
+                            <select id="mr-settings-camera-ip" style="padding:8px;border-radius:4px;border:1px solid #555;background:#333;color:#fff;">
+                                <option value="auto">Auto</option>
+                                <option value="localhost">Localhost (127.0.0.1)</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="setting-note">IP used in Moonraker camera URLs. Auto = localhost when Moonraker is local, otherwise printer's IP.</div>
+                </div>
+            </div>
+            <hr style="border-color:#444;margin:15px 0;">
             <div id="moonraker-cameras-list">
                 <!-- Populated by JavaScript -->
                 <div style="color:#888;font-size:12px;">Loading cameras...</div>
@@ -1020,6 +1035,13 @@
 
             // Refresh preview with new camera
             refreshPreview();
+
+            // Reload camera controls if panel is expanded
+            if (cameraControlsExpanded) {
+                loadCameraControls();
+            } else {
+                cameraControlsLoaded = false;
+            }
         }
 
         function toggleCameraEnabled(id, enabled) {
@@ -1096,7 +1118,12 @@
             statusEl.textContent = 'Applying...';
             statusEl.style.color = '#888';
 
-            // Gather settings from form
+            // Gather connection settings
+            const hostEl = document.getElementById('mr-settings-host');
+            const portEl = document.getElementById('mr-settings-port');
+            const camIpEl = document.getElementById('mr-settings-camera-ip');
+
+            // Gather camera settings from form
             const settings = {};
             let defaultCamId = null;
 
@@ -1120,10 +1147,17 @@
                 if (input.checked) defaultCamId = input.value;
             });
 
+            const payload = {
+                settings: settings,
+                moonraker_host: hostEl ? hostEl.value.trim() || '127.0.0.1' : '127.0.0.1',
+                moonraker_port: portEl ? portEl.value || '7125' : '7125',
+                moonraker_camera_ip: camIpEl ? camIpEl.value : 'auto'
+            };
+
             fetch('/api/moonraker/cameras', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({settings: settings})
+                body: JSON.stringify(payload)
             })
             .then(r => r.json())
             .then(data => {
@@ -1131,7 +1165,7 @@
                     statusEl.textContent = 'Settings applied!';
                     statusEl.style.color = '#4CAF50';
                     moonrakerCameraSettings = settings;
-                    setTimeout(() => { statusEl.textContent = ''; }, 3000);
+                    setTimeout(() => { statusEl.textContent = ''; checkMoonrakerStatus(); }, 2000);
                 } else {
                     statusEl.textContent = 'Error: ' + (data.error || 'Unknown error');
                     statusEl.style.color = '#f44';
@@ -1143,10 +1177,40 @@
             });
         }
 
+        // Load network interfaces for Camera IP select
+        function loadNetworkInterfaces() {
+            fetch('/api/network/interfaces')
+                .then(r => r.json())
+                .then(data => {
+                    const select = document.getElementById('mr-settings-camera-ip');
+                    if (!select) return;
+                    const currentVal = data.moonraker_camera_ip || 'auto';
+                    // Clear dynamic options (keep Auto and Localhost)
+                    while (select.options.length > 2) select.remove(2);
+                    // Add interface options
+                    if (data.eth0) {
+                        const opt = document.createElement('option');
+                        opt.value = 'eth0';
+                        opt.textContent = 'eth0 (' + data.eth0 + ')';
+                        select.appendChild(opt);
+                    }
+                    if (data.eth1) {
+                        const opt = document.createElement('option');
+                        opt.value = 'eth1';
+                        opt.textContent = 'eth1 (' + data.eth1 + ')';
+                        select.appendChild(opt);
+                    }
+                    select.value = currentVal;
+                })
+                .catch(err => console.log('Network interfaces load error:', err));
+        }
+
         // Load moonraker settings when cameras are loaded
         function loadCamerasAndMoonraker() {
             loadCameras();
             loadMoonrakerCameraSettings();
+            loadNetworkInterfaces();
+            checkMoonrakerStatus();
         }
 
         function refreshPreview() {
@@ -1401,12 +1465,32 @@
 
         // LED control
         function controlLed(on) {
+            const btn = document.getElementById(on ? 'led-on-btn' : 'led-off-btn');
             fetch('/api/led/' + (on ? 'on' : 'off'))
                 .then(r => r.json())
                 .then(data => {
-                    console.log('LED:', data);
+                    if (data.status === 'ok') {
+                        if (btn) {
+                            btn.style.background = on ? '#4CAF50' : '#f44336';
+                            setTimeout(() => { btn.style.background = ''; }, 1500);
+                        }
+                    } else {
+                        if (btn) {
+                            btn.style.background = '#f44336';
+                            setTimeout(() => { btn.style.background = ''; }, 1500);
+                        }
+                        if (data.message) console.warn('LED:', data.message);
+                    }
                 })
                 .catch(e => console.error('LED error:', e));
+        }
+
+        function updateLedButtons(mode) {
+            const onBtn = document.getElementById('led-on-btn');
+            const offBtn = document.getElementById('led-off-btn');
+            const isVanilla = mode === 'vanilla-klipper';
+            if (onBtn) { onBtn.disabled = isVanilla; onBtn.title = isVanilla ? 'LED control not available in vanilla-klipper mode' : ''; }
+            if (offBtn) { offBtn.disabled = isVanilla; offBtn.title = isVanilla ? 'LED control not available in vanilla-klipper mode' : ''; }
         }
 
         // Camera controls
@@ -1426,7 +1510,7 @@
         }
 
         function loadCameraControls() {
-            fetch('/api/camera/controls')
+            fetch('/api/camera/controls?camera_id=' + activeCameraId)
                 .then(r => r.json())
                 .then(data => {
                     // Update all sliders and selects with current values
@@ -1684,7 +1768,6 @@ if(flvjs.isSupported()){
                 updateTimelapseModeSettings();
                 updateVariableFpsSettings();
                 checkUsbStatus();
-                checkMoonrakerStatus();
             }
         }
 
@@ -2001,8 +2084,6 @@ if(flvjs.isSupported()){
                 data.append('timelapse_hyperlapse_interval', formData.get('timelapse_hyperlapse_interval') || '30');
                 data.append('timelapse_storage', formData.get('timelapse_storage') || 'internal');
                 data.append('timelapse_usb_path', formData.get('timelapse_usb_path') || '/mnt/udisk/timelapse');
-                data.append('moonraker_host', formData.get('moonraker_host') || '127.0.0.1');
-                data.append('moonraker_port', formData.get('moonraker_port') || '7125');
                 data.append('timelapse_output_fps', formData.get('timelapse_output_fps') || '30');
                 data.append('timelapse_target_length', formData.get('timelapse_target_length') || '10');
                 data.append('timelapse_variable_fps_min', formData.get('timelapse_variable_fps_min') || '5');
@@ -2020,7 +2101,6 @@ if(flvjs.isSupported()){
                     if (data.status === 'ok') {
                         // Refresh status indicators
                         checkUsbStatus();
-                        checkMoonrakerStatus();
                         alert('Timelapse settings saved');
                     } else {
                         alert('Error saving settings: ' + (data.error || 'Unknown error'));
@@ -2039,6 +2119,10 @@ if(flvjs.isSupported()){
             if (proxyCheckbox) {
                 toggleProxySettings(proxyCheckbox.checked);
             }
+            // Check mode to disable LED buttons in vanilla-klipper
+            fetch('/api/config').then(r => r.json()).then(data => {
+                if (data.mode) updateLedButtons(data.mode);
+            }).catch(() => {});
         });
 
         // Snapshot preview is static - click image to refresh (reduces CPU usage)

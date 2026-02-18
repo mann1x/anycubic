@@ -126,4 +126,7 @@ void flv_proxy_set_url(const char *url);
 /* Check if FLV proxy is configured */
 int flv_proxy_is_active(void);
 
+/* Get FLV proxy stream FPS (0 if not active/no data) */
+float flv_proxy_get_fps(void);
+
 #endif /* HTTP_SERVER_H */

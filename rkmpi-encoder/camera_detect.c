@@ -19,6 +19,15 @@
 #define V4L2_BY_PATH_DIR  "/dev/v4l/by-path"
 #define V4L2_BY_ID_DIR    "/dev/v4l/by-id"
 
+/* Safe string copy: copies src into dst of size dst_size, always null-terminates. */
+static inline void safe_strcpy(char *dst, size_t dst_size, const char *src) {
+    if (dst_size == 0) return;
+    size_t len = strlen(src);
+    if (len >= dst_size) len = dst_size - 1;
+    memcpy(dst, src, len);
+    dst[len] = '\0';
+}
+
 /* Multi-camera port allocation: CAM#1=8080, CAM#2=8082, CAM#3=8083, CAM#4=8084 */
 static int camera_port_for_id(int camera_id) {
     if (camera_id == 1) return 8080;
@@ -282,7 +291,7 @@ static void lookup_by_id(const char *device, char *unique_id, size_t id_size) {
         /* Only index0 entries (one per camera) */
         if (!strstr(entry->d_name, "-video-index0")) continue;
 
-        char symlink_path[256];
+        char symlink_path[512];
         snprintf(symlink_path, sizeof(symlink_path), "%s/%s",
                  V4L2_BY_ID_DIR, entry->d_name);
 
@@ -290,7 +299,7 @@ static void lookup_by_id(const char *device, char *unique_id, size_t id_size) {
         if (!realpath(symlink_path, real_path)) continue;
 
         if (strcmp(real_path, device) == 0) {
-            strncpy(unique_id, entry->d_name, id_size - 1);
+            safe_strcpy(unique_id, id_size, entry->d_name);
             break;
         }
     }
@@ -320,7 +329,7 @@ int camera_detect_all(CameraInfo *cameras, int max_cameras,
             continue;
 
         /* Resolve symlink to /dev/videoN */
-        char symlink_path[256];
+        char symlink_path[512];
         snprintf(symlink_path, sizeof(symlink_path), "%s/%s",
                  V4L2_BY_PATH_DIR, entry->d_name);
 
@@ -336,16 +345,16 @@ int camera_detect_all(CameraInfo *cameras, int max_cameras,
         CameraInfo *cam = &cameras[count];
 
         /* Device path */
-        strncpy(cam->device, real_path, sizeof(cam->device) - 1);
+        safe_strcpy(cam->device, sizeof(cam->device), real_path);
 
         /* By-path entry name */
-        strncpy(cam->by_path, entry->d_name, sizeof(cam->by_path) - 1);
+        safe_strcpy(cam->by_path, sizeof(cam->by_path), entry->d_name);
 
         /* Generate unique_id from /dev/v4l/by-id/ (matches Python behavior),
          * fall back to by-path name if by-id not available */
         lookup_by_id(real_path, cam->unique_id, sizeof(cam->unique_id));
         if (!cam->unique_id[0]) {
-            strncpy(cam->unique_id, entry->d_name, sizeof(cam->unique_id) - 1);
+            safe_strcpy(cam->unique_id, sizeof(cam->unique_id), entry->d_name);
         }
 
         /* Parse USB port */

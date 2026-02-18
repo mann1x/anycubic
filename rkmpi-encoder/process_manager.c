@@ -33,12 +33,12 @@ static int build_secondary_args(char **argv, int max_args,
     int argc = 0;
 
     /* Static string buffers for argument values (persist until exec) */
-    static char port_str[8];
-    static char width_str[8];
-    static char height_str[8];
-    static char fps_str[8];
-    static char bitrate_str[8];
-    static char quality_str[8];
+    static char port_str[12];
+    static char width_str[12];
+    static char height_str[12];
+    static char fps_str[12];
+    static char bitrate_str[12];
+    static char quality_str[12];
 
     /* Use per-camera overrides if set, otherwise default 640x480 */
     int width = (proc->override_width > 0) ? proc->override_width : 640;
@@ -155,7 +155,7 @@ int procmgr_start_camera(ManagedProcess *proc, const CameraInfo *cam,
     /* Parent process */
     proc->pid = pid;
     proc->camera_id = cam->camera_id;
-    strncpy(proc->device, cam->device, sizeof(proc->device) - 1);
+    snprintf(proc->device, sizeof(proc->device), "%s", cam->device);
     proc->streaming_port = cam->streaming_port;
     proc->last_start = time(NULL);
     proc->enabled = 1;

@@ -195,6 +195,28 @@ size_t frame_buffer_copy(FrameBuffer *fb, uint8_t *dst, size_t dst_size,
     return copied;
 }
 
+const uint8_t *frame_buffer_ref(FrameBuffer *fb, size_t *size_out,
+                                 uint64_t *sequence_out) {
+    pthread_mutex_lock(&fb->mutex);
+
+    const FrameData *frame = &fb->frames[fb->read_idx];
+
+    if (frame->size == 0) {
+        pthread_mutex_unlock(&fb->mutex);
+        return NULL;
+    }
+
+    if (size_out) *size_out = frame->size;
+    if (sequence_out) *sequence_out = frame->sequence;
+
+    /* Pointer is valid until next write swaps this slot (~50ms at 20fps).
+     * Caller must use the data promptly (within one frame period). */
+    const uint8_t *ptr = frame->data;
+
+    pthread_mutex_unlock(&fb->mutex);
+    return ptr;
+}
+
 uint64_t frame_buffer_get_sequence(FrameBuffer *fb) {
     uint64_t seq;
     pthread_mutex_lock(&fb->mutex);

@@ -171,14 +171,27 @@ echo "  Camera: $CAMERA_DEVICE ${CAM_WIDTH}x${CAM_HEIGHT}" >> "$APP_LOG"
 echo "  Config: $CONFIG_FILE" >> "$APP_LOG"
 echo "  Args: $ENCODER_ARGS $H264_FLAG $DISPLAY_FLAG $DISPLAY_FPS $FLV_FLAG" >> "$APP_LOG"
 
-# shellcheck disable=SC2086  # Intentional word splitting
-"$APP_ROOT/rkmpi_enc" --primary --config "$CONFIG_FILE" \
-    --template-dir "$APP_ROOT" \
-    $ENCODER_ARGS $H264_FLAG $DISPLAY_FLAG $DISPLAY_FPS $FLV_FLAG \
-    -v >> "$APP_LOG" 2>&1 &
-CHILD_PID=$!
-echo $CHILD_PID > "$PID_FILE"
+# Restart loop: re-launch on exit code 75 (restart requested from control page)
+while true; do
+    # shellcheck disable=SC2086  # Intentional word splitting
+    "$APP_ROOT/rkmpi_enc" --primary --config "$CONFIG_FILE" \
+        --template-dir "$APP_ROOT" \
+        $ENCODER_ARGS $H264_FLAG $DISPLAY_FLAG $DISPLAY_FPS $FLV_FLAG \
+        -v >> "$APP_LOG" 2>&1 &
+    CHILD_PID=$!
+    echo $CHILD_PID > "$PID_FILE"
 
-# Wait for child to exit
-wait $CHILD_PID
+    # Wait for child to exit
+    wait $CHILD_PID
+    EXIT_CODE=$?
+
+    if [ "$EXIT_CODE" = "75" ]; then
+        echo "Encoder requested restart, relaunching..." >> "$APP_LOG"
+        sleep 1
+        continue
+    fi
+
+    # Normal exit or signal — stop the loop
+    break
+done
 rm -f "$PID_FILE" 2>/dev/null

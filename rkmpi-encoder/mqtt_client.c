@@ -7,6 +7,7 @@
  * this module provides stub functions that return errors.
  */
 
+#define _GNU_SOURCE
 #include "mqtt_client.h"
 #include "cJSON.h"
 #include <stdio.h>
@@ -733,6 +734,7 @@ int mqtt_client_start(void) {
         mqtt_log("Failed to create thread\n");
         return -1;
     }
+    pthread_setname_np(g_mqtt_client.thread, "mqtt");
 
     mqtt_log("Started (device=%.8s...)\n", g_mqtt_client.creds.device_id);
     return 0;
@@ -751,6 +753,47 @@ int mqtt_is_streaming_paused(void) {
     return g_mqtt_client.streaming_paused;
 }
 
+/* Send LED control via MQTT light topic */
+int mqtt_send_led(int on, int brightness) {
+    MQTTClient *client = &g_mqtt_client;
+
+    if (!client->connected || !client->ssl) {
+        mqtt_log("LED: not connected\n");
+        return -1;
+    }
+
+    /* Build light topic */
+    char topic[256];
+    snprintf(topic, sizeof(topic),
+             "anycubic/anycubicCloud/v1/web/printer/%s/%s/light",
+             client->config.model_id, client->creds.device_id);
+
+    /* Build payload matching ACProxyCam format */
+    char payload[512];
+    snprintf(payload, sizeof(payload),
+             "{\"type\":\"light\",\"action\":\"control\",\"timestamp\":%llu,"
+             "\"msgid\":\"%08x%08x\","
+             "\"data\":{\"type\":2,\"status\":%d,\"brightness\":%d}}",
+             (unsigned long long)get_time_ms(),
+             (unsigned)rand(), (unsigned)rand(),
+             on ? 1 : 0, brightness);
+
+    uint8_t buf[1024];
+    size_t len = mqtt_build_publish(buf, sizeof(buf), topic, payload, 0, 0);
+    if (len == 0) {
+        mqtt_log("LED: publish packet too large\n");
+        return -1;
+    }
+
+    pthread_mutex_lock(&client->mutex);
+    int ret = mqtt_ssl_send(client, buf, len);
+    if (ret == 0) client->last_activity = get_time_ms();
+    pthread_mutex_unlock(&client->mutex);
+
+    mqtt_log("LED: sent %s (brightness=%d)\n", on ? "ON" : "OFF", brightness);
+    return ret;
+}
+
 #else /* !TLS_AVAILABLE */
 
 /* Stub implementations when TLS is not available */
@@ -767,6 +810,11 @@ void mqtt_client_stop(void) {
 
 int mqtt_is_streaming_paused(void) {
     return 0;
+}
+
+int mqtt_send_led(int on, int brightness) {
+    (void)on; (void)brightness;
+    return -1;
 }
 
 #endif /* TLS_AVAILABLE */

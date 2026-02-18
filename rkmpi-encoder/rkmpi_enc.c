@@ -28,6 +28,7 @@
  * Build: make
  */
 
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
@@ -353,6 +354,7 @@ static int client_activity_check(int mjpeg_clients, int flv_clients, int server_
 
 /* Global state */
 static volatile sig_atomic_t g_running = 1;
+static volatile sig_atomic_t g_restart_requested = 0;
 static volatile int g_snapshot_pending = 0;  /* HTTP snapshot requested */
 static pthread_mutex_t g_state_mutex = PTHREAD_MUTEX_INITIALIZER;
 
@@ -1731,7 +1733,34 @@ static AppConfig *g_app_config_ptr = NULL;  /* Set in main() */
  * Config-changed callback: handle timelapse/moonraker setting changes.
  * Called from control server thread when settings are saved.
  */
+static void on_restart_requested(void) {
+    log_info("Restart requested from control server\n");
+    g_restart_requested = 1;
+    g_running = 0;
+}
+
 static void on_config_changed(AppConfig *cfg) {
+    /* Update H.264 encoding state based on config */
+    int new_h264 = cfg->acproxycam_flv_proxy ? 0 : cfg->h264_enabled;
+    if (new_h264 != g_ctrl.h264_enabled) {
+        g_ctrl.h264_enabled = new_h264;
+        log_info("Config: H.264 encoding %s%s\n",
+                 new_h264 ? "enabled" : "disabled",
+                 cfg->acproxycam_flv_proxy ? " (FLV proxy active)" : "");
+    }
+
+    /* Update display capture settings */
+    display_set_enabled(cfg->display_enabled);
+    if (cfg->display_fps > 0)
+        display_set_fps(cfg->display_fps);
+
+    /* Update auto-skip settings */
+    g_ctrl.auto_skip = cfg->auto_skip;
+    g_ctrl.target_cpu = cfg->target_cpu;
+    if (!cfg->auto_skip && cfg->skip_ratio >= 1) {
+        g_ctrl.skip_ratio = cfg->skip_ratio;
+    }
+
     /* Check if moonraker client needs start/stop/restart */
     int should_run = cfg->timelapse_enabled;
     int is_running = g_moonraker_initialized;
@@ -1887,8 +1916,8 @@ int main(int argc, char *argv[]) {
     }
 
     /* Copy file paths to globals (used by read_cmd_file/write_ctrl_file) */
-    strncpy(g_cmd_file, cfg.cmd_file, sizeof(g_cmd_file) - 1);
-    strncpy(g_ctrl_file, cfg.ctrl_file, sizeof(g_ctrl_file) - 1);
+    snprintf(g_cmd_file, sizeof(g_cmd_file), "%s", cfg.cmd_file);
+    snprintf(g_ctrl_file, sizeof(g_ctrl_file), "%s", cfg.ctrl_file);
 
     /* If no-stdout is set, disable stdout output */
     if (cfg.no_stdout) {
@@ -1999,8 +2028,7 @@ int main(int argc, char *argv[]) {
         }
 
         /* Store config path for later saves */
-        strncpy(app_config.config_file, config_path,
-                sizeof(app_config.config_file) - 1);
+        snprintf(app_config.config_file, sizeof(app_config.config_file), "%s", config_path);
 
         /* Override config with CLI args where provided */
         if (cfg.streaming_port > 0)
@@ -2068,7 +2096,7 @@ int main(int argc, char *argv[]) {
 
             /* Set config-changed callback */
             control_server_set_config_callback(on_config_changed);
-            control_server_set_restart_callback(NULL);  /* TODO: implement */
+            control_server_set_restart_callback(on_restart_requested);
         } else {
             log_error("Primary: failed to start control server\n");
         }
@@ -2431,6 +2459,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    pthread_setname_np(pthread_self(), "capture");
     log_info("Starting capture loop...\n");
     if (cfg.mjpeg_stdout) {
         log_info("  MJPEG: stdout (multipart)\n");
@@ -3116,6 +3145,10 @@ skip_jpeg_output:
     unlink(g_ctrl_file);
     unlink(g_cmd_file);
 
+    if (g_restart_requested) {
+        log_info("Streamer restarting (exit code 75)...\n");
+        return 75;
+    }
     log_info("Streamer stopped\n");
     return 0;
 }

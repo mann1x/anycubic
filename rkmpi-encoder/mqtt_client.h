@@ -68,4 +68,8 @@ void mqtt_client_stop(void);
 /* Check if streaming is paused (stopCapture received) */
 int mqtt_is_streaming_paused(void);
 
+/* Send LED on/off command via MQTT light topic.
+ * Returns 0 on success, -1 if not connected/MQTT disabled. */
+int mqtt_send_led(int on, int brightness);
+
 #endif /* MQTT_CLIENT_H */

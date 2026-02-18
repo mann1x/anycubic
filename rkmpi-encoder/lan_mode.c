@@ -242,8 +242,8 @@ int wifi_fix_route_priority(void) {
 
     /* Parse routes - look for wlan0 with metric 0 */
     int needs_fix = 0;
-    char wlan_gw[32] = {0};
-    char subnet[32];
+    char wlan_gw[48] = {0};
+    char subnet[48];
     snprintf(subnet, sizeof(subnet), "%s.0", wlan_prefix);
 
     char *line = route_output;
@@ -261,7 +261,7 @@ int wifi_fix_route_priority(void) {
                     needs_fix = 1;
                 }
                 if (strcmp(dest, "0.0.0.0") == 0 && metric == 0) {
-                    strncpy(wlan_gw, gw, sizeof(wlan_gw) - 1);
+                    snprintf(wlan_gw, sizeof(wlan_gw), "%s", gw);
                 }
             }
         }

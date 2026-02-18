@@ -127,6 +127,7 @@ void config_set_defaults(AppConfig *cfg) {
     cfg->timelapse_end_delay = 5.0f;
     strncpy(cfg->moonraker_host, "127.0.0.1", sizeof(cfg->moonraker_host) - 1);
     cfg->moonraker_port = 7125;
+    strncpy(cfg->moonraker_camera_ip, "auto", sizeof(cfg->moonraker_camera_ip) - 1);
 
     /* Camera controls */
     cfg->cam_brightness = 0;
@@ -269,6 +270,8 @@ int config_load(AppConfig *cfg, const char *path) {
     strncpy(cfg->moonraker_host, mr_host, sizeof(cfg->moonraker_host) - 1);
     cfg->moonraker_port = clamp_int(
         json_get_int(root, "moonraker_port", cfg->moonraker_port), 1, 65535);
+    const char *mr_cam_ip = json_get_str(root, "moonraker_camera_ip", cfg->moonraker_camera_ip);
+    strncpy(cfg->moonraker_camera_ip, mr_cam_ip, sizeof(cfg->moonraker_camera_ip) - 1);
 
     /* Per-camera settings: preserve as raw JSON string */
     const cJSON *cameras = cJSON_GetObjectItemCaseSensitive(root, "cameras");
@@ -387,6 +390,7 @@ int config_save(const AppConfig *cfg, const char *path) {
     json_set_str(root, "timelapse_usb_path", cfg->timelapse_usb_path);
     json_set_str(root, "moonraker_host", cfg->moonraker_host);
     json_set_int(root, "moonraker_port", cfg->moonraker_port);
+    json_set_str(root, "moonraker_camera_ip", cfg->moonraker_camera_ip);
     json_set_int(root, "timelapse_output_fps", cfg->timelapse_output_fps);
     json_set_bool(root, "timelapse_variable_fps", cfg->timelapse_variable_fps);
     json_set_int(root, "timelapse_target_length", cfg->timelapse_target_length);

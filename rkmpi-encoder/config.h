@@ -85,6 +85,7 @@ typedef struct {
     float timelapse_end_delay;
     char moonraker_host[64];
     int moonraker_port;
+    char moonraker_camera_ip[16];   /* "auto", "localhost", "eth0", "eth1" */
 
     /* Primary camera controls (CAM#1) */
     int cam_brightness;

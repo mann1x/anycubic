@@ -5,6 +5,7 @@
  * events and drives timelapse recording via direct function calls.
  */
 
+#define _GNU_SOURCE
 #include "moonraker_client.h"
 #include "timelapse.h"
 #include "cJSON.h"
@@ -268,9 +269,24 @@ static int ws_send_pong(MoonrakerClient *mc, const uint8_t *payload, size_t len)
 }
 
 /*
+ * Send a WebSocket ping frame (masked, empty payload).
+ */
+static int ws_send_ping(MoonrakerClient *mc) {
+    uint8_t header[6];
+    header[0] = 0x80 | WS_OP_PING;
+    header[1] = 0x80 | 0;  /* MASK=1, length=0 */
+
+    uint8_t mask[4];
+    ws_random_mask(mask);
+    memcpy(header + 2, mask, 4);
+
+    return send(mc->fd, header, 6, MSG_NOSIGNAL) == 6 ? 0 : -1;
+}
+
+/*
  * Receive a single WebSocket frame.
- * Returns payload length on success, -1 on error, 0 on timeout.
- * Caller must free *payload_out if return > 0.
+ * Returns 1 on success (frame received), -1 on error, 0 on timeout.
+ * Caller must free *payload_out if return == 1.
  */
 static int ws_recv_frame(MoonrakerClient *mc, int *opcode_out,
                           uint8_t **payload_out, size_t *len_out,
@@ -346,7 +362,7 @@ static int ws_recv_frame(MoonrakerClient *mc, int *opcode_out,
     *opcode_out = opcode;
     *payload_out = payload;
     *len_out = (size_t)payload_len;
-    return (int)payload_len;
+    return 1;  /* Frame received (0 = timeout, -1 = error) */
 }
 
 /* ============================================================================
@@ -384,9 +400,14 @@ static int send_jsonrpc(MoonrakerClient *mc, const char *method,
  * Returns 0 on success, -1 on error.
  */
 static int subscribe_print_stats(MoonrakerClient *mc) {
+    /* Subscribe only to fields we need — subscribing to null (all fields)
+     * causes Moonraker to send notifications on every print_duration update
+     * (~1/sec), which hammers Moonraker CPU on single-core printers.
+     * Layer info comes from virtual_sdcard (Anycubic) or print_stats.info
+     * (standard Klipper) — subscribe to both sources. */
     const char *params =
         "{\"objects\":{"
-            "\"print_stats\":null,"
+            "\"print_stats\":[\"state\",\"filename\",\"info\"],"
             "\"virtual_sdcard\":[\"current_layer\",\"total_layer\"]"
         "}}";
     return send_jsonrpc(mc, "printer.objects.subscribe", params);
@@ -695,12 +716,6 @@ static void handle_status_update(MoonrakerClient *mc, cJSON *params_obj) {
             strncpy(mc->filename, fn->valuestring,
                     sizeof(mc->filename) - 1);
         }
-
-        /* Extract print duration */
-        cJSON *dur = cJSON_GetObjectItemCaseSensitive(ps, "print_duration");
-        if (cJSON_IsNumber(dur)) {
-            mc->print_duration = (float)dur->valuedouble;
-        }
     }
 
     /* Extract and process layer info */
@@ -730,6 +745,14 @@ static void handle_status_update(MoonrakerClient *mc, cJSON *params_obj) {
  * Process a WebSocket text message (JSON).
  */
 static void process_message(MoonrakerClient *mc, const char *payload) {
+    /* Quick pre-filter: skip expensive cJSON_Parse for messages we don't need.
+     * Moonraker broadcasts notify_proc_stat_update every second to all clients
+     * (~1.2KB of system stats) — just discard without parsing. */
+    if (strstr(payload, "notify_status_update") == NULL &&
+        strstr(payload, "\"result\"") == NULL) {
+        return;
+    }
+
     cJSON *json = cJSON_Parse(payload);
     if (!json) return;
 
@@ -820,7 +843,11 @@ static void *moonraker_thread_func(void *arg) {
             }
 
             if (ret == 0) {
-                /* Timeout — no data, just continue */
+                /* Timeout — send ping to keep connection alive */
+                if (ws_send_ping(mc) != 0) {
+                    mr_log("Ping failed, connection lost\n");
+                    break;
+                }
                 continue;
             }
 
@@ -833,6 +860,10 @@ static void *moonraker_thread_func(void *arg) {
 
             case WS_OP_PING:
                 ws_send_pong(mc, payload, payload_len);
+                break;
+
+            case WS_OP_PONG:
+                /* Expected response to our ping — ignore */
                 break;
 
             case WS_OP_CLOSE:
@@ -898,6 +929,7 @@ int moonraker_client_start(MoonrakerClient *mc, const char *host, int port,
         mr_log("Failed to create thread\n");
         return -1;
     }
+    pthread_setname_np(mc->thread, "moonraker");
 
     mr_log("Started (target: %s:%d)\n", host, port);
     return 0;

@@ -5,8 +5,10 @@
  * Provides web UI and REST API for settings management.
  */
 
+#define _GNU_SOURCE
 #include "control_server.h"
 #include "moonraker_client.h"
+#include "mqtt_client.h"
 #include "config.h"
 #include "cpu_monitor.h"
 #include "http_server.h"
@@ -50,10 +52,14 @@ static void handle_client(ControlServer *srv, int client_fd, struct sockaddr_in 
  * Utility Functions
  * ============================================================================ */
 
-static uint64_t get_time_us(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000 + (uint64_t)ts.tv_nsec / 1000;
+/* Safe string copy: copies src into dst of size dst_size, always null-terminates.
+ * Uses strlen+memcpy to avoid both strncpy and snprintf truncation warnings. */
+static inline void safe_strcpy(char *dst, size_t dst_size, const char *src) {
+    if (dst_size == 0) return;
+    size_t len = strlen(src);
+    if (len >= dst_size) len = dst_size - 1;
+    memcpy(dst, src, len);
+    dst[len] = '\0';
 }
 
 /* Send data to socket (handles partial writes) */
@@ -320,6 +326,41 @@ static void read_encoder_stats(ControlServer *srv) {
     fclose(f);
 }
 
+/* Get IP address for a specific interface */
+static int get_iface_ip(const char *iface, char *buf, size_t bufsize) {
+    char cmd[128];
+    snprintf(cmd, sizeof(cmd),
+             "ifconfig %s 2>/dev/null | grep -o 'inet addr:[0-9.]*\\|inet [0-9.]*' | head -1",
+             iface);
+    FILE *f = popen(cmd, "r");
+    if (!f) return -1;
+
+    char line[128];
+    int found = 0;
+    if (fgets(line, sizeof(line), f)) {
+        char *ip_start = strstr(line, "addr:");
+        if (ip_start) {
+            ip_start += 5;
+        } else {
+            ip_start = strstr(line, "inet ");
+            if (ip_start) ip_start += 5;
+        }
+        if (ip_start) {
+            /* Trim trailing whitespace/newline */
+            char *end = ip_start;
+            while (*end && *end != ' ' && *end != '\n' && *end != '/') end++;
+            size_t len = end - ip_start;
+            if (len > 0 && len < bufsize && strncmp(ip_start, "127.", 4) != 0) {
+                memcpy(buf, ip_start, len);
+                buf[len] = '\0';
+                found = 1;
+            }
+        }
+    }
+    pclose(f);
+    return found ? 0 : -1;
+}
+
 /* Get IP address (prefer eth1, then wlan0) */
 static int get_ip_address(char *buf, size_t bufsize) {
     FILE *f = popen("ifconfig 2>/dev/null", "r");
@@ -418,13 +459,12 @@ static void serve_control_page(ControlServer *srv, int fd) {
     }
 
     AppConfig *cfg = srv->config;
-    char buf[128];
 
     /* Build template variables */
     /* We use a large array of TemplateVar - each variable corresponds to
      * a $variable_name in the template */
-    char sp_str[8], cp_str[8], br_str[8], fps_str[8], sr_str[8];
-    char tc_str[8], jq_str[8], dfps_str[8], mcfps_str[8];
+    char sp_str[12], cp_str[12], br_str[12], fps_str[12], sr_str[12];
+    char tc_str[12], jq_str[12], dfps_str[12], mcfps_str[12];
 
     snprintf(sp_str, sizeof(sp_str), "%d", cfg->streaming_port);
     snprintf(cp_str, sizeof(cp_str), "%d", cfg->control_port);
@@ -441,10 +481,10 @@ static void serve_control_page(ControlServer *srv, int fd) {
     snprintf(mcfps_str, sizeof(mcfps_str), "%d", hw_max_fps);
 
     /* Timelapse strings */
-    char tl_hi_str[8], tl_ofps_str[8], tl_tl_str[8];
-    char tl_vfmin_str[8], tl_vfmax_str[8], tl_crf_str[8];
-    char tl_dlf_str[8], tl_sd_str[8], tl_ed_str[8];
-    char mr_port_str[8];
+    char tl_hi_str[12], tl_ofps_str[12], tl_tl_str[12];
+    char tl_vfmin_str[12], tl_vfmax_str[12], tl_crf_str[12];
+    char tl_dlf_str[12], tl_sd_str[12], tl_ed_str[12];
+    char mr_port_str[12];
 
     snprintf(tl_hi_str, sizeof(tl_hi_str), "%d", cfg->timelapse_hyperlapse_interval);
     snprintf(tl_ofps_str, sizeof(tl_ofps_str), "%d", cfg->timelapse_output_fps);
@@ -533,6 +573,7 @@ static void serve_control_page(ControlServer *srv, int fd) {
         { "timelapse_usb_path", cfg->timelapse_usb_path },
         { "moonraker_host", cfg->moonraker_host },
         { "moonraker_port", mr_port_str },
+        { "moonraker_camera_ip", cfg->moonraker_camera_ip },
         { "timelapse_output_fps", tl_ofps_str },
         { "timelapse_variable_fps_checked", cfg->timelapse_variable_fps ? checked : empty },
         { "timelapse_target_length", tl_tl_str },
@@ -570,7 +611,7 @@ static void handle_control_post(ControlServer *srv, int fd,
     /* Encoder type */
     const char *enc = form_get(params, nparams, "encoder_type");
     if (enc && (strcmp(enc, "rkmpi") == 0 || strcmp(enc, "rkmpi-yuyv") == 0)) {
-        strncpy(cfg->encoder_type, enc, sizeof(cfg->encoder_type) - 1);
+        safe_strcpy(cfg->encoder_type, sizeof(cfg->encoder_type), enc);
     }
 
     /* Boolean settings (checkboxes: present=1, absent=0) */
@@ -684,8 +725,15 @@ static void serve_api_stats(ControlServer *srv, int fd) {
     cJSON *fps = cJSON_CreateObject();
     cJSON_AddNumberToObject(fps, "mjpeg",
         ((int)(srv->encoder_mjpeg_fps * 10 + 0.5f)) / 10.0);
+    /* Use FLV proxy FPS when proxy is active and local encoder reports 0 */
+    float h264_fps = srv->encoder_h264_fps;
+    if (h264_fps < 0.1f) {
+        float proxy_fps = flv_proxy_get_fps();
+        if (proxy_fps > 0.1f)
+            h264_fps = proxy_fps;
+    }
     cJSON_AddNumberToObject(fps, "h264",
-        ((int)(srv->encoder_h264_fps * 10 + 0.5f)) / 10.0);
+        ((int)(h264_fps * 10 + 0.5f)) / 10.0);
     cJSON_AddItemToObject(root, "fps", fps);
 
     /* Clients */
@@ -707,6 +755,7 @@ static void serve_api_stats(ControlServer *srv, int fd) {
     cJSON_AddStringToObject(root, "session_id", srv->session_id);
     cJSON_AddBoolToObject(root, "display_enabled", srv->config->display_enabled);
     cJSON_AddNumberToObject(root, "display_fps", srv->config->display_fps);
+    cJSON_AddStringToObject(root, "mode", srv->config->mode);
 
     send_json_response(fd, 200, root);
     cJSON_Delete(root);
@@ -753,14 +802,18 @@ static void serve_api_config(ControlServer *srv, int fd) {
 }
 
 /* GET /api/camera/controls - Camera control ranges and values */
-static void serve_camera_controls(ControlServer *srv, int fd) {
+static void serve_camera_controls(ControlServer *srv, int fd, int camera_id) {
     AppConfig *cfg = srv->config;
     cJSON *root = cJSON_CreateObject();
+
+    /* For secondary cameras (id >= 2), return defaults since we
+     * don't store their per-camera control values in config */
+    int use_defaults = (camera_id >= 2);
 
     /* Helper macro for camera controls */
     #define ADD_CTRL(name, field, min_v, max_v, def_v) do { \
         cJSON *c = cJSON_CreateObject(); \
-        cJSON_AddNumberToObject(c, "value", cfg->field); \
+        cJSON_AddNumberToObject(c, "value", use_defaults ? (def_v) : cfg->field); \
         cJSON_AddNumberToObject(c, "min", min_v); \
         cJSON_AddNumberToObject(c, "max", max_v); \
         cJSON_AddNumberToObject(c, "default", def_v); \
@@ -780,7 +833,7 @@ static void serve_camera_controls(ControlServer *srv, int fd) {
 
     /* Controls with options */
     cJSON *ea = cJSON_CreateObject();
-    cJSON_AddNumberToObject(ea, "value", cfg->cam_exposure_auto);
+    cJSON_AddNumberToObject(ea, "value", use_defaults ? 3 : cfg->cam_exposure_auto);
     cJSON_AddNumberToObject(ea, "min", 1);
     cJSON_AddNumberToObject(ea, "max", 3);
     cJSON_AddNumberToObject(ea, "default", 3);
@@ -794,7 +847,7 @@ static void serve_camera_controls(ControlServer *srv, int fd) {
     ADD_CTRL("exposure_priority", cam_exposure_priority, 0, 1, 0);
 
     cJSON *pl = cJSON_CreateObject();
-    cJSON_AddNumberToObject(pl, "value", cfg->cam_power_line);
+    cJSON_AddNumberToObject(pl, "value", use_defaults ? 1 : cfg->cam_power_line);
     cJSON_AddNumberToObject(pl, "min", 0);
     cJSON_AddNumberToObject(pl, "max", 2);
     cJSON_AddNumberToObject(pl, "default", 1);
@@ -827,7 +880,7 @@ static void handle_camera_set(ControlServer *srv, int fd, const char *body) {
         }
 
         /* Write to command file */
-        char cmd_line[128];
+        char cmd_line[640];
         snprintf(cmd_line, sizeof(cmd_line), "cam_%s=%s\n", ctrl, val);
 
         FILE *f = fopen("/tmp/h264_cmd", "a");
@@ -866,6 +919,8 @@ static void handle_camera_set(ControlServer *srv, int fd, const char *body) {
     /* JSON body format */
     const cJSON *ctrl = cJSON_GetObjectItemCaseSensitive(req, "control");
     const cJSON *val = cJSON_GetObjectItemCaseSensitive(req, "value");
+    const cJSON *cam_id = cJSON_GetObjectItemCaseSensitive(req, "camera_id");
+    int camera_id = (cam_id && cJSON_IsNumber(cam_id)) ? cam_id->valueint : 1;
 
     if (ctrl && val && cJSON_IsString(ctrl)) {
         char cmd_line[128];
@@ -875,10 +930,38 @@ static void handle_camera_set(ControlServer *srv, int fd, const char *body) {
             snprintf(cmd_line, sizeof(cmd_line), "cam_%s=%s\n", ctrl->valuestring, val->valuestring);
         }
 
-        FILE *f = fopen("/tmp/h264_cmd", "a");
+        /* Write to correct camera's command file */
+        char cmd_path[64];
+        if (camera_id <= 1)
+            snprintf(cmd_path, sizeof(cmd_path), "/tmp/h264_cmd");
+        else
+            snprintf(cmd_path, sizeof(cmd_path), "/tmp/h264_cmd_%d", camera_id);
+
+        FILE *f = fopen(cmd_path, "a");
         if (f) {
             fputs(cmd_line, f);
             fclose(f);
+        }
+
+        /* Only persist config for primary camera */
+        if (camera_id <= 1 && cJSON_IsNumber(val)) {
+            int v = val->valueint;
+            AppConfig *cfg = srv->config;
+            if (strcmp(ctrl->valuestring, "brightness") == 0) cfg->cam_brightness = v;
+            else if (strcmp(ctrl->valuestring, "contrast") == 0) cfg->cam_contrast = v;
+            else if (strcmp(ctrl->valuestring, "saturation") == 0) cfg->cam_saturation = v;
+            else if (strcmp(ctrl->valuestring, "hue") == 0) cfg->cam_hue = v;
+            else if (strcmp(ctrl->valuestring, "gamma") == 0) cfg->cam_gamma = v;
+            else if (strcmp(ctrl->valuestring, "sharpness") == 0) cfg->cam_sharpness = v;
+            else if (strcmp(ctrl->valuestring, "gain") == 0) cfg->cam_gain = v;
+            else if (strcmp(ctrl->valuestring, "backlight") == 0) cfg->cam_backlight = v;
+            else if (strcmp(ctrl->valuestring, "wb_auto") == 0) cfg->cam_wb_auto = v;
+            else if (strcmp(ctrl->valuestring, "wb_temp") == 0) cfg->cam_wb_temp = v;
+            else if (strcmp(ctrl->valuestring, "exposure_auto") == 0) cfg->cam_exposure_auto = v;
+            else if (strcmp(ctrl->valuestring, "exposure") == 0) cfg->cam_exposure = v;
+            else if (strcmp(ctrl->valuestring, "exposure_priority") == 0) cfg->cam_exposure_priority = v;
+            else if (strcmp(ctrl->valuestring, "power_line") == 0) cfg->cam_power_line = v;
+            config_save(cfg, CONFIG_DEFAULT_PATH);
         }
     }
 
@@ -1279,7 +1362,7 @@ static void serve_timelapse_browse(ControlServer *srv, int fd, const char *path)
         while ((entry = readdir(dir)) != NULL) {
             if (entry->d_name[0] == '.') continue;
 
-            char fullpath[512];
+            char fullpath[768];
             snprintf(fullpath, sizeof(fullpath), "%s/%s", path, entry->d_name);
 
             struct stat st;
@@ -1311,22 +1394,16 @@ static void handle_timelapse_settings(ControlServer *srv, int fd, const char *bo
 
     const char *val;
     val = form_get(params, nparams, "timelapse_mode");
-    if (val) strncpy(cfg->timelapse_mode, val, sizeof(cfg->timelapse_mode) - 1);
+    if (val) safe_strcpy(cfg->timelapse_mode, sizeof(cfg->timelapse_mode), val);
 
     val = form_get(params, nparams, "timelapse_hyperlapse_interval");
     if (val) cfg->timelapse_hyperlapse_interval = atoi(val);
 
     val = form_get(params, nparams, "timelapse_storage");
-    if (val) strncpy(cfg->timelapse_storage, val, sizeof(cfg->timelapse_storage) - 1);
+    if (val) safe_strcpy(cfg->timelapse_storage, sizeof(cfg->timelapse_storage), val);
 
     val = form_get(params, nparams, "timelapse_usb_path");
-    if (val) strncpy(cfg->timelapse_usb_path, val, sizeof(cfg->timelapse_usb_path) - 1);
-
-    val = form_get(params, nparams, "moonraker_host");
-    if (val) strncpy(cfg->moonraker_host, val, sizeof(cfg->moonraker_host) - 1);
-
-    val = form_get(params, nparams, "moonraker_port");
-    if (val) cfg->moonraker_port = atoi(val);
+    if (val) safe_strcpy(cfg->timelapse_usb_path, sizeof(cfg->timelapse_usb_path), val);
 
     val = form_get(params, nparams, "timelapse_output_fps");
     if (val) cfg->timelapse_output_fps = atoi(val);
@@ -1555,9 +1632,67 @@ static void serve_timelapse_moonraker_status(ControlServer *srv, int fd) {
     cJSON_Delete(root);
 }
 
+/* LED ON/OFF handler via MQTT light topic */
+static void handle_led(ControlServer *srv, int fd, int on) {
+    /* LED control only available in go-klipper mode (requires MQTT) */
+    if (strcmp(srv->config->mode, "vanilla-klipper") == 0) {
+        cJSON *result = cJSON_CreateObject();
+        cJSON_AddStringToObject(result, "status", "error");
+        cJSON_AddStringToObject(result, "message", "LED control not available in vanilla-klipper mode");
+        send_json_response(fd, 200, result);
+        cJSON_Delete(result);
+        return;
+    }
+
+    int ret = mqtt_send_led(on, 100);
+
+    cJSON *result = cJSON_CreateObject();
+    if (ret == 0) {
+        cJSON_AddStringToObject(result, "status", "ok");
+    } else {
+        cJSON_AddStringToObject(result, "status", "error");
+        cJSON_AddStringToObject(result, "message", "MQTT not connected");
+    }
+    send_json_response(fd, 200, result);
+    cJSON_Delete(result);
+}
+
 /* ============================================================================
  * Moonraker Camera Provisioning
  * ============================================================================ */
+
+/* Resolve camera IP based on moonraker_camera_ip config setting.
+ * The stream URL is loaded directly by the user's browser, so "auto"
+ * must always use the printer's routable IP (active interface by route metric). */
+static void resolve_camera_ip(const AppConfig *cfg, char *buf, size_t bufsize) {
+    const char *mode = cfg->moonraker_camera_ip;
+    if (strcmp(mode, "localhost") == 0) {
+        safe_strcpy(buf, bufsize, "127.0.0.1");
+    } else if (strcmp(mode, "eth0") == 0 || strcmp(mode, "eth1") == 0) {
+        if (get_iface_ip(mode, buf, bufsize) != 0)
+            safe_strcpy(buf, bufsize, "127.0.0.1");  /* fallback */
+    } else {
+        /* "auto" — always use printer's routable IP */
+        if (get_ip_address(buf, bufsize) != 0)
+            safe_strcpy(buf, bufsize, "127.0.0.1");  /* fallback */
+    }
+}
+
+/* GET /api/network/interfaces - Return network interface IPs */
+static void serve_network_interfaces(ControlServer *srv, int fd) {
+    cJSON *root = cJSON_CreateObject();
+
+    char ip[64];
+    if (get_iface_ip("eth0", ip, sizeof(ip)) == 0)
+        cJSON_AddStringToObject(root, "eth0", ip);
+    if (get_iface_ip("eth1", ip, sizeof(ip)) == 0)
+        cJSON_AddStringToObject(root, "eth1", ip);
+
+    cJSON_AddStringToObject(root, "moonraker_camera_ip", srv->config->moonraker_camera_ip);
+
+    send_json_response(fd, 200, root);
+    cJSON_Delete(root);
+}
 
 /*
  * Make a one-shot HTTP POST to Moonraker to register/update a webcam entry.
@@ -1639,6 +1774,10 @@ void control_server_provision_moonraker(ControlServer *srv) {
 
     if (!host[0] || port <= 0) return;
 
+    /* Resolve camera IP based on config setting */
+    char camera_ip[64];
+    resolve_camera_ip(srv->config, camera_ip, sizeof(camera_ip));
+
     /* Parse cameras_json for per-camera moonraker settings */
     cJSON *cam_settings = NULL;
     if (srv->config->cameras_json[0]) {
@@ -1676,12 +1815,12 @@ void control_server_provision_moonraker(ControlServer *srv) {
             snprintf(name, sizeof(name), "USB Camera %d", cam->camera_id);
         }
 
-        /* Build stream/snapshot URLs with printer's own IP */
+        /* Build stream/snapshot URLs with resolved camera IP */
         char stream_url[128], snap_url[128];
         snprintf(stream_url, sizeof(stream_url),
-                 "http://127.0.0.1:%d/stream", cam->streaming_port);
+                 "http://%s:%d/stream", camera_ip, cam->streaming_port);
         snprintf(snap_url, sizeof(snap_url),
-                 "http://127.0.0.1:%d/snapshot", cam->streaming_port);
+                 "http://%s:%d/snapshot", camera_ip, cam->streaming_port);
 
         int fps = cam->max_fps > 0 ? cam->max_fps : 20;
 
@@ -1764,7 +1903,7 @@ static void serve_cameras(ControlServer *srv, int fd) {
                     }
                     int ow = mp->override_width > 0 ? mp->override_width : 640;
                     int oh = mp->override_height > 0 ? mp->override_height : 480;
-                    char res[16];
+                    char res[24];
                     snprintf(res, sizeof(res), "%dx%d", ow, oh);
                     cJSON_AddStringToObject(obj, "configured_resolution", res);
                     cJSON_AddStringToObject(obj, "capture_mode",
@@ -1822,17 +1961,41 @@ static void serve_moonraker_cameras(ControlServer *srv, int fd) {
 
 static void handle_moonraker_cameras_post(ControlServer *srv, int fd,
                                             const char *body) {
-    /* Body is JSON: {"settings": {"unique_id": {"moonraker_name": "...", ...}}} */
+    /* Body is JSON: {"settings": {...}, "moonraker_host": "...", ...} */
     cJSON *json = cJSON_Parse(body);
     if (!json) {
         send_json_error(fd, 400, "Invalid JSON");
         return;
     }
 
+    /* Save moonraker connection settings if provided */
+    cJSON *mr_host = cJSON_GetObjectItem(json, "moonraker_host");
+    if (mr_host && mr_host->valuestring && mr_host->valuestring[0])
+        safe_strcpy(srv->config->moonraker_host,
+                    sizeof(srv->config->moonraker_host), mr_host->valuestring);
+
+    cJSON *mr_port = cJSON_GetObjectItem(json, "moonraker_port");
+    if (mr_port) {
+        int port = cJSON_IsNumber(mr_port) ? mr_port->valueint : 0;
+        if (mr_port->valuestring) port = atoi(mr_port->valuestring);
+        if (port > 0 && port <= 65535) srv->config->moonraker_port = port;
+    }
+
+    cJSON *mr_cam_ip = cJSON_GetObjectItem(json, "moonraker_camera_ip");
+    if (mr_cam_ip && mr_cam_ip->valuestring)
+        safe_strcpy(srv->config->moonraker_camera_ip,
+                    sizeof(srv->config->moonraker_camera_ip), mr_cam_ip->valuestring);
+
     cJSON *settings = cJSON_GetObjectItem(json, "settings");
     if (!settings) {
+        /* No camera settings — just save connection settings */
+        config_save(srv->config, srv->config->config_file);
+        control_server_provision_moonraker(srv);
+        cJSON *resp = cJSON_CreateObject();
+        cJSON_AddStringToObject(resp, "status", "ok");
+        send_json_response(fd, 200, resp);
+        cJSON_Delete(resp);
         cJSON_Delete(json);
-        send_json_error(fd, 400, "Missing settings");
         return;
     }
 
@@ -2164,7 +2327,7 @@ static void handle_camera_settings(ControlServer *srv, int fd,
 
             /* Save encoder settings */
             if (proc->override_width > 0 && proc->override_height > 0) {
-                char res_buf[16];
+                char res_buf[24];
                 snprintf(res_buf, sizeof(res_buf), "%dx%d",
                          proc->override_width, proc->override_height);
                 cJSON_DeleteItemFromObject(cam_entry, "resolution");
@@ -2262,9 +2425,9 @@ static void handle_client(ControlServer *srv, int client_fd,
         if (path_len >= sizeof(path)) path_len = sizeof(path) - 1;
         memcpy(path, full_path, path_len);
         path[path_len] = '\0';
-        strncpy(query_string, qmark + 1, sizeof(query_string) - 1);
+        snprintf(query_string, sizeof(query_string), "%s", qmark + 1);
     } else {
-        strncpy(path, full_path, sizeof(path) - 1);
+        snprintf(path, sizeof(path), "%s", full_path);
     }
 
     /* Parse query params */
@@ -2339,13 +2502,21 @@ static void handle_client(ControlServer *srv, int client_fd,
         serve_api_config(srv, client_fd);
     }
     else if (is_get && strcmp(path, "/api/camera/controls") == 0) {
-        serve_camera_controls(srv, client_fd);
+        const char *cam_id_str = form_get(query_params, nquery, "camera_id");
+        int cam_id = cam_id_str ? atoi(cam_id_str) : 1;
+        serve_camera_controls(srv, client_fd, cam_id);
     }
     else if (is_post && strcmp(path, "/api/camera/set") == 0) {
         handle_camera_set(srv, client_fd, post_body ? post_body : "");
     }
     else if (is_post && strcmp(path, "/api/touch") == 0) {
         handle_touch(srv, client_fd, post_body ? post_body : "");
+    }
+    else if (is_get && strcmp(path, "/api/led/on") == 0) {
+        handle_led(srv, client_fd, 1);
+    }
+    else if (is_get && strcmp(path, "/api/led/off") == 0) {
+        handle_led(srv, client_fd, 0);
     }
     else if (is_get && strcmp(path, "/api/restart") == 0) {
         handle_restart(srv, client_fd);
@@ -2401,6 +2572,9 @@ static void handle_client(ControlServer *srv, int client_fd,
     /* Multi-camera routes */
     else if (is_get && strcmp(path, "/api/cameras") == 0) {
         serve_cameras(srv, client_fd);
+    }
+    else if (is_get && strcmp(path, "/api/network/interfaces") == 0) {
+        serve_network_interfaces(srv, client_fd);
     }
     else if (is_get && strcmp(path, "/api/moonraker/cameras") == 0) {
         serve_moonraker_cameras(srv, client_fd);
@@ -2515,7 +2689,7 @@ static void *control_server_thread(void *arg) {
                     control_server_provision_moonraker(srv);
                     route_fixed = 0;  /* Re-check routes on IP change */
                 }
-                strncpy(last_ip, current_ip, sizeof(last_ip) - 1);
+                snprintf(last_ip, sizeof(last_ip), "%s", current_ip);
             }
 
             /* Fix WiFi route priority (retry until successful) */
@@ -2594,6 +2768,7 @@ int control_server_start(AppConfig *cfg, int port, const char *template_dir) {
         close(srv->listen_fd);
         return -1;
     }
+    pthread_setname_np(srv->thread, "control_srv");
 
     fprintf(stderr, "Control: Server listening on port %d\n", srv->port);
     return 0;
