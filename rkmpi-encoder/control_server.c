@@ -43,6 +43,7 @@ static MoonrakerClient *g_moonraker_client = NULL;
 /* External globals from rkmpi_enc.c */
 extern volatile sig_atomic_t g_running;
 extern int g_verbose;
+extern const char g_encoder_version[];
 
 /* Forward declarations */
 static void *control_server_thread(void *arg);
@@ -563,6 +564,8 @@ static void serve_control_page(ControlServer *srv, int fd) {
         { "fps_pct", fps_pct_str },
         { "encoder_type", cfg->encoder_type },
         { "session_id", srv->session_id },
+        { "encoder_version", g_encoder_version },
+        { "streamer_version", srv->streamer_version },
         /* Timelapse settings */
         { "timelapse_enabled_checked", cfg->timelapse_enabled ? checked : empty },
         { "timelapse_mode_layer_selected", tl_layer_sel },
@@ -2729,6 +2732,24 @@ int control_server_start(AppConfig *cfg, int port, const char *template_dir) {
     /* Generate session ID */
     snprintf(srv->session_id, sizeof(srv->session_id), "%08x%08x",
              (unsigned int)time(NULL), (unsigned int)getpid());
+
+    /* Read streamer version from VERSION file in template directory */
+    safe_strcpy(srv->streamer_version, sizeof(srv->streamer_version), "");
+    {
+        char vpath[300];
+        snprintf(vpath, sizeof(vpath), "%s/VERSION", srv->template_dir);
+        FILE *vf = fopen(vpath, "r");
+        if (vf) {
+            char vbuf[16] = {0};
+            if (fgets(vbuf, sizeof(vbuf), vf)) {
+                /* Trim trailing newline */
+                char *nl = strchr(vbuf, '\n');
+                if (nl) *nl = '\0';
+                safe_strcpy(srv->streamer_version, sizeof(srv->streamer_version), vbuf);
+            }
+            fclose(vf);
+        }
+    }
 
     /* Initialize CPU monitor */
     cpu_monitor_init(&srv->cpu_monitor);

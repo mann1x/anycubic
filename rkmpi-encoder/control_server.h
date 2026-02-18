@@ -74,6 +74,9 @@ typedef struct {
     /* Template directory path */
     char template_dir[256];
 
+    /* Streamer version (read from VERSION file in template_dir) */
+    char streamer_version[16];
+
     /* Multi-camera state (set by main, read by API) */
     CameraInfo *cameras;
     int num_cameras;

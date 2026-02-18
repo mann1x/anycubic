@@ -142,6 +142,7 @@ void __stack_chk_fail(void) {
 /* Version info - update on significant changes */
 #define VERSION            "2.0.0"
 #define BUILD_DATE         __DATE__ " " __TIME__
+const char g_encoder_version[] = VERSION;
 
 #define DEFAULT_DEVICE     "/dev/video10"
 #define DEFAULT_WIDTH      1280
