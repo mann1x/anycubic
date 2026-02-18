@@ -1064,40 +1064,92 @@ static void serve_timelapse_page(ControlServer *srv, int fd) {
 }
 
 /* Helper: get timelapse directory path */
-static const char *get_timelapse_dir(const char *storage) {
+static const char *get_timelapse_dir(ControlServer *srv, const char *storage) {
     if (storage && strcmp(storage, "usb") == 0) {
+        /* Use configured USB path if set, otherwise default */
+        if (srv->config->timelapse_usb_path[0])
+            return srv->config->timelapse_usb_path;
         return TIMELAPSE_DIR_USB;
     }
     return TIMELAPSE_DIR_INTERNAL;
 }
 
-/* GET /api/timelapse/list - JSON list of recordings */
+/* GET /api/timelapse/list - JSON list of recordings.
+ * Groups MP4 files with their JPG thumbnails.
+ * Thumbnail naming: <base>_<frames>.jpg matches <base>.mp4 */
 static void serve_timelapse_list(ControlServer *srv, int fd, const char *storage) {
-    const char *dir_path = get_timelapse_dir(storage);
+    const char *dir_path = get_timelapse_dir(srv, storage);
 
     cJSON *root = cJSON_CreateObject();
-    cJSON *files = cJSON_CreateArray();
+    cJSON *recordings = cJSON_CreateArray();
+    uint64_t total_size = 0;
 
+    /* First pass: collect all filenames */
     DIR *dir = opendir(dir_path);
     if (dir) {
+        /* Collect MP4 and JPG names in arrays (max 200 entries) */
+        #define TL_MAX_ENTRIES 200
+        char *mp4_names[TL_MAX_ENTRIES];
+        char *jpg_names[TL_MAX_ENTRIES];
+        int mp4_count = 0, jpg_count = 0;
+
         struct dirent *entry;
         while ((entry = readdir(dir)) != NULL) {
-            /* Only MP4 files */
             const char *name = entry->d_name;
             size_t nlen = strlen(name);
             if (nlen < 5) continue;
-            if (strcasecmp(name + nlen - 4, ".mp4") != 0) continue;
+            if (strcasecmp(name + nlen - 4, ".mp4") == 0 && mp4_count < TL_MAX_ENTRIES)
+                mp4_names[mp4_count++] = strdup(name);
+            else if (strcasecmp(name + nlen - 4, ".jpg") == 0 && jpg_count < TL_MAX_ENTRIES)
+                jpg_names[jpg_count++] = strdup(name);
+        }
+        closedir(dir);
+
+        /* Process each MP4 and find matching thumbnail */
+        for (int i = 0; i < mp4_count; i++) {
+            const char *mp4 = mp4_names[i];
+            size_t mp4len = strlen(mp4);
+            /* Base name = mp4 without .mp4 extension */
+            size_t baselen = mp4len - 4;
 
             char filepath[512];
-            snprintf(filepath, sizeof(filepath), "%s/%s", dir_path, name);
+            snprintf(filepath, sizeof(filepath), "%s/%s", dir_path, mp4);
 
             struct stat st;
             if (stat(filepath, &st) != 0) continue;
 
-            cJSON *file = cJSON_CreateObject();
-            cJSON_AddStringToObject(file, "name", name);
-            cJSON_AddNumberToObject(file, "size", st.st_size);
-            cJSON_AddNumberToObject(file, "mtime", st.st_mtime);
+            /* Find matching thumbnail: <base>_<number>.jpg */
+            const char *thumb = NULL;
+            int frames = 0;
+            for (int j = 0; j < jpg_count; j++) {
+                if (!jpg_names[j]) continue;
+                /* Must start with base name + '_' */
+                if (strncmp(jpg_names[j], mp4, baselen) == 0 && jpg_names[j][baselen] == '_') {
+                    /* Extract frame count from suffix */
+                    const char *num_start = jpg_names[j] + baselen + 1;
+                    char *dot = strrchr(num_start, '.');
+                    if (dot && dot > num_start) {
+                        int f = atoi(num_start);
+                        if (f > frames) {
+                            frames = f;
+                            thumb = jpg_names[j];
+                        }
+                    }
+                }
+            }
+
+            cJSON *rec = cJSON_CreateObject();
+            /* name = base name (used as group ID for delete) */
+            char base[256];
+            snprintf(base, sizeof(base), "%.*s", (int)baselen, mp4);
+            cJSON_AddStringToObject(rec, "name", base);
+            cJSON_AddStringToObject(rec, "mp4", mp4);
+            if (thumb)
+                cJSON_AddStringToObject(rec, "thumbnail", thumb);
+            cJSON_AddNumberToObject(rec, "frames", frames);
+            cJSON_AddNumberToObject(rec, "size", (double)st.st_size);
+            cJSON_AddNumberToObject(rec, "mtime", (double)st.st_mtime);
+            total_size += st.st_size;
 
             /* Get duration using ffprobe if available */
             char cmd[768];
@@ -1105,23 +1157,25 @@ static void serve_timelapse_list(ControlServer *srv, int fd, const char *storage
                 "%s -v error -show_entries format=duration "
                 "-of csv=p=0 '%s' 2>/dev/null",
                 FFPROBE_PATH, filepath);
-
             FILE *p = popen(cmd, "r");
             if (p) {
                 char dur_buf[32];
                 if (fgets(dur_buf, sizeof(dur_buf), p)) {
-                    float duration = atof(dur_buf);
-                    cJSON_AddNumberToObject(file, "duration", duration);
+                    cJSON_AddNumberToObject(rec, "duration", atof(dur_buf));
                 }
                 pclose(p);
             }
 
-            cJSON_AddItemToArray(files, file);
+            cJSON_AddItemToArray(recordings, rec);
         }
-        closedir(dir);
+
+        /* Free names */
+        for (int i = 0; i < mp4_count; i++) free(mp4_names[i]);
+        for (int i = 0; i < jpg_count; i++) free(jpg_names[i]);
     }
 
-    cJSON_AddItemToObject(root, "files", files);
+    cJSON_AddItemToObject(root, "recordings", recordings);
+    cJSON_AddNumberToObject(root, "total_size", (double)total_size);
     cJSON_AddStringToObject(root, "storage", storage ? storage : "internal");
     cJSON_AddStringToObject(root, "path", dir_path);
 
@@ -1129,55 +1183,63 @@ static void serve_timelapse_list(ControlServer *srv, int fd, const char *storage
     cJSON_Delete(root);
 }
 
-/* GET /api/timelapse/preview/<name> - Thumbnail extraction */
+/* GET /api/timelapse/thumb/<name> - Serve thumbnail JPEG.
+ * If <name> is a .jpg that exists in the timelapse dir, serve it directly.
+ * Otherwise try extracting first frame from video via ffmpeg. */
 static void serve_timelapse_thumb(ControlServer *srv, int fd,
                                    const char *name, const char *storage) {
-    const char *dir_path = get_timelapse_dir(storage);
+    const char *dir_path = get_timelapse_dir(srv, storage);
     char filepath[512];
     snprintf(filepath, sizeof(filepath), "%s/%s", dir_path, name);
 
-    /* Validate file exists */
+    /* If the requested file is a JPG that exists, serve directly */
+    size_t nlen = strlen(name);
+    int is_jpg = (nlen > 4 && strcasecmp(name + nlen - 4, ".jpg") == 0);
+
     struct stat st;
+    if (is_jpg && stat(filepath, &st) == 0 && st.st_size > 0 && st.st_size <= 512 * 1024) {
+        FILE *f = fopen(filepath, "rb");
+        if (f) {
+            char *data = malloc(st.st_size);
+            if (data) {
+                fread(data, 1, st.st_size, f);
+                fclose(f);
+                send_http_response(fd, 200, "image/jpeg", data, st.st_size,
+                                  "Cache-Control: max-age=3600\r\n");
+                free(data);
+                return;
+            }
+            fclose(f);
+        }
+    }
+
+    /* Fallback: extract first frame from video via ffmpeg */
     if (stat(filepath, &st) != 0) {
         send_404(fd);
         return;
     }
 
-    /* Extract first frame as JPEG using ffmpeg */
     char cmd[768];
     snprintf(cmd, sizeof(cmd),
         "%s -y -i '%s' -vframes 1 -q:v 5 -f image2 /tmp/timelapse_thumb.jpg 2>/dev/null",
         FFMPEG_PATH, filepath);
 
-    int ret = system(cmd);
-    if (ret != 0) {
+    if (system(cmd) != 0) {
         send_404(fd);
         return;
     }
 
-    /* Read and serve the thumbnail */
     FILE *f = fopen("/tmp/timelapse_thumb.jpg", "rb");
-    if (!f) {
-        send_404(fd);
-        return;
-    }
+    if (!f) { send_404(fd); return; }
 
     fseek(f, 0, SEEK_END);
     long fsize = ftell(f);
     fseek(f, 0, SEEK_SET);
 
-    if (fsize <= 0 || fsize > 512 * 1024) {
-        fclose(f);
-        send_404(fd);
-        return;
-    }
+    if (fsize <= 0 || fsize > 512 * 1024) { fclose(f); send_404(fd); return; }
 
     char *jpeg_data = malloc(fsize);
-    if (!jpeg_data) {
-        fclose(f);
-        send_404(fd);
-        return;
-    }
+    if (!jpeg_data) { fclose(f); send_404(fd); return; }
 
     fread(jpeg_data, 1, fsize, f);
     fclose(f);
@@ -1192,7 +1254,7 @@ static void serve_timelapse_thumb(ControlServer *srv, int fd,
 static void serve_timelapse_video(ControlServer *srv, int fd,
                                    const char *name, const char *storage,
                                    const char *request) {
-    const char *dir_path = get_timelapse_dir(storage);
+    const char *dir_path = get_timelapse_dir(srv, storage);
     char filepath[512];
     snprintf(filepath, sizeof(filepath), "%s/%s", dir_path, name);
 
@@ -1276,16 +1338,16 @@ static void serve_timelapse_video(ControlServer *srv, int fd,
     fclose(f);
 }
 
-/* DELETE /api/timelapse/delete/<name> - Delete recording */
+/* DELETE /api/timelapse/delete/<name> - Delete recording.
+ * <name> is the base name (without extension).
+ * Deletes <name>.mp4 and any <name>_*.jpg thumbnails. */
 static void handle_timelapse_delete(ControlServer *srv, int fd,
                                      const char *name, const char *storage) {
-    const char *dir_path = get_timelapse_dir(storage);
-    char filepath[512];
-    snprintf(filepath, sizeof(filepath), "%s/%s", dir_path, name);
+    const char *dir_path = get_timelapse_dir(srv, storage);
 
     cJSON *result = cJSON_CreateObject();
 
-    /* Validate: must be .mp4 file within timelapse dir (no path traversal) */
+    /* Validate: no path traversal */
     if (strchr(name, '/') || strchr(name, '\\') || strstr(name, "..")) {
         cJSON_AddStringToObject(result, "status", "error");
         cJSON_AddStringToObject(result, "message", "Invalid filename");
@@ -1294,9 +1356,32 @@ static void handle_timelapse_delete(ControlServer *srv, int fd,
         return;
     }
 
-    if (unlink(filepath) == 0) {
+    /* Delete the MP4 file */
+    char filepath[512];
+    snprintf(filepath, sizeof(filepath), "%s/%s.mp4", dir_path, name);
+    int mp4_ok = (unlink(filepath) == 0);
+
+    /* Delete matching thumbnail(s): <name>_*.jpg */
+    size_t namelen = strlen(name);
+    DIR *dir = opendir(dir_path);
+    if (dir) {
+        struct dirent *entry;
+        while ((entry = readdir(dir)) != NULL) {
+            const char *fn = entry->d_name;
+            size_t fnlen = strlen(fn);
+            if (fnlen < 5) continue;
+            if (strcasecmp(fn + fnlen - 4, ".jpg") != 0) continue;
+            if (strncmp(fn, name, namelen) == 0 && fn[namelen] == '_') {
+                snprintf(filepath, sizeof(filepath), "%s/%s", dir_path, fn);
+                unlink(filepath);
+            }
+        }
+        closedir(dir);
+    }
+
+    if (mp4_ok) {
         cJSON_AddStringToObject(result, "status", "ok");
-        fprintf(stderr, "Timelapse: Deleted %s\n", filepath);
+        fprintf(stderr, "Timelapse: Deleted %s.mp4 (+ thumbnails)\n", name);
     } else {
         cJSON_AddStringToObject(result, "status", "error");
         cJSON_AddStringToObject(result, "message", strerror(errno));
@@ -1341,6 +1426,7 @@ static void serve_timelapse_storage(ControlServer *srv, int fd) {
     }
 
     cJSON_AddBoolToObject(root, "usb_mounted", usb_mounted);
+    cJSON_AddStringToObject(root, "current", srv->config->timelapse_storage);
 
     send_json_response(fd, 200, root);
     cJSON_Delete(root);

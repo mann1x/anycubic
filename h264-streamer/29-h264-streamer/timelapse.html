@@ -88,15 +88,16 @@
                 .then(r => r.json())
                 .then(data => {
                     usbMounted = data.usb_mounted;
-                    const usbConfigured = data.current === 'usb';
                     currentStorage = data.current || 'internal';
+                    /* If configured storage is USB but not mounted, fall back */
+                    if (currentStorage === 'usb' && !usbMounted)
+                        currentStorage = 'internal';
                     const storageSelect = document.getElementById('storage-select');
-                    if (usbConfigured && usbMounted) {
+                    if (usbMounted) {
                         storageSelect.style.display = '';
                         storageSelect.value = currentStorage;
                     } else {
                         storageSelect.style.display = 'none';
-                        currentStorage = 'internal';
                     }
                     loadRecordings();
                 })
@@ -247,10 +248,10 @@
             })
             .then(r => r.json())
             .then(data => {
-                if (data.success) {
+                if (data.status === 'ok') {
                     loadRecordings();
                 } else {
-                    alert('Delete failed: ' + (data.error || 'Unknown error'));
+                    alert('Delete failed: ' + (data.message || data.error || 'Unknown error'));
                 }
             })
             .catch(function(err) {
