@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## h264-streamer
 
-### [2.0.0] - 2026-02-17
+### [2.0.0] - 2026-02-20
 
 #### Added
 - Pure C architecture — rkmpi_enc `--primary` mode replaces h264_server.py as the sole application process
@@ -23,18 +23,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Built-in ACProxyCam FLV proxy with transparent byte forwarding
 - HTML template system (`control.html`, `index.html`, `timelapse.html`) with `{{variable}}` substitution
 - JSON config file persistence (`29-h264-streamer.config`) for all settings
+- Hot-apply settings without restart: MJPEG FPS, H.264 bitrate, debug logging
+- FPS and bitrate overlay on MJPEG and H.264 stream previews
+- Dynamic status panel showing per-camera ports and active endpoints
+- Streamer and encoder version display in control page header
+- LED control via MQTT
+- Moonraker settings panel for per-camera provisioning
+- Per-camera V4L2 resolution enumeration and capture mode selection
+- Timelapse management with grouped recordings, thumbnails, and USB default storage
+- WiFi route fix and RTL8723DS driver optimization (ported from Python)
 
 #### Removed
 - h264_server.py (10,160 lines of Python) — all functionality now in rkmpi_enc C binary
 - Python interpreter dependency — saves ~18MB RSS on the 256MB RV1106
 - FIFO pipes (`/tmp/mjpeg.pipe`, `/tmp/h264.pipe`) — streaming now internal to process
 - gkcam encoder mode — only rkmpi and rkmpi-yuyv modes supported
+- Unnecessary encoder restarts for MJPEG FPS, bitrate, and logging changes
+
+#### Fixed
+- Config-to-encoder mapping at startup: bitrate, JPEG quality, H.264 resolution, and logging were saved but never applied
+- Per-camera settings persistence and UI state bugs
+- Moonraker client reconnect handling
+- Multi-camera error handling and V4L2 recovery
 
 #### Changed
 - Process model: single `rkmpi_enc --primary` process instead of Python orchestrator + C encoder subprocesses
 - Timelapse via Moonraker now uses direct function calls instead of control file IPC
 - Control page served from HTML template files instead of inline Python strings
 - Config now read/written by C `config.c` module instead of Python ConfigParser
+- Auto-skip algorithm tuned for faster convergence with smoothed CPU readings
 
 ### [1.6.5] - 2026-02-16
 
@@ -162,7 +179,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## rkmpi-encoder
 
-### [1.5.0] - 2026-02-17
+### [1.5.0] - 2026-02-20
 
 #### Added
 - Primary mode (`--primary`) — all-in-one application process for h264-streamer
@@ -178,6 +195,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Moonraker camera provisioning — configure webcams in Moonraker via HTTP API
 - Timelapse file management — list, serve (with HTTP Range), delete, auto-generate thumbnails
 - Dynamic config reload — `on_config_changed` callback for live settings updates
+- Runtime hot-apply for MJPEG FPS, H.264 bitrate (via `RK_MPI_VENC_SetChnAttr`), and debug logging
+- FPS/bitrate overlay rendering on MJPEG and H.264 stream previews
+- Runtime skip ratio reporting in stats API
+
+#### Fixed
+- Config-to-encoder mapping: bitrate, JPEG quality, H.264 resolution, and logging saved to config but never applied at startup
+- Auto-skip thresholds tuned for faster convergence using smoothed CPU readings
 
 ### [1.4.1] - 2026-02-16
 
