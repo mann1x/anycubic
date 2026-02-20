@@ -411,7 +411,6 @@
                             </label>
                         </div>
                     </div>
-                    <div class="setting-note">Requires restart</div>
                 </div>
                 <div class="setting rkmpi-mjpeg-only h264-local-setting">
                     <div class="setting-row">
@@ -493,7 +492,6 @@
                             <input type="number" name="bitrate" value="$bitrate" min="100" max="4000" style="width:80px;">
                         </div>
                     </div>
-                    <div class="setting-note">Requires restart</div>
                 </div>
                 <div class="setting rkmpi-only">
                     <div class="setting-row">
@@ -797,9 +795,6 @@
         let mjpegActive = false;
         let statsInterval = null;
         let currentEncoderType = '$encoder_type';
-        let currentMjpegFpsTarget = $mjpeg_fps;
-        let currentLogging = false;
-        let currentBitrate = $bitrate;
         let currentH264Resolution = '$h264_resolution';
         let currentSessionId = '$session_id';
 
@@ -1797,15 +1792,9 @@ if(flvjs.isSupported()){
         }
 
         function updateMjpegFpsLabel() {
-            const fps = parseInt(document.getElementById('mjpeg_fps_input').value) || 10;
             const label = document.getElementById('mjpeg_fps_label');
-            if (fps !== currentMjpegFpsTarget) {
-                label.textContent = '(Requires restart)';
-                label.style.color = '#f90';
-            } else {
-                label.textContent = '(Camera source rate)';
-                label.style.color = '#888';
-            }
+            label.textContent = '(Camera source rate)';
+            label.style.color = '#888';
         }
 
         function toggleAutoSkip(enabled) {
@@ -2150,16 +2139,10 @@ if(flvjs.isSupported()){
                 data.append('acproxycam_flv_proxy', '1');
             }
 
-            // Check if settings require restart
-            const newMjpegFps = parseInt(mjpegFpsValue) || 10;
-            const newLogging = formData.has('logging');
-            const newBitrate = parseInt(document.querySelector('[name=bitrate]').value) || 512;
+            // Check if settings require restart (only camera resolution still needs it)
             const newH264Resolution = document.querySelector('[name=h264_resolution]')?.value || '1280x720';
-            const needsRkmpiRestart = (newMjpegFps !== currentMjpegFpsTarget) && currentEncoderType === 'rkmpi';
-            const needsLoggingRestart = (newLogging !== currentLogging);
-            const needsBitrateRestart = (newBitrate !== currentBitrate) && (currentEncoderType === 'rkmpi' || currentEncoderType === 'rkmpi-yuyv');
-            const needsResolutionRestart = (newH264Resolution !== currentH264Resolution) && (currentEncoderType === 'rkmpi' || currentEncoderType === 'rkmpi-yuyv');
-            const needsRestart = needsRkmpiRestart || needsLoggingRestart || needsBitrateRestart || needsResolutionRestart;
+            const needsRestart = (newH264Resolution !== currentH264Resolution) &&
+                (currentEncoderType === 'rkmpi' || currentEncoderType === 'rkmpi-yuyv');
 
             if (needsRestart) {
                 // Show loading overlay and trigger restart
@@ -2248,6 +2231,11 @@ if(flvjs.isSupported()){
             const proxyCheckbox = document.querySelector('[name=acproxycam_flv_proxy]');
             if (proxyCheckbox) {
                 toggleProxySettings(proxyCheckbox.checked);
+            }
+            // Apply auto-skip UI state on load (disable slider when auto-skip is on)
+            const autoSkipCheckbox = document.querySelector('[name=auto_skip]');
+            if (autoSkipCheckbox) {
+                toggleAutoSkip(autoSkipCheckbox.checked);
             }
             // Check mode to disable LED buttons in vanilla-klipper
             fetch('/api/config').then(r => r.json()).then(data => {

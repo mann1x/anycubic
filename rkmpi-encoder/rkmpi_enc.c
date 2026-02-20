@@ -1083,11 +1083,11 @@ static CPUStats g_cpu_stats = {0};
  * - Require sustained low CPU before improving quality
  */
 #define AUTOSKIP_HISTORY_SIZE    8       /* Rolling average window (4s at 500ms interval) */
-#define AUTOSKIP_COOLDOWN_MS     3000    /* Wait 3s after increase before allowing decrease */
-#define AUTOSKIP_STABLE_COUNT    6       /* Need 6 consecutive low readings (~3s) to decrease */
-#define AUTOSKIP_HIGH_THRESHOLD  8       /* Increase if CPU > target + 8% (instant reaction) */
-#define AUTOSKIP_LOW_THRESHOLD   20      /* Decrease if smoothed CPU < target - 20% */
-#define AUTOSKIP_EMERGENCY_THRESHOLD 25  /* Emergency if CPU > target + 25% */
+#define AUTOSKIP_COOLDOWN_MS     2000    /* Wait 2s after increase before allowing decrease */
+#define AUTOSKIP_STABLE_COUNT    4       /* Need 4 consecutive low readings (~2s) to decrease */
+#define AUTOSKIP_HIGH_THRESHOLD  5       /* Increase if smoothed CPU > target + 5% */
+#define AUTOSKIP_LOW_THRESHOLD   10      /* Decrease if smoothed CPU < target - 10% */
+#define AUTOSKIP_EMERGENCY_THRESHOLD 20  /* Emergency instant increase if CPU > target + 20% */
 
 typedef struct {
     int cpu_history[AUTOSKIP_HISTORY_SIZE];  /* Rolling CPU readings */
@@ -1194,55 +1194,56 @@ static void auto_adjust_skip_ratio(void) {
     int target = g_ctrl.target_cpu;
     RK_U64 now = get_timestamp_us();
     const char *action = NULL;
+    int smoothed_cpu = get_smoothed_cpu();
 
     /*
-     * FAST PATH: Increase skip (reduce quality) on high CPU
-     * Uses INSTANT CPU reading for fast reaction
+     * EMERGENCY PATH: Instant reaction for very high CPU
+     * Uses instant CPU reading — only for truly critical situations
      */
-    if (cpu > target + AUTOSKIP_HIGH_THRESHOLD) {
+    if (cpu > target + AUTOSKIP_EMERGENCY_THRESHOLD) {
         int overage = cpu - target;
-        int steps = 1;
+        int steps;
 
-        /* Proportional response: more aggressive when further over target */
         if (overage > AUTOSKIP_EMERGENCY_THRESHOLD + 15) {
-            steps = 4;  /* Critical: jump aggressively */
+            steps = 3;  /* Critical */
             action = "CRITICAL";
-        } else if (overage > AUTOSKIP_EMERGENCY_THRESHOLD) {
-            steps = 3;  /* Emergency response */
-            action = "EMERGENCY";
-        } else if (overage > AUTOSKIP_HIGH_THRESHOLD + 7) {
-            steps = 2;  /* Moderate increase */
-            action = "HIGH";
         } else {
-            steps = 1;  /* Gentle increase */
-            action = "above";
+            steps = 2;  /* Emergency */
+            action = "EMERGENCY";
         }
 
         g_ctrl.skip_ratio += steps;
-        if (g_ctrl.skip_ratio > g_ctrl.max_skip) {
+        if (g_ctrl.skip_ratio > g_ctrl.max_skip)
             g_ctrl.skip_ratio = g_ctrl.max_skip;
-        }
 
-        /* Record increase time and reset stability counter */
         g_autoskip.last_increase_time = now;
         g_autoskip.stable_low_count = 0;
     }
     /*
-     * SLOW PATH: Decrease skip (improve quality) on low CPU
-     * Uses SMOOTHED CPU reading and requires stability
+     * NORMAL INCREASE: Uses smoothed CPU to avoid overreacting to spikes
+     * Single-step increase only
+     */
+    else if (smoothed_cpu >= 0 && smoothed_cpu > target + AUTOSKIP_HIGH_THRESHOLD) {
+        g_ctrl.skip_ratio++;
+        if (g_ctrl.skip_ratio > g_ctrl.max_skip)
+            g_ctrl.skip_ratio = g_ctrl.max_skip;
+
+        g_autoskip.last_increase_time = now;
+        g_autoskip.stable_low_count = 0;
+        action = "above";
+    }
+    /*
+     * DECREASE PATH: Improve quality when CPU is comfortably below target
+     * Uses smoothed CPU and requires stability
      */
     else {
-        int smoothed_cpu = get_smoothed_cpu();
-
         /* Check if CPU is below recovery threshold */
         if (smoothed_cpu >= 0 && smoothed_cpu < target - AUTOSKIP_LOW_THRESHOLD) {
             g_autoskip.stable_low_count++;
         } else {
-            /* Reset stability counter if not consistently low */
             g_autoskip.stable_low_count = 0;
         }
 
-        /* Check all conditions for decreasing skip ratio */
         int cooldown_elapsed = (now - g_autoskip.last_increase_time) >=
                                (AUTOSKIP_COOLDOWN_MS * 1000ULL);
         int stable_enough = g_autoskip.stable_low_count >= AUTOSKIP_STABLE_COUNT;
@@ -1250,16 +1251,15 @@ static void auto_adjust_skip_ratio(void) {
 
         if (cooldown_elapsed && stable_enough && can_decrease) {
             g_ctrl.skip_ratio--;
-            g_autoskip.stable_low_count = 0;  /* Reset after decrease */
+            g_autoskip.stable_low_count = 0;
             action = "stable-low";
         }
     }
 
     /* Log changes */
     if (g_ctrl.skip_ratio != old_skip) {
-        int smoothed = get_smoothed_cpu();
         log_info("Auto-skip: CPU=%d%% (avg=%d%%, target=%d%%), skip %d->%d [%s]\n",
-                 cpu, smoothed >= 0 ? smoothed : cpu, target,
+                 cpu, smoothed_cpu >= 0 ? smoothed_cpu : cpu, target,
                  old_skip, g_ctrl.skip_ratio, action ? action : "?");
         write_ctrl_file();
     }
@@ -1731,6 +1731,39 @@ static int g_moonraker_initialized = 0;
 static AppConfig *g_app_config_ptr = NULL;  /* Set in main() */
 
 /*
+ * Update H.264 encoder bitrate at runtime via RKMPI API.
+ * Can be called from control server thread — SDK has internal locking.
+ * Returns 0 on success, -1 on failure.
+ */
+static int update_venc_bitrate(int new_bitrate) {
+    VENC_CHN_ATTR_S stAttr;
+    RK_S32 ret = RK_MPI_VENC_GetChnAttr(VENC_CHN_H264, &stAttr);
+    if (ret != RK_SUCCESS) {
+        log_error("VENC GetChnAttr failed: 0x%x\n", ret);
+        return -1;
+    }
+
+    /* Update bitrate in rate control attr */
+    if (stAttr.stRcAttr.enRcMode == VENC_RC_MODE_H264CBR) {
+        stAttr.stRcAttr.stH264Cbr.u32BitRate = new_bitrate;
+    } else if (stAttr.stRcAttr.enRcMode == VENC_RC_MODE_H264VBR) {
+        stAttr.stRcAttr.stH264Vbr.u32BitRate = new_bitrate;
+        stAttr.stRcAttr.stH264Vbr.u32MaxBitRate = new_bitrate * 2;
+        stAttr.stRcAttr.stH264Vbr.u32MinBitRate = new_bitrate / 2;
+    }
+
+    ret = RK_MPI_VENC_SetChnAttr(VENC_CHN_H264, &stAttr);
+    if (ret != RK_SUCCESS) {
+        log_error("VENC SetChnAttr failed: 0x%x\n", ret);
+        return -1;
+    }
+
+    /* Force IDR for immediate effect */
+    RK_MPI_VENC_RequestIDR(VENC_CHN_H264, RK_TRUE);
+    return 0;
+}
+
+/*
  * Config-changed callback: handle timelapse/moonraker setting changes.
  * Called from control server thread when settings are saved.
  */
@@ -1754,6 +1787,32 @@ static void on_config_changed(AppConfig *cfg) {
     display_set_enabled(cfg->display_enabled);
     if (cfg->display_fps > 0)
         display_set_fps(cfg->display_fps);
+
+    /* Update logging at runtime (before other changes so log messages appear) */
+    g_verbose = cfg->logging;
+
+    /* Update MJPEG FPS at runtime */
+    if (cfg->mjpeg_fps >= 2 && cfg->mjpeg_fps <= 30 &&
+        cfg->mjpeg_fps != g_mjpeg_ctrl.target_fps) {
+        log_info("Config: MJPEG FPS %d -> %d\n",
+                 g_mjpeg_ctrl.target_fps, cfg->mjpeg_fps);
+        g_mjpeg_ctrl.target_fps = cfg->mjpeg_fps;
+        g_mjpeg_ctrl.target_interval = 1000000 / cfg->mjpeg_fps;
+    }
+
+    /* Update H.264 bitrate at runtime */
+    if (cfg->bitrate >= 100 && cfg->bitrate <= 4000) {
+        static int current_bitrate = 0;
+        if (current_bitrate != cfg->bitrate) {
+            if (update_venc_bitrate(cfg->bitrate) == 0) {
+                log_info("Config: H.264 bitrate changed to %d kbps\n",
+                         cfg->bitrate);
+                current_bitrate = cfg->bitrate;
+            } else {
+                log_error("Config: Failed to update H.264 bitrate\n");
+            }
+        }
+    }
 
     /* Update auto-skip settings */
     g_ctrl.auto_skip = cfg->auto_skip;
@@ -2061,6 +2120,27 @@ int main(int argc, char *argv[]) {
             log_info("Primary: ACProxyCam FLV proxy enabled, "
                      "disabling local H.264 encoding\n");
         }
+
+        /* Apply bitrate from config (overrides CLI default) */
+        if (app_config.bitrate >= 100 && app_config.bitrate <= 4000)
+            cfg.bitrate = app_config.bitrate;
+
+        /* Apply JPEG quality from config */
+        if (app_config.jpeg_quality >= 1 && app_config.jpeg_quality <= 99)
+            cfg.jpeg_quality = app_config.jpeg_quality;
+
+        /* Parse h264_resolution string -> cfg.h264_width/h264_height */
+        {
+            int res_w = 0, res_h = 0;
+            if (sscanf(app_config.h264_resolution, "%dx%d", &res_w, &res_h) == 2 &&
+                res_w >= 160 && res_w <= 1920 && res_h >= 120 && res_h <= 1080) {
+                cfg.h264_width = res_w;
+                cfg.h264_height = res_h;
+            }
+        }
+
+        /* Apply logging from config */
+        g_verbose = app_config.logging;
 
         /* Apply display settings from config */
         if (app_config.display_enabled) {
@@ -3044,7 +3124,8 @@ skip_jpeg_output:
                     g_stats.mjpeg_clients, g_stats.flv_clients,
                     0 /* display_clients */,
                     max_cam_fps > 0 ? max_cam_fps
-                                    : g_mjpeg_ctrl.target_fps);
+                                    : g_mjpeg_ctrl.target_fps,
+                    g_ctrl.skip_ratio);
             }
 
             last_stats_write = now;

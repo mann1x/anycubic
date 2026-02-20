@@ -62,6 +62,7 @@ typedef struct {
     int encoder_flv_clients;
     int encoder_display_clients;
     int max_camera_fps;
+    int runtime_skip_ratio;     /* Actual skip ratio (auto-adjusted) */
 
     /* ACProxyCam state */
     char acproxycam_flv_url[256];
@@ -106,7 +107,8 @@ void control_server_stop(void);
 /* Update encoder stats (called from main loop or stats reader) */
 void control_server_update_stats(float mjpeg_fps, float h264_fps,
                                   int mjpeg_clients, int flv_clients,
-                                  int display_clients, int max_camera_fps);
+                                  int display_clients, int max_camera_fps,
+                                  int skip_ratio);
 
 /* Set config-changed callback */
 void control_server_set_config_callback(void (*cb)(AppConfig *cfg));

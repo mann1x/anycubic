@@ -748,7 +748,10 @@ static void serve_api_stats(ControlServer *srv, int fd) {
     /* Settings */
     cJSON_AddStringToObject(root, "encoder_type", srv->config->encoder_type);
     cJSON_AddBoolToObject(root, "h264_enabled", srv->config->h264_enabled);
-    cJSON_AddNumberToObject(root, "skip_ratio", srv->config->skip_ratio);
+    /* Runtime skip_ratio (auto-adjusted) vs saved config value */
+    int rt_skip = srv->runtime_skip_ratio > 0 ? srv->runtime_skip_ratio
+                                               : srv->config->skip_ratio;
+    cJSON_AddNumberToObject(root, "skip_ratio", rt_skip);
     cJSON_AddNumberToObject(root, "saved_skip_ratio", srv->config->skip_ratio);
     cJSON_AddBoolToObject(root, "auto_skip", srv->config->auto_skip);
     cJSON_AddNumberToObject(root, "target_cpu", srv->config->target_cpu);
@@ -2898,7 +2901,8 @@ void control_server_stop(void) {
 
 void control_server_update_stats(float mjpeg_fps, float h264_fps,
                                   int mjpeg_clients, int flv_clients,
-                                  int display_clients, int max_camera_fps) {
+                                  int display_clients, int max_camera_fps,
+                                  int skip_ratio) {
     ControlServer *srv = &g_control_server;
     srv->encoder_mjpeg_fps = mjpeg_fps;
     srv->encoder_h264_fps = h264_fps;
@@ -2906,6 +2910,7 @@ void control_server_update_stats(float mjpeg_fps, float h264_fps,
     srv->encoder_flv_clients = flv_clients;
     srv->encoder_display_clients = display_clients;
     srv->max_camera_fps = max_camera_fps;
+    srv->runtime_skip_ratio = skip_ratio;
 }
 
 void control_server_set_config_callback(void (*cb)(AppConfig *cfg)) {
