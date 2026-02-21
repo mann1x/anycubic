@@ -21,6 +21,7 @@ OPENSSL_PATH = $(SDK_PATH)/openssl-arm
 # -fno-stack-protector: disable stack protection (not available in printer's uClibc)
 CFLAGS = -Wall -O2 -march=armv7-a -mfpu=neon -mfloat-abi=hard -fno-stack-protector
 CFLAGS += -I$(INC_PATH)
+CFLAGS += -I$(INC_PATH)/rknn
 CFLAGS += -I$(INC_PATH)/rkaiq/iq_parser_v2/j2s
 # OpenSSL headers and enable TLS
 CFLAGS += -I$(OPENSSL_PATH)/include -DHAVE_OPENSSL
@@ -60,7 +61,8 @@ SRCS = rkmpi_enc.c \
        touch_inject.c \
        camera_detect.c \
        process_manager.c \
-       moonraker_client.c
+       moonraker_client.c \
+       fault_detect.c
 
 OBJS = $(SRCS:.c=.o)
 
@@ -82,7 +84,8 @@ HDRS = frame_buffer.h \
        touch_inject.h \
        camera_detect.h \
        process_manager.h \
-       moonraker_client.h
+       moonraker_client.h \
+       fault_detect.h
 
 .PHONY: all clean install static dynamic server-only timing
 
@@ -152,10 +155,13 @@ run: deploy
 # Copy to h264-streamer build directory
 H264_STREAMER_BUILD = /shared/dev/Rinkhals/build/swu-tools/h264-streamer
 
+RKNN_LIB = $(SDK_PATH)/lib/librknnmrt.so
+
 install-h264: $(TARGET)
 	@echo "Installing $(TARGET) to h264-streamer build..."
 	cp $(TARGET) $(H264_STREAMER_BUILD)/
-	@echo "Installed to $(H264_STREAMER_BUILD)/$(TARGET)"
+	cp $(RKNN_LIB) $(H264_STREAMER_BUILD)/
+	@echo "Installed to $(H264_STREAMER_BUILD)/$(TARGET) + librknnmrt.so"
 
 help:
 	@echo "RKMPI H.264 Encoder Build System v2.0"

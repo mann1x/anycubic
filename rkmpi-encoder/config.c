@@ -146,6 +146,19 @@ void config_set_defaults(AppConfig *cfg) {
     cfg->cam_power_line = 1;
 
     cfg->cameras_json[0] = '\0';
+
+    /* Fault Detection */
+    cfg->fault_detect_enabled = 0;
+    cfg->fault_detect_cnn_enabled = 0;
+    cfg->fault_detect_proto_enabled = 0;
+    cfg->fault_detect_multi_enabled = 0;
+    strncpy(cfg->fault_detect_strategy, "or", sizeof(cfg->fault_detect_strategy) - 1);
+    cfg->fault_detect_interval = 5;
+    cfg->fault_detect_verify_interval = 2;
+    cfg->fault_detect_cnn_model[0] = '\0';
+    cfg->fault_detect_proto_model[0] = '\0';
+    cfg->fault_detect_multi_model[0] = '\0';
+    cfg->fault_detect_min_free_mem = 20;
 }
 
 int config_load(AppConfig *cfg, const char *path) {
@@ -283,6 +296,26 @@ int config_load(AppConfig *cfg, const char *path) {
         }
     }
 
+    /* Fault Detection */
+    cfg->fault_detect_enabled = json_get_bool(root, "fault_detect_enabled", cfg->fault_detect_enabled);
+    cfg->fault_detect_cnn_enabled = json_get_bool(root, "fault_detect_cnn_enabled", cfg->fault_detect_cnn_enabled);
+    cfg->fault_detect_proto_enabled = json_get_bool(root, "fault_detect_proto_enabled", cfg->fault_detect_proto_enabled);
+    cfg->fault_detect_multi_enabled = json_get_bool(root, "fault_detect_multi_enabled", cfg->fault_detect_multi_enabled);
+    const char *fd_strat = json_get_str(root, "fault_detect_strategy", cfg->fault_detect_strategy);
+    strncpy(cfg->fault_detect_strategy, fd_strat, sizeof(cfg->fault_detect_strategy) - 1);
+    cfg->fault_detect_interval = clamp_int(
+        json_get_int(root, "fault_detect_interval", cfg->fault_detect_interval), 1, 60);
+    cfg->fault_detect_verify_interval = clamp_int(
+        json_get_int(root, "fault_detect_verify_interval", cfg->fault_detect_verify_interval), 1, 30);
+    const char *fd_cnn = json_get_str(root, "fault_detect_cnn_model", cfg->fault_detect_cnn_model);
+    strncpy(cfg->fault_detect_cnn_model, fd_cnn, sizeof(cfg->fault_detect_cnn_model) - 1);
+    const char *fd_proto = json_get_str(root, "fault_detect_proto_model", cfg->fault_detect_proto_model);
+    strncpy(cfg->fault_detect_proto_model, fd_proto, sizeof(cfg->fault_detect_proto_model) - 1);
+    const char *fd_multi = json_get_str(root, "fault_detect_multi_model", cfg->fault_detect_multi_model);
+    strncpy(cfg->fault_detect_multi_model, fd_multi, sizeof(cfg->fault_detect_multi_model) - 1);
+    cfg->fault_detect_min_free_mem = clamp_int(
+        json_get_int(root, "fault_detect_min_free_mem", cfg->fault_detect_min_free_mem), 5, 100);
+
     cJSON_Delete(root);
 
     fprintf(stderr, "Config: Loaded from %s (encoder=%s, bitrate=%d, fps=%d)\n",
@@ -402,6 +435,19 @@ int config_save(const AppConfig *cfg, const char *path) {
     json_set_bool(root, "timelapse_flip_x", cfg->timelapse_flip_x);
     json_set_bool(root, "timelapse_flip_y", cfg->timelapse_flip_y);
     json_set_float(root, "timelapse_end_delay", cfg->timelapse_end_delay);
+
+    /* Fault Detection */
+    json_set_bool(root, "fault_detect_enabled", cfg->fault_detect_enabled);
+    json_set_bool(root, "fault_detect_cnn_enabled", cfg->fault_detect_cnn_enabled);
+    json_set_bool(root, "fault_detect_proto_enabled", cfg->fault_detect_proto_enabled);
+    json_set_bool(root, "fault_detect_multi_enabled", cfg->fault_detect_multi_enabled);
+    json_set_str(root, "fault_detect_strategy", cfg->fault_detect_strategy);
+    json_set_int(root, "fault_detect_interval", cfg->fault_detect_interval);
+    json_set_int(root, "fault_detect_verify_interval", cfg->fault_detect_verify_interval);
+    json_set_str(root, "fault_detect_cnn_model", cfg->fault_detect_cnn_model);
+    json_set_str(root, "fault_detect_proto_model", cfg->fault_detect_proto_model);
+    json_set_str(root, "fault_detect_multi_model", cfg->fault_detect_multi_model);
+    json_set_int(root, "fault_detect_min_free_mem", cfg->fault_detect_min_free_mem);
 
     /* Per-camera settings */
     if (cfg->cameras_json[0]) {

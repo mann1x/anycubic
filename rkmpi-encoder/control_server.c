@@ -14,6 +14,7 @@
 #include "http_server.h"
 #include "lan_mode.h"
 #include "touch_inject.h"
+#include "fault_detect.h"
 #include "cJSON.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -588,6 +589,13 @@ static void serve_control_page(ControlServer *srv, int fd) {
         { "timelapse_flip_x_checked", cfg->timelapse_flip_x ? checked : empty },
         { "timelapse_flip_y_checked", cfg->timelapse_flip_y ? checked : empty },
         { "timelapse_end_delay", tl_ed_str },
+        /* Fault detection */
+        { "fd_npu_available", fault_detect_npu_available() ? "true" : "false" },
+        { "fd_enabled_checked", cfg->fault_detect_enabled ? checked : empty },
+        { "fd_cnn_enabled_checked", cfg->fault_detect_cnn_enabled ? checked : empty },
+        { "fd_proto_enabled_checked", cfg->fault_detect_proto_enabled ? checked : empty },
+        { "fd_multi_enabled_checked", cfg->fault_detect_multi_enabled ? checked : empty },
+        { "fd_strategy", cfg->fault_detect_strategy },
     };
     int nvars = sizeof(vars) / sizeof(vars[0]);
 
@@ -763,6 +771,31 @@ static void serve_api_stats(ControlServer *srv, int fd) {
     cJSON_AddNumberToObject(root, "display_fps", srv->config->display_fps);
     cJSON_AddStringToObject(root, "mode", srv->config->mode);
 
+    /* Fault detection status */
+    {
+        cJSON *fd_obj = cJSON_CreateObject();
+        fd_state_t fd_state = fault_detect_get_state();
+        static const char *fd_status_names[] = {
+            "disabled", "enabled", "active", "error", "no_npu", "mem_low"
+        };
+        int si = (int)fd_state.status;
+        if (si < 0 || si > 5) si = 3;
+        cJSON_AddStringToObject(fd_obj, "status", fd_status_names[si]);
+        cJSON_AddStringToObject(fd_obj, "detection",
+            fd_state.last_result.result == FD_CLASS_FAULT ? "fault" : "ok");
+        cJSON_AddStringToObject(fd_obj, "fault_class",
+            fd_state.last_result.fault_class_name);
+        cJSON_AddNumberToObject(fd_obj, "confidence",
+            ((int)(fd_state.last_result.confidence * 100 + 0.5f)) / 100.0);
+        cJSON_AddNumberToObject(fd_obj, "inference_ms",
+            (int)(fd_state.last_result.total_ms + 0.5f));
+        cJSON_AddNumberToObject(fd_obj, "cycle_count",
+            (double)fd_state.cycle_count);
+        cJSON_AddBoolToObject(fd_obj, "npu_available",
+            fault_detect_npu_available());
+        cJSON_AddItemToObject(root, "fault_detect", fd_obj);
+    }
+
     send_json_response(fd, 200, root);
     cJSON_Delete(root);
 }
@@ -805,6 +838,126 @@ static void serve_api_config(ControlServer *srv, int fd) {
 
     send_json_response(fd, 200, root);
     cJSON_Delete(root);
+}
+
+/* GET /api/fault_detect/models - List available models */
+static void serve_fault_detect_models(ControlServer *srv, int fd) {
+    (void)srv;
+    fd_model_info_t models[FD_MAX_MODELS * 3];
+    int count = fault_detect_scan_models(models, FD_MAX_MODELS * 3);
+
+    fd_config_t fd_cfg = fault_detect_get_config();
+
+    cJSON *arr = cJSON_CreateArray();
+    for (int i = 0; i < count; i++) {
+        cJSON *item = cJSON_CreateObject();
+        cJSON_AddStringToObject(item, "name", models[i].name);
+        cJSON_AddStringToObject(item, "path", models[i].path);
+        const char *cls_name = models[i].cls == FD_MODEL_CNN ? "cnn" :
+                               models[i].cls == FD_MODEL_PROTONET ? "protonet" :
+                               "multiclass";
+        cJSON_AddStringToObject(item, "class", cls_name);
+
+        /* Check if this model is currently selected */
+        int selected = 0;
+        if (models[i].cls == FD_MODEL_CNN &&
+            strcmp(models[i].name, fd_cfg.cnn_model) == 0)
+            selected = 1;
+        else if (models[i].cls == FD_MODEL_PROTONET &&
+                 strcmp(models[i].name, fd_cfg.proto_model) == 0)
+            selected = 1;
+        else if (models[i].cls == FD_MODEL_MULTICLASS &&
+                 strcmp(models[i].name, fd_cfg.multi_model) == 0)
+            selected = 1;
+        cJSON_AddBoolToObject(item, "selected", selected);
+
+        cJSON_AddItemToArray(arr, item);
+    }
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddItemToObject(root, "models", arr);
+    cJSON_AddBoolToObject(root, "npu_available", fault_detect_npu_available());
+
+    send_json_response(fd, 200, root);
+    cJSON_Delete(root);
+}
+
+/* POST /api/fault_detect/settings - Update fault detection settings */
+static void handle_fault_detect_settings(ControlServer *srv, int fd,
+                                          const char *body) {
+    cJSON *root = cJSON_Parse(body);
+    if (!root) {
+        send_http_response(fd, 400, "application/json",
+                          "{\"status\":\"error\",\"error\":\"invalid JSON\"}", 42,
+                          NULL);
+        return;
+    }
+
+    AppConfig *cfg = srv->config;
+
+    /* Update config fields from JSON */
+    const cJSON *item;
+    item = cJSON_GetObjectItemCaseSensitive(root, "enabled");
+    if (item) cfg->fault_detect_enabled = cJSON_IsTrue(item) ? 1 : 0;
+
+    item = cJSON_GetObjectItemCaseSensitive(root, "cnn_enabled");
+    if (item) cfg->fault_detect_cnn_enabled = cJSON_IsTrue(item) ? 1 : 0;
+
+    item = cJSON_GetObjectItemCaseSensitive(root, "proto_enabled");
+    if (item) cfg->fault_detect_proto_enabled = cJSON_IsTrue(item) ? 1 : 0;
+
+    item = cJSON_GetObjectItemCaseSensitive(root, "multi_enabled");
+    if (item) cfg->fault_detect_multi_enabled = cJSON_IsTrue(item) ? 1 : 0;
+
+    item = cJSON_GetObjectItemCaseSensitive(root, "strategy");
+    if (item && cJSON_IsString(item) && item->valuestring)
+        safe_strcpy(cfg->fault_detect_strategy,
+                    sizeof(cfg->fault_detect_strategy), item->valuestring);
+
+    item = cJSON_GetObjectItemCaseSensitive(root, "interval");
+    if (item && cJSON_IsNumber(item)) {
+        int v = item->valueint;
+        if (v >= 1 && v <= 60) cfg->fault_detect_interval = v;
+    }
+
+    item = cJSON_GetObjectItemCaseSensitive(root, "verify_interval");
+    if (item && cJSON_IsNumber(item)) {
+        int v = item->valueint;
+        if (v >= 1 && v <= 30) cfg->fault_detect_verify_interval = v;
+    }
+
+    item = cJSON_GetObjectItemCaseSensitive(root, "cnn_model");
+    if (item && cJSON_IsString(item) && item->valuestring)
+        safe_strcpy(cfg->fault_detect_cnn_model,
+                    sizeof(cfg->fault_detect_cnn_model), item->valuestring);
+
+    item = cJSON_GetObjectItemCaseSensitive(root, "proto_model");
+    if (item && cJSON_IsString(item) && item->valuestring)
+        safe_strcpy(cfg->fault_detect_proto_model,
+                    sizeof(cfg->fault_detect_proto_model), item->valuestring);
+
+    item = cJSON_GetObjectItemCaseSensitive(root, "multi_model");
+    if (item && cJSON_IsString(item) && item->valuestring)
+        safe_strcpy(cfg->fault_detect_multi_model,
+                    sizeof(cfg->fault_detect_multi_model), item->valuestring);
+
+    item = cJSON_GetObjectItemCaseSensitive(root, "min_free_mem");
+    if (item && cJSON_IsNumber(item)) {
+        int v = item->valueint;
+        if (v >= 5 && v <= 100) cfg->fault_detect_min_free_mem = v;
+    }
+
+    cJSON_Delete(root);
+
+    /* Save to disk */
+    config_save(cfg, cfg->config_file);
+
+    /* Apply live update via config-changed callback */
+    if (srv->on_config_changed)
+        srv->on_config_changed(cfg);
+
+    send_http_response(fd, 200, "application/json",
+                      "{\"status\":\"ok\"}", 15, NULL);
 }
 
 /* GET /api/camera/controls - Camera control ranges and values */
@@ -2691,6 +2844,13 @@ static void handle_client(ControlServer *srv, int client_fd,
         } else {
             serve_acproxycam_flv_status(srv, client_fd);
         }
+    }
+    /* Fault detection routes */
+    else if (is_get && strcmp(path, "/api/fault_detect/models") == 0) {
+        serve_fault_detect_models(srv, client_fd);
+    }
+    else if (is_post && strcmp(path, "/api/fault_detect/settings") == 0) {
+        handle_fault_detect_settings(srv, client_fd, post_body ? post_body : "");
     }
     /* Streaming redirects */
     else if (is_get && strcmp(path, "/stream") == 0) {

@@ -69,6 +69,7 @@
 #include "camera_detect.h"
 #include "process_manager.h"
 #include "moonraker_client.h"
+#include "fault_detect.h"
 #include "cJSON.h"
 
 /* Forward declarations */
@@ -1858,6 +1859,32 @@ static void on_config_changed(AppConfig *cfg) {
             }
         }
     }
+
+    /* Update fault detection config */
+    {
+        fd_config_t fd_cfg;
+        fd_cfg.enabled = cfg->fault_detect_enabled;
+        fd_cfg.cnn_enabled = cfg->fault_detect_cnn_enabled;
+        fd_cfg.proto_enabled = cfg->fault_detect_proto_enabled;
+        fd_cfg.multi_enabled = cfg->fault_detect_multi_enabled;
+        fd_cfg.strategy = fd_strategy_from_name(cfg->fault_detect_strategy);
+        fd_cfg.interval_s = cfg->fault_detect_interval;
+        fd_cfg.verify_interval_s = cfg->fault_detect_verify_interval;
+        snprintf(fd_cfg.cnn_model, sizeof(fd_cfg.cnn_model), "%s",
+                 cfg->fault_detect_cnn_model);
+        snprintf(fd_cfg.proto_model, sizeof(fd_cfg.proto_model), "%s",
+                 cfg->fault_detect_proto_model);
+        snprintf(fd_cfg.multi_model, sizeof(fd_cfg.multi_model), "%s",
+                 cfg->fault_detect_multi_model);
+        fd_cfg.min_free_mem_mb = cfg->fault_detect_min_free_mem;
+        fault_detect_set_config(&fd_cfg);
+
+        if (cfg->fault_detect_enabled && fault_detect_npu_available()) {
+            fault_detect_start();  /* no-op if already running */
+        } else {
+            fault_detect_stop();
+        }
+    }
 }
 
 int main(int argc, char *argv[]) {
@@ -2180,6 +2207,35 @@ int main(int argc, char *argv[]) {
             control_server_set_restart_callback(on_restart_requested);
         } else {
             log_error("Primary: failed to start control server\n");
+        }
+
+        /* Initialize fault detection (scans models, dlopen RKNN) */
+        fault_detect_init("/useremain/home/rinkhals/fault_detect/models");
+
+        /* Apply saved config to fault detection */
+        {
+            fd_config_t fd_cfg;
+            fd_cfg.enabled = app_config.fault_detect_enabled;
+            fd_cfg.cnn_enabled = app_config.fault_detect_cnn_enabled;
+            fd_cfg.proto_enabled = app_config.fault_detect_proto_enabled;
+            fd_cfg.multi_enabled = app_config.fault_detect_multi_enabled;
+            fd_cfg.strategy = fd_strategy_from_name(app_config.fault_detect_strategy);
+            fd_cfg.interval_s = app_config.fault_detect_interval;
+            fd_cfg.verify_interval_s = app_config.fault_detect_verify_interval;
+            snprintf(fd_cfg.cnn_model, sizeof(fd_cfg.cnn_model), "%s",
+                     app_config.fault_detect_cnn_model);
+            snprintf(fd_cfg.proto_model, sizeof(fd_cfg.proto_model), "%s",
+                     app_config.fault_detect_proto_model);
+            snprintf(fd_cfg.multi_model, sizeof(fd_cfg.multi_model), "%s",
+                     app_config.fault_detect_multi_model);
+            fd_cfg.min_free_mem_mb = app_config.fault_detect_min_free_mem;
+            fault_detect_set_config(&fd_cfg);
+
+            if (app_config.fault_detect_enabled && fault_detect_npu_available()) {
+                if (fault_detect_start() < 0) {
+                    log_error("Fault detection: model validation failed, disabling\n");
+                }
+            }
         }
     }
 
@@ -2789,6 +2845,7 @@ int main(int argc, char *argv[]) {
                                 frame_buffer_write(&g_jpeg_buffer, jpeg_data, jpeg_len,
                                                    get_timestamp_us(), 0);
                                 clear_snapshot_pending();  /* Clear snapshot request */
+                                fault_detect_feed_jpeg(jpeg_data, jpeg_len);
                             }
                             TIMING_END(frame_buffer);
 
@@ -2933,6 +2990,8 @@ skip_jpeg_output:
                                    get_timestamp_us(), 0);
                 clear_snapshot_pending();  /* Clear snapshot request after writing frame */
             }
+            if (cfg.server_mode && captured_count >= CAMERA_WARMUP_FRAMES)
+                fault_detect_feed_jpeg(jpeg_data, jpeg_len);
             TIMING_END(frame_buffer);
 
             /* Output MJPEG to stdout (multipart format for HTTP streaming) */
@@ -3165,6 +3224,10 @@ skip_jpeg_output:
                  (unsigned long long)mjpeg_frame_count, mjpeg_fps,
                  (unsigned long long)h264_frame_count, h264_fps, elapsed);
     }
+
+    /* Stop fault detection */
+    fault_detect_stop();
+    fault_detect_cleanup();
 
     /* Stop Moonraker client (before secondary cameras and control server) */
     if (g_moonraker_initialized) {

@@ -107,6 +107,19 @@ typedef struct {
     /* Stored as raw JSON string to preserve unknown camera IDs */
     char cameras_json[4096];
 
+    /* Fault Detection */
+    int fault_detect_enabled;
+    int fault_detect_cnn_enabled;
+    int fault_detect_proto_enabled;
+    int fault_detect_multi_enabled;
+    char fault_detect_strategy[32];
+    int fault_detect_interval;
+    int fault_detect_verify_interval;
+    char fault_detect_cnn_model[64];
+    char fault_detect_proto_model[64];
+    char fault_detect_multi_model[64];
+    int fault_detect_min_free_mem;
+
     /* Runtime: config file path (not persisted) */
     char config_file[256];
 } AppConfig;
