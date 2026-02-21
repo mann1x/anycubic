@@ -821,7 +821,7 @@
                     </div>
                 </div>
 
-                <div id="fd-details" style="display:none;">
+                <div id="fd-details">
                     <div class="setting" id="fd-models-container">
                         <div class="setting-row">
                             <span class="label">Models:</span>
@@ -2423,9 +2423,10 @@ if(flvjs.isSupported()){
         }
 
         function updateFdVisibility() {
+            /* Settings always visible; just dim when disabled */
             const enabled = document.getElementById('fd_enabled').checked;
             const details = document.getElementById('fd-details');
-            if (details) details.style.display = enabled ? '' : 'none';
+            if (details) details.style.opacity = enabled ? '1' : '0.5';
         }
 
         function loadFdModels() {

@@ -635,8 +635,8 @@ static void fd_get_thresholds(int strategy,
     case FD_STRATEGY_PROTONET:
     case FD_STRATEGY_MULTICLASS:
     default:
-        *cnn_th   = 0.50f;   /* Printer-calibrated: idle max=0.408, fault typ=0.97 */
-        *proto_th = 0.60f;   /* Printer-calibrated: idle max=0.591, fault min=0.578 */
+        *cnn_th   = 0.50f;   /* Printer-calibrated: idle max=0.443, p95=0.429 */
+        *proto_th = 0.65f;   /* Printer-calibrated: idle max=0.619, p95=0.584 */
         break;
     }
     /* Multi-class threshold:
@@ -854,11 +854,13 @@ static void fd_run_detection(const uint8_t *preprocessed, fd_result_t *result,
         if (pace_us > 0 && have_cnn) usleep(pace_us);
     }
 
-    /* Dynamic CNN threshold: when ProtoNet sees something suspicious,
+    /* Dynamic CNN threshold: when ProtoNet is moderately suspicious,
      * lower the CNN threshold to catch light faults.
-     * Proto margin >= 0.45 → cnn_th drops from 0.50 to 0.42 */
-    if (have_proto && have_cnn && proto_conf >= 0.45f) {
-        cnn_th = 0.42f;
+     * Proto margin >= 0.60 → cnn_th drops from 0.50 to 0.45
+     * Trigger at 0.60 (vs proto_th 0.65) so CNN assists before Proto trips.
+     * 0.45 is safe: idle CNN max=0.443, fires on <2% of idle cycles. */
+    if (have_proto && have_cnn && proto_conf >= 0.60f) {
+        cnn_th = 0.45f;
         fd_log("  Dynamic CNN threshold: %.2f (proto margin=%.3f)\n",
                cnn_th, proto_conf);
     }
