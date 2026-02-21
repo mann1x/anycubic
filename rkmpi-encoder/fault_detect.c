@@ -840,6 +840,29 @@ static void fd_run_detection(const uint8_t *preprocessed, fd_result_t *result,
 
     int pace_us = cfg->pace_ms * 1000;
 
+    /* Run ProtoNet FIRST (its margin gates the CNN threshold) */
+    if (have_proto) {
+        memset(&model_result, 0, sizeof(model_result));
+        if (fd_run_protonet(preprocessed, &model_result, proto_th) < 0) {
+            result->result = FD_CLASS_OK;
+            result->total_ms = (float)(fd_get_time_ms() - t0);
+            return;
+        }
+        proto_class = model_result.result;
+        proto_conf = model_result.confidence;
+        result->proto_ms = model_result.proto_ms;
+        if (pace_us > 0 && have_cnn) usleep(pace_us);
+    }
+
+    /* Dynamic CNN threshold: when ProtoNet sees something suspicious,
+     * lower the CNN threshold to catch light faults.
+     * Proto margin >= 0.45 → cnn_th drops from 0.50 to 0.42 */
+    if (have_proto && have_cnn && proto_conf >= 0.45f) {
+        cnn_th = 0.42f;
+        fd_log("  Dynamic CNN threshold: %.2f (proto margin=%.3f)\n",
+               cnn_th, proto_conf);
+    }
+
     /* Run CNN */
     if (have_cnn) {
         memset(&model_result, 0, sizeof(model_result));
@@ -851,20 +874,6 @@ static void fd_run_detection(const uint8_t *preprocessed, fd_result_t *result,
         cnn_class = model_result.result;
         cnn_conf = model_result.confidence;
         result->cnn_ms = model_result.cnn_ms;
-        if (pace_us > 0 && have_proto) usleep(pace_us);
-    }
-
-    /* Run ProtoNet */
-    if (have_proto) {
-        memset(&model_result, 0, sizeof(model_result));
-        if (fd_run_protonet(preprocessed, &model_result, proto_th) < 0) {
-            result->result = FD_CLASS_OK;
-            result->total_ms = (float)(fd_get_time_ms() - t0);
-            return;
-        }
-        proto_class = model_result.result;
-        proto_conf = model_result.confidence;
-        result->proto_ms = model_result.proto_ms;
     }
 
     /* VERIFY/CLASSIFY: only run multiclass if CNN or ProtoNet flagged FAULT */
