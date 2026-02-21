@@ -1877,6 +1877,7 @@ static void on_config_changed(AppConfig *cfg) {
         snprintf(fd_cfg.multi_model, sizeof(fd_cfg.multi_model), "%s",
                  cfg->fault_detect_multi_model);
         fd_cfg.min_free_mem_mb = cfg->fault_detect_min_free_mem;
+        fd_cfg.pace_ms = cfg->fault_detect_pace_ms;
         fault_detect_set_config(&fd_cfg);
 
         if (cfg->fault_detect_enabled && fault_detect_npu_available()) {
@@ -2229,6 +2230,7 @@ int main(int argc, char *argv[]) {
             snprintf(fd_cfg.multi_model, sizeof(fd_cfg.multi_model), "%s",
                      app_config.fault_detect_multi_model);
             fd_cfg.min_free_mem_mb = app_config.fault_detect_min_free_mem;
+            fd_cfg.pace_ms = app_config.fault_detect_pace_ms;
             fault_detect_set_config(&fd_cfg);
 
             if (app_config.fault_detect_enabled && fault_detect_npu_available()) {

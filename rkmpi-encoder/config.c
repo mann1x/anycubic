@@ -159,6 +159,7 @@ void config_set_defaults(AppConfig *cfg) {
     cfg->fault_detect_proto_model[0] = '\0';
     cfg->fault_detect_multi_model[0] = '\0';
     cfg->fault_detect_min_free_mem = 20;
+    cfg->fault_detect_pace_ms = 0;
 }
 
 int config_load(AppConfig *cfg, const char *path) {
@@ -315,6 +316,8 @@ int config_load(AppConfig *cfg, const char *path) {
     strncpy(cfg->fault_detect_multi_model, fd_multi, sizeof(cfg->fault_detect_multi_model) - 1);
     cfg->fault_detect_min_free_mem = clamp_int(
         json_get_int(root, "fault_detect_min_free_mem", cfg->fault_detect_min_free_mem), 5, 100);
+    cfg->fault_detect_pace_ms = clamp_int(
+        json_get_int(root, "fault_detect_pace_ms", cfg->fault_detect_pace_ms), 0, 500);
 
     cJSON_Delete(root);
 
@@ -448,6 +451,7 @@ int config_save(const AppConfig *cfg, const char *path) {
     json_set_str(root, "fault_detect_proto_model", cfg->fault_detect_proto_model);
     json_set_str(root, "fault_detect_multi_model", cfg->fault_detect_multi_model);
     json_set_int(root, "fault_detect_min_free_mem", cfg->fault_detect_min_free_mem);
+    json_set_int(root, "fault_detect_pace_ms", cfg->fault_detect_pace_ms);
 
     /* Per-camera settings */
     if (cfg->cameras_json[0]) {

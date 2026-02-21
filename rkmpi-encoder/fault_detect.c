@@ -425,16 +425,37 @@ static int fd_decode_jpeg(const uint8_t *jpeg_data, size_t jpeg_size,
         return -1;
     }
 
-    img->data = (uint8_t *)malloc(width * height * 3);
+    /* Find smallest TurboJPEG scaling factor where shortest side >= 256 */
+    int num_sf = 0;
+    tjscalingfactor *sf = tjGetScalingFactors(&num_sf);
+    tjscalingfactor best_sf = {1, 1};  /* default: no scaling */
+    if (sf) {
+        for (int i = 0; i < num_sf; i++) {
+            int sw = TJSCALED(width, sf[i]);
+            int sh = TJSCALED(height, sf[i]);
+            int shortest = sw < sh ? sw : sh;
+            int best_w = TJSCALED(width, best_sf);
+            int best_h = TJSCALED(height, best_sf);
+            if (shortest >= 256 && sw * sh < best_w * best_h) {
+                best_sf = sf[i];
+            }
+        }
+    }
+
+    int out_w = TJSCALED(width, best_sf);
+    int out_h = TJSCALED(height, best_sf);
+
+    img->data = (uint8_t *)malloc(out_w * out_h * 3);
     if (!img->data) {
         tjDestroy(handle);
         return -1;
     }
-    img->width = width;
-    img->height = height;
+    img->width = out_w;
+    img->height = out_h;
 
     ret = tjDecompress2(handle, jpeg_data, (unsigned long)jpeg_size,
-                        img->data, width, 0, height, TJPF_RGB, 0);
+                        img->data, out_w, 0, out_h, TJPF_RGB,
+                        0);
     tjDestroy(handle);
     if (ret < 0) {
         free(img->data);
@@ -444,10 +465,14 @@ static int fd_decode_jpeg(const uint8_t *jpeg_data, size_t jpeg_size,
     return 0;
 }
 
-/* Fused resize (shortest side→256) + center crop (224×224), bilinear */
-static void fd_resize_crop_bilinear(const uint8_t *src, int sw, int sh,
-                                     uint8_t *dst, int dw, int dh)
+/* Fused resize + center crop + grayscale in single pass (no intermediate buffer).
+ * Resizes shortest side to 256, center-crops 224×224, converts to BT.601
+ * grayscale replicated to 3 channels. Bilinear interpolation. */
+static void fd_resize_crop_gray(const uint8_t *src, int sw, int sh,
+                                 uint8_t *dst)
 {
+    const int dw = FD_MODEL_INPUT_SIZE;
+    const int dh = FD_MODEL_INPUT_SIZE;
     float scale = 256.0f / (sw < sh ? sw : sh);
     int rw = (int)(sw * scale);
     int rh = (int)(sh * scale);
@@ -481,39 +506,24 @@ static void fd_resize_crop_bilinear(const uint8_t *src, int sw, int sh,
             float w01 = (1.0f - x_diff) * y_diff;
             float w11 = x_diff * y_diff;
 
-            for (int ch = 0; ch < 3; ch++) {
-                float val = a[ch] * w00 + b[ch] * w10 +
-                            c[ch] * w01 + d[ch] * w11;
-                int iv = (int)(val + 0.5f);
-                if (iv < 0) iv = 0;
-                if (iv > 255) iv = 255;
-                dst[(dy * dw + dx) * 3 + ch] = (uint8_t)iv;
-            }
+            /* Bilinear interpolate each channel, then BT.601 grayscale */
+            float r = a[0]*w00 + b[0]*w10 + c[0]*w01 + d[0]*w11;
+            float g = a[1]*w00 + b[1]*w10 + c[1]*w01 + d[1]*w11;
+            float bl = a[2]*w00 + b[2]*w10 + c[2]*w01 + d[2]*w11;
+            int gray = (int)((306*r + 601*g + 117*bl) / 1024.0f + 0.5f);
+            if (gray < 0) gray = 0;
+            if (gray > 255) gray = 255;
+            uint8_t g8 = (uint8_t)gray;
+            int off = (dy * dw + dx) * 3;
+            dst[off] = dst[off + 1] = dst[off + 2] = g8;
         }
     }
 }
 
-/* Full preprocessing: resize+crop then 3-channel grayscale (BT.601) */
+/* Preprocess: scaled-decode image → fused resize+crop+grayscale */
 static int fd_preprocess(const fd_image_t *img, uint8_t *out_buf)
 {
-    uint8_t *crop_buf = (uint8_t *)malloc(FD_MODEL_INPUT_BYTES);
-    if (!crop_buf) return -1;
-
-    fd_resize_crop_bilinear(img->data, img->width, img->height,
-                            crop_buf, FD_MODEL_INPUT_SIZE, FD_MODEL_INPUT_SIZE);
-
-    int npix = FD_MODEL_INPUT_SIZE * FD_MODEL_INPUT_SIZE;
-    for (int i = 0; i < npix; i++) {
-        uint8_t r = crop_buf[i * 3 + 0];
-        uint8_t g = crop_buf[i * 3 + 1];
-        uint8_t b = crop_buf[i * 3 + 2];
-        uint8_t gray = (uint8_t)((306 * r + 601 * g + 117 * b) >> 10);
-        out_buf[i * 3 + 0] = gray;
-        out_buf[i * 3 + 1] = gray;
-        out_buf[i * 3 + 2] = gray;
-    }
-
-    free(crop_buf);
+    fd_resize_crop_gray(img->data, img->width, img->height, out_buf);
     return 0;
 }
 
@@ -625,7 +635,7 @@ static void fd_get_thresholds(int strategy,
     case FD_STRATEGY_PROTONET:
     case FD_STRATEGY_MULTICLASS:
     default:
-        *cnn_th   = 0.29f;   /* Printer-calibrated: idle max=0.286, fault min=0.292 */
+        *cnn_th   = 0.50f;   /* Printer-calibrated: idle max=0.408, fault typ=0.97 */
         *proto_th = 0.60f;   /* Printer-calibrated: idle max=0.591, fault min=0.578 */
         break;
     }
@@ -828,6 +838,8 @@ static void fd_run_detection(const uint8_t *preprocessed, fd_result_t *result,
     float cnn_conf = 0.5f, proto_conf = 0.0f, multi_conf = 0.5f;
     fd_result_t model_result;
 
+    int pace_us = cfg->pace_ms * 1000;
+
     /* Run CNN */
     if (have_cnn) {
         memset(&model_result, 0, sizeof(model_result));
@@ -839,6 +851,7 @@ static void fd_run_detection(const uint8_t *preprocessed, fd_result_t *result,
         cnn_class = model_result.result;
         cnn_conf = model_result.confidence;
         result->cnn_ms = model_result.cnn_ms;
+        if (pace_us > 0 && have_proto) usleep(pace_us);
     }
 
     /* Run ProtoNet */
@@ -866,6 +879,7 @@ static void fd_run_detection(const uint8_t *preprocessed, fd_result_t *result,
 
     /* Run Multiclass */
     if (run_multi) {
+        if (pace_us > 0) usleep(pace_us);
         memset(&model_result, 0, sizeof(model_result));
         if (fd_run_multiclass(preprocessed, &model_result, multi_th) == 0) {
             multi_class = model_result.result;
@@ -1064,8 +1078,9 @@ static void *fd_thread_func(void *arg)
         if (!jpeg_copy) continue;
 
         fd_set_state(FD_STATUS_ACTIVE, NULL, NULL);
+        int pace_us = cfg.pace_ms * 1000;
 
-        /* Decode JPEG */
+        /* Decode JPEG (with TurboJPEG scaled decode) */
         fd_image_t img = {0};
         if (fd_decode_jpeg(jpeg_copy, jpeg_size, &img) < 0) {
             free(jpeg_copy);
@@ -1074,7 +1089,9 @@ static void *fd_thread_func(void *arg)
         }
         free(jpeg_copy);
 
-        /* Preprocess */
+        if (pace_us > 0) usleep(pace_us);
+
+        /* Fused resize+crop+grayscale (single pass, no intermediate alloc) */
         if (fd_preprocess(&img, preprocessed) < 0) {
             free(img.data);
             fd_set_state(FD_STATUS_ERROR, NULL, "preprocess failed");
@@ -1082,7 +1099,9 @@ static void *fd_thread_func(void *arg)
         }
         free(img.data);
 
-        /* Run detection */
+        if (pace_us > 0) usleep(pace_us);
+
+        /* Run detection (pacing between models handled inside) */
         fd_result_t result;
         fd_run_detection(preprocessed, &result, &cfg);
 

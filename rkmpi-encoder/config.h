@@ -119,6 +119,7 @@ typedef struct {
     char fault_detect_proto_model[64];
     char fault_detect_multi_model[64];
     int fault_detect_min_free_mem;
+    int fault_detect_pace_ms;
 
     /* Runtime: config file path (not persisted) */
     char config_file[256];

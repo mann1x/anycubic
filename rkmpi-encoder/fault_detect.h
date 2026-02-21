@@ -107,6 +107,7 @@ typedef struct {
     char proto_model[64];       /* Selected ProtoNet model subdir */
     char multi_model[64];       /* Selected Multiclass model subdir */
     int min_free_mem_mb;        /* Min free memory to run (default 20) */
+    int pace_ms;                /* Inter-step pause ms to reduce CPU spikes (0=off) */
 } fd_config_t;
 
 /* ============================================================================

@@ -947,6 +947,12 @@ static void handle_fault_detect_settings(ControlServer *srv, int fd,
         if (v >= 5 && v <= 100) cfg->fault_detect_min_free_mem = v;
     }
 
+    item = cJSON_GetObjectItemCaseSensitive(root, "pace_ms");
+    if (item && cJSON_IsNumber(item)) {
+        int v = item->valueint;
+        if (v >= 0 && v <= 500) cfg->fault_detect_pace_ms = v;
+    }
+
     cJSON_Delete(root);
 
     /* Save to disk */
