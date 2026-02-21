@@ -57,6 +57,9 @@ start() {
     cd "$APP_ROOT"
     echo "Starting h264-streamer app" >> "$APP_LOG"
 
+    # Kill gkcam to free camera/ISP resources (required in all modes)
+    kill_by_name gkcam
+
     PIDS=$(get_by_name h264_monitor)
     if [ "$PIDS" = "" ]; then
         chmod +x ./h264_monitor.sh
@@ -73,10 +76,8 @@ debug() {
     ./h264_monitor.sh
 }
 stop() {
-    # In go-klipper mode, kill gkcam first (like mjpg-streamer does) to ensure clean state
-    if [ "$MODE" != "vanilla-klipper" ]; then
-        kill_by_name gkcam
-    fi
+    # Kill gkcam to ensure clean state (required in all modes)
+    kill_by_name gkcam
 
     # Stop our processes
     # Use SIGTERM first to allow cleanup, then SIGKILL
@@ -94,21 +95,15 @@ stop() {
 
     sleep 2
 
-    # Restart gkcam fresh (go-klipper mode only)
-    if [ "$MODE" != "vanilla-klipper" ]; then
-        echo "Restarting gkcam..." >> "$APP_LOG"
-        cd /userdata/app/gk
-        LD_LIBRARY_PATH=/userdata/app/gk:$LD_LIBRARY_PATH \
-            ./gkcam >> "$RINKHALS_LOGS/gkcam.log" 2>&1 &
-    else
-        echo "Vanilla-klipper mode: skipping gkcam restart" >> "$APP_LOG"
-    fi
+    # Restart gkcam so stock camera service works again
+    echo "Restarting gkcam..." >> "$APP_LOG"
+    cd /userdata/app/gk
+    LD_LIBRARY_PATH=/userdata/app/gk:$LD_LIBRARY_PATH \
+        ./gkcam >> "$RINKHALS_LOGS/gkcam.log" 2>&1 &
 }
 restart() {
-    # In go-klipper mode, kill gkcam first (like mjpg-streamer does) to ensure clean state
-    if [ "$MODE" != "vanilla-klipper" ]; then
-        kill_by_name gkcam
-    fi
+    # Kill gkcam to free camera/ISP resources (required in all modes)
+    kill_by_name gkcam
 
     # Stop our processes
     # Use SIGTERM first to allow cleanup, then SIGKILL
