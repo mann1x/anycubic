@@ -1774,6 +1774,63 @@ static void on_restart_requested(void) {
     g_running = 0;
 }
 
+/* Parse fd_thresholds_json and populate fd_cfg->thresholds for the active model_set */
+static void apply_fd_thresholds(fd_config_t *fd_cfg, const AppConfig *cfg)
+{
+    memset(&fd_cfg->thresholds, 0, sizeof(fd_cfg->thresholds));
+    if (!cfg->fd_thresholds_json[0] || !fd_cfg->model_set[0]) return;
+
+    cJSON *root = cJSON_Parse(cfg->fd_thresholds_json);
+    if (!root) return;
+
+    cJSON *entry = cJSON_GetObjectItemCaseSensitive(root, fd_cfg->model_set);
+    if (entry && cJSON_IsObject(entry)) {
+        const cJSON *mode_item = cJSON_GetObjectItemCaseSensitive(entry, "mode");
+        if (mode_item && cJSON_IsString(mode_item) && mode_item->valuestring)
+            fd_cfg->thresholds.use_custom = (strcmp(mode_item->valuestring, "custom") == 0);
+
+        const cJSON *prof = cJSON_GetObjectItemCaseSensitive(entry, "profile");
+        if (prof && cJSON_IsString(prof) && prof->valuestring)
+            snprintf(fd_cfg->thresholds.profile, sizeof(fd_cfg->thresholds.profile),
+                     "%s", prof->valuestring);
+
+        const cJSON *v;
+        v = cJSON_GetObjectItemCaseSensitive(entry, "cnn_threshold");
+        if (v && cJSON_IsNumber(v)) fd_cfg->thresholds.cnn_threshold = (float)v->valuedouble;
+        v = cJSON_GetObjectItemCaseSensitive(entry, "cnn_dynamic_threshold");
+        if (v && cJSON_IsNumber(v)) fd_cfg->thresholds.cnn_dynamic_threshold = (float)v->valuedouble;
+        v = cJSON_GetObjectItemCaseSensitive(entry, "proto_threshold");
+        if (v && cJSON_IsNumber(v)) fd_cfg->thresholds.proto_threshold = (float)v->valuedouble;
+        v = cJSON_GetObjectItemCaseSensitive(entry, "proto_dynamic_trigger");
+        if (v && cJSON_IsNumber(v)) fd_cfg->thresholds.proto_dynamic_trigger = (float)v->valuedouble;
+        v = cJSON_GetObjectItemCaseSensitive(entry, "multi_threshold");
+        if (v && cJSON_IsNumber(v)) fd_cfg->thresholds.multi_threshold = (float)v->valuedouble;
+    }
+    cJSON_Delete(root);
+}
+
+/* Scan model set metadata to get file overrides for the active model_set */
+static void apply_fd_file_overrides(fd_config_t *fd_cfg)
+{
+    if (!fd_cfg->model_set[0]) return;
+
+    fd_model_set_t sets[FD_MAX_SETS];
+    int count = fault_detect_scan_sets(sets, FD_MAX_SETS);
+    for (int i = 0; i < count; i++) {
+        if (strcmp(sets[i].dir_name, fd_cfg->model_set) == 0) {
+            if (sets[i].cnn_file[0])
+                snprintf(fd_cfg->cnn_file, sizeof(fd_cfg->cnn_file), "%s", sets[i].cnn_file);
+            if (sets[i].proto_file[0])
+                snprintf(fd_cfg->proto_file, sizeof(fd_cfg->proto_file), "%s", sets[i].proto_file);
+            if (sets[i].proto_prototypes[0])
+                snprintf(fd_cfg->proto_prototypes, sizeof(fd_cfg->proto_prototypes), "%s", sets[i].proto_prototypes);
+            if (sets[i].multi_file[0])
+                snprintf(fd_cfg->multi_file, sizeof(fd_cfg->multi_file), "%s", sets[i].multi_file);
+            break;
+        }
+    }
+}
+
 static void on_config_changed(AppConfig *cfg) {
     /* Update H.264 encoding state based on config */
     int new_h264 = cfg->acproxycam_flv_proxy ? 0 : cfg->h264_enabled;
@@ -1863,6 +1920,7 @@ static void on_config_changed(AppConfig *cfg) {
     /* Update fault detection config */
     {
         fd_config_t fd_cfg;
+        memset(&fd_cfg, 0, sizeof(fd_cfg));
         fd_cfg.enabled = cfg->fault_detect_enabled;
         fd_cfg.cnn_enabled = cfg->fault_detect_cnn_enabled;
         fd_cfg.proto_enabled = cfg->fault_detect_proto_enabled;
@@ -1870,14 +1928,12 @@ static void on_config_changed(AppConfig *cfg) {
         fd_cfg.strategy = fd_strategy_from_name(cfg->fault_detect_strategy);
         fd_cfg.interval_s = cfg->fault_detect_interval;
         fd_cfg.verify_interval_s = cfg->fault_detect_verify_interval;
-        snprintf(fd_cfg.cnn_model, sizeof(fd_cfg.cnn_model), "%s",
-                 cfg->fault_detect_cnn_model);
-        snprintf(fd_cfg.proto_model, sizeof(fd_cfg.proto_model), "%s",
-                 cfg->fault_detect_proto_model);
-        snprintf(fd_cfg.multi_model, sizeof(fd_cfg.multi_model), "%s",
-                 cfg->fault_detect_multi_model);
+        snprintf(fd_cfg.model_set, sizeof(fd_cfg.model_set), "%s",
+                 cfg->fault_detect_model_set);
         fd_cfg.min_free_mem_mb = cfg->fault_detect_min_free_mem;
         fd_cfg.pace_ms = cfg->fault_detect_pace_ms;
+        apply_fd_thresholds(&fd_cfg, cfg);
+        apply_fd_file_overrides(&fd_cfg);
         fault_detect_set_config(&fd_cfg);
 
         if (cfg->fault_detect_enabled && fault_detect_npu_available()) {
@@ -2216,6 +2272,7 @@ int main(int argc, char *argv[]) {
         /* Apply saved config to fault detection */
         {
             fd_config_t fd_cfg;
+            memset(&fd_cfg, 0, sizeof(fd_cfg));
             fd_cfg.enabled = app_config.fault_detect_enabled;
             fd_cfg.cnn_enabled = app_config.fault_detect_cnn_enabled;
             fd_cfg.proto_enabled = app_config.fault_detect_proto_enabled;
@@ -2223,14 +2280,12 @@ int main(int argc, char *argv[]) {
             fd_cfg.strategy = fd_strategy_from_name(app_config.fault_detect_strategy);
             fd_cfg.interval_s = app_config.fault_detect_interval;
             fd_cfg.verify_interval_s = app_config.fault_detect_verify_interval;
-            snprintf(fd_cfg.cnn_model, sizeof(fd_cfg.cnn_model), "%s",
-                     app_config.fault_detect_cnn_model);
-            snprintf(fd_cfg.proto_model, sizeof(fd_cfg.proto_model), "%s",
-                     app_config.fault_detect_proto_model);
-            snprintf(fd_cfg.multi_model, sizeof(fd_cfg.multi_model), "%s",
-                     app_config.fault_detect_multi_model);
+            snprintf(fd_cfg.model_set, sizeof(fd_cfg.model_set), "%s",
+                     app_config.fault_detect_model_set);
             fd_cfg.min_free_mem_mb = app_config.fault_detect_min_free_mem;
             fd_cfg.pace_ms = app_config.fault_detect_pace_ms;
+            apply_fd_thresholds(&fd_cfg, &app_config);
+            apply_fd_file_overrides(&fd_cfg);
             fault_detect_set_config(&fd_cfg);
 
             if (app_config.fault_detect_enabled && fault_detect_npu_available()) {

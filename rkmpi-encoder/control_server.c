@@ -33,6 +33,7 @@
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <time.h>
+#include <math.h>
 #include <signal.h>
 
 /* Global instance */
@@ -596,6 +597,7 @@ static void serve_control_page(ControlServer *srv, int fd) {
         { "fd_proto_enabled_checked", cfg->fault_detect_proto_enabled ? checked : empty },
         { "fd_multi_enabled_checked", cfg->fault_detect_multi_enabled ? checked : empty },
         { "fd_strategy", cfg->fault_detect_strategy },
+        { "fd_model_set", cfg->fault_detect_model_set },
     };
     int nvars = sizeof(vars) / sizeof(vars[0]);
 
@@ -840,46 +842,77 @@ static void serve_api_config(ControlServer *srv, int fd) {
     cJSON_Delete(root);
 }
 
-/* GET /api/fault_detect/models - List available models */
-static void serve_fault_detect_models(ControlServer *srv, int fd) {
-    (void)srv;
-    fd_model_info_t models[FD_MAX_MODELS * 3];
-    int count = fault_detect_scan_models(models, FD_MAX_MODELS * 3);
+/* Round float to 2 decimal places for clean JSON output (avoids 0.45f → 0.449999988) */
+static double round2(float f) { return round((double)f * 100.0) / 100.0; }
 
+/* GET /api/fault_detect/sets - List available model sets */
+static void serve_fault_detect_sets(ControlServer *srv, int fd) {
+    fd_model_set_t sets[FD_MAX_SETS];
+    int count = fault_detect_scan_sets(sets, FD_MAX_SETS);
+
+    AppConfig *cfg = srv->config;
     fd_config_t fd_cfg = fault_detect_get_config();
+
+    /* Parse stored thresholds config */
+    cJSON *th_root = NULL;
+    if (cfg->fd_thresholds_json[0])
+        th_root = cJSON_Parse(cfg->fd_thresholds_json);
 
     cJSON *arr = cJSON_CreateArray();
     for (int i = 0; i < count; i++) {
         cJSON *item = cJSON_CreateObject();
-        cJSON_AddStringToObject(item, "name", models[i].name);
-        cJSON_AddStringToObject(item, "path", models[i].path);
-        const char *cls_name = models[i].cls == FD_MODEL_CNN ? "cnn" :
-                               models[i].cls == FD_MODEL_PROTONET ? "protonet" :
-                               "multiclass";
-        cJSON_AddStringToObject(item, "class", cls_name);
+        cJSON_AddStringToObject(item, "dir_name", sets[i].dir_name);
+        cJSON_AddStringToObject(item, "display_name", sets[i].display_name);
+        cJSON_AddStringToObject(item, "description", sets[i].description);
+        cJSON_AddBoolToObject(item, "has_cnn", sets[i].has_cnn);
+        cJSON_AddBoolToObject(item, "has_protonet", sets[i].has_protonet);
+        cJSON_AddBoolToObject(item, "has_multiclass", sets[i].has_multiclass);
+        cJSON_AddStringToObject(item, "cnn_display_name", sets[i].cnn_display_name);
+        cJSON_AddStringToObject(item, "proto_display_name", sets[i].proto_display_name);
+        cJSON_AddStringToObject(item, "multi_display_name", sets[i].multi_display_name);
 
-        /* Check if this model is currently selected */
-        int selected = 0;
-        if (models[i].cls == FD_MODEL_CNN &&
-            strcmp(models[i].name, fd_cfg.cnn_model) == 0)
-            selected = 1;
-        else if (models[i].cls == FD_MODEL_PROTONET &&
-                 strcmp(models[i].name, fd_cfg.proto_model) == 0)
-            selected = 1;
-        else if (models[i].cls == FD_MODEL_MULTICLASS &&
-                 strcmp(models[i].name, fd_cfg.multi_model) == 0)
-            selected = 1;
+        int selected = (strcmp(sets[i].dir_name, fd_cfg.model_set) == 0);
         cJSON_AddBoolToObject(item, "selected", selected);
+
+        /* Profiles */
+        cJSON *prof_obj = cJSON_CreateObject();
+        for (int p = 0; p < sets[i].num_profiles; p++) {
+            fd_threshold_profile_t *pr = &sets[i].profiles[p];
+            cJSON *pj = cJSON_CreateObject();
+            cJSON_AddStringToObject(pj, "description", pr->description);
+            cJSON_AddNumberToObject(pj, "cnn_threshold", round2(pr->cnn_threshold));
+            cJSON_AddNumberToObject(pj, "cnn_dynamic_threshold", round2(pr->cnn_dynamic_threshold));
+            cJSON_AddNumberToObject(pj, "proto_threshold", round2(pr->proto_threshold));
+            cJSON_AddNumberToObject(pj, "proto_dynamic_trigger", round2(pr->proto_dynamic_trigger));
+            cJSON_AddNumberToObject(pj, "multi_threshold", round2(pr->multi_threshold));
+            cJSON_AddItemToObject(prof_obj, pr->name, pj);
+        }
+        cJSON_AddItemToObject(item, "profiles", prof_obj);
+
+        /* threshold_config for selected set only */
+        if (selected && th_root) {
+            cJSON *tc = cJSON_GetObjectItemCaseSensitive(th_root, sets[i].dir_name);
+            if (tc)
+                cJSON_AddItemReferenceToObject(item, "threshold_config", tc);
+        }
 
         cJSON_AddItemToArray(arr, item);
     }
 
     cJSON *root = cJSON_CreateObject();
-    cJSON_AddItemToObject(root, "models", arr);
+    cJSON_AddItemToObject(root, "sets", arr);
     cJSON_AddBoolToObject(root, "npu_available", fault_detect_npu_available());
 
     send_json_response(fd, 200, root);
     cJSON_Delete(root);
+    if (th_root) cJSON_Delete(th_root);
+}
+
+/* Clamp float threshold to valid range */
+static float clamp_threshold(float v) {
+    if (v < 0.01f) return 0.01f;
+    if (v > 0.99f) return 0.99f;
+    return v;
 }
 
 /* POST /api/fault_detect/settings - Update fault detection settings */
@@ -926,20 +959,10 @@ static void handle_fault_detect_settings(ControlServer *srv, int fd,
         if (v >= 1 && v <= 30) cfg->fault_detect_verify_interval = v;
     }
 
-    item = cJSON_GetObjectItemCaseSensitive(root, "cnn_model");
+    item = cJSON_GetObjectItemCaseSensitive(root, "model_set");
     if (item && cJSON_IsString(item) && item->valuestring)
-        safe_strcpy(cfg->fault_detect_cnn_model,
-                    sizeof(cfg->fault_detect_cnn_model), item->valuestring);
-
-    item = cJSON_GetObjectItemCaseSensitive(root, "proto_model");
-    if (item && cJSON_IsString(item) && item->valuestring)
-        safe_strcpy(cfg->fault_detect_proto_model,
-                    sizeof(cfg->fault_detect_proto_model), item->valuestring);
-
-    item = cJSON_GetObjectItemCaseSensitive(root, "multi_model");
-    if (item && cJSON_IsString(item) && item->valuestring)
-        safe_strcpy(cfg->fault_detect_multi_model,
-                    sizeof(cfg->fault_detect_multi_model), item->valuestring);
+        safe_strcpy(cfg->fault_detect_model_set,
+                    sizeof(cfg->fault_detect_model_set), item->valuestring);
 
     item = cJSON_GetObjectItemCaseSensitive(root, "min_free_mem");
     if (item && cJSON_IsNumber(item)) {
@@ -951,6 +974,65 @@ static void handle_fault_detect_settings(ControlServer *srv, int fd,
     if (item && cJSON_IsNumber(item)) {
         int v = item->valueint;
         if (v >= 0 && v <= 500) cfg->fault_detect_pace_ms = v;
+    }
+
+    /* Threshold settings (per-set, merged into fd_thresholds_json) */
+    const cJSON *th_obj = cJSON_GetObjectItemCaseSensitive(root, "thresholds");
+    if (th_obj && cJSON_IsObject(th_obj)) {
+        /* Parse existing thresholds config */
+        cJSON *existing = NULL;
+        if (cfg->fd_thresholds_json[0])
+            existing = cJSON_Parse(cfg->fd_thresholds_json);
+        if (!existing)
+            existing = cJSON_CreateObject();
+
+        /* Merge each set's threshold entry */
+        const cJSON *set_th;
+        cJSON_ArrayForEach(set_th, th_obj) {
+            if (!cJSON_IsObject(set_th) || !set_th->string) continue;
+
+            /* Validate mode */
+            const cJSON *mode = cJSON_GetObjectItemCaseSensitive(set_th, "mode");
+            if (!mode || !cJSON_IsString(mode) || !mode->valuestring) continue;
+            if (strcmp(mode->valuestring, "profile") != 0 &&
+                strcmp(mode->valuestring, "custom") != 0) continue;
+
+            /* Build validated entry */
+            cJSON *entry = cJSON_CreateObject();
+            cJSON_AddStringToObject(entry, "mode", mode->valuestring);
+
+            const cJSON *prof = cJSON_GetObjectItemCaseSensitive(set_th, "profile");
+            if (prof && cJSON_IsString(prof) && prof->valuestring)
+                cJSON_AddStringToObject(entry, "profile", prof->valuestring);
+
+            const cJSON *v;
+            v = cJSON_GetObjectItemCaseSensitive(set_th, "cnn_threshold");
+            if (v && cJSON_IsNumber(v))
+                cJSON_AddNumberToObject(entry, "cnn_threshold", round2(clamp_threshold((float)v->valuedouble)));
+            v = cJSON_GetObjectItemCaseSensitive(set_th, "cnn_dynamic_threshold");
+            if (v && cJSON_IsNumber(v))
+                cJSON_AddNumberToObject(entry, "cnn_dynamic_threshold", round2(clamp_threshold((float)v->valuedouble)));
+            v = cJSON_GetObjectItemCaseSensitive(set_th, "proto_threshold");
+            if (v && cJSON_IsNumber(v))
+                cJSON_AddNumberToObject(entry, "proto_threshold", round2(clamp_threshold((float)v->valuedouble)));
+            v = cJSON_GetObjectItemCaseSensitive(set_th, "proto_dynamic_trigger");
+            if (v && cJSON_IsNumber(v))
+                cJSON_AddNumberToObject(entry, "proto_dynamic_trigger", round2(clamp_threshold((float)v->valuedouble)));
+            v = cJSON_GetObjectItemCaseSensitive(set_th, "multi_threshold");
+            if (v && cJSON_IsNumber(v))
+                cJSON_AddNumberToObject(entry, "multi_threshold", round2(clamp_threshold((float)v->valuedouble)));
+
+            cJSON_DeleteItemFromObjectCaseSensitive(existing, set_th->string);
+            cJSON_AddItemToObject(existing, set_th->string, entry);
+        }
+
+        char *th_str = cJSON_PrintUnformatted(existing);
+        if (th_str) {
+            safe_strcpy(cfg->fd_thresholds_json,
+                        sizeof(cfg->fd_thresholds_json), th_str);
+            free(th_str);
+        }
+        cJSON_Delete(existing);
     }
 
     cJSON_Delete(root);
@@ -2852,8 +2934,9 @@ static void handle_client(ControlServer *srv, int client_fd,
         }
     }
     /* Fault detection routes */
-    else if (is_get && strcmp(path, "/api/fault_detect/models") == 0) {
-        serve_fault_detect_models(srv, client_fd);
+    else if (is_get && (strcmp(path, "/api/fault_detect/sets") == 0 ||
+                        strcmp(path, "/api/fault_detect/models") == 0)) {
+        serve_fault_detect_sets(srv, client_fd);
     }
     else if (is_post && strcmp(path, "/api/fault_detect/settings") == 0) {
         handle_fault_detect_settings(srv, client_fd, post_body ? post_body : "");

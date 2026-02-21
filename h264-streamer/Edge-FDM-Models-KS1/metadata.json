@@ -1,0 +1,29 @@
+{
+    "name": "Edge FDM Models KS1",
+    "description": "BigEdge FDM fault detection models calibrated for Kobra S1",
+    "models": {
+        "cnn": {
+            "display_name": "MobileNetV2 Sweep LS 0.05",
+            "file": "model.rknn"
+        },
+        "protonet": {
+            "display_name": "ProtoNet Sweep Temp 0.05",
+            "file": "encoder.rknn",
+            "prototypes": "prototypes.bin"
+        },
+        "multiclass": {
+            "display_name": "Multiclass CNN v1",
+            "file": "multiclass.rknn"
+        }
+    },
+    "profiles": {
+        "KS1": {
+            "description": "Kobra S1 calibrated (Feb 2026)",
+            "cnn_threshold": 0.50,
+            "cnn_dynamic_threshold": 0.45,
+            "proto_threshold": 0.65,
+            "proto_dynamic_trigger": 0.60,
+            "multi_threshold": 0.81
+        }
+    }
+}

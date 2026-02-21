@@ -822,11 +822,22 @@
                 </div>
 
                 <div id="fd-details">
-                    <div class="setting" id="fd-models-container">
+                    <div class="setting">
+                        <div class="setting-row">
+                            <span class="label">Model Set:</span>
+                            <div class="control">
+                                <select id="fd_model_set" onchange="onFdSetChange()" style="padding:8px;border-radius:4px;border:1px solid #555;background:#333;color:#fff;max-width:200px;">
+                                    <option value="">Loading...</option>
+                                </select>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="setting" id="fd-models-container" style="display:none;">
                         <div class="setting-row">
                             <span class="label">Models:</span>
                             <div class="control" style="flex-direction:column;align-items:flex-end;">
-                                <div id="fd-models-list" style="font-size:12px;color:#888;">Loading...</div>
+                                <div id="fd-models-list" style="font-size:12px;color:#ccc;"></div>
                             </div>
                         </div>
                     </div>
@@ -862,6 +873,61 @@
                             <span class="label">Verify interval:</span>
                             <div class="control">
                                 <input type="number" id="fd_verify_interval" min="1" max="30" value="2" style="width:50px;"> <span style="color:#888">sec</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="setting" id="fd-threshold-section" style="display:none;margin-top:10px;">
+                        <div class="setting-row">
+                            <span class="label">Profile:</span>
+                            <div class="control" style="gap:8px;">
+                                <select id="fd_profile" onchange="onFdProfileChange()" style="padding:8px;border-radius:4px;border:1px solid #555;background:#333;color:#fff;min-width:200px;">
+                                </select>
+                                <label style="font-size:12px;color:#ccc;white-space:nowrap;">
+                                    <input type="checkbox" id="fd_custom" onchange="onFdCustomToggle()"> Custom
+                                </label>
+                            </div>
+                        </div>
+                        <div id="fd-threshold-inputs" style="margin-top:8px;">
+                            <div id="fd-th-cnn-row">
+                                <div class="setting-row">
+                                    <span class="label" style="font-size:12px;">CNN threshold:</span>
+                                    <div class="control" style="gap:4px;">
+                                        <input type="number" id="fd_th_cnn" min="0.01" max="0.99" step="0.01" style="width:60px;" disabled>
+                                        <span style="color:#888;font-size:11px;">Dynamic:</span>
+                                        <input type="number" id="fd_th_cnn_dyn" min="0.01" max="0.99" step="0.01" style="width:60px;" disabled>
+                                    </div>
+                                </div>
+                                <div style="font-size:10px;color:#777;padding:1px 0 4px 20px;line-height:1.4;">
+                                    CNN confidence required to flag a fault. Higher = fewer false alarms, lower = more sensitive.<br>
+                                    <em>Dynamic</em>: reduced threshold used when ProtoNet also detects a fault (see trigger below).
+                                </div>
+                            </div>
+                            <div id="fd-th-proto-row">
+                                <div class="setting-row">
+                                    <span class="label" style="font-size:12px;">Proto threshold:</span>
+                                    <div class="control" style="gap:4px;">
+                                        <input type="number" id="fd_th_proto" min="0.01" max="0.99" step="0.01" style="width:60px;" disabled>
+                                        <span style="color:#888;font-size:11px;">Trigger:</span>
+                                        <input type="number" id="fd_th_proto_trig" min="0.01" max="0.99" step="0.01" style="width:60px;" disabled>
+                                    </div>
+                                </div>
+                                <div style="font-size:10px;color:#777;padding:1px 0 4px 20px;line-height:1.4;">
+                                    ProtoNet similarity margin required to flag a fault. Higher = more conservative.<br>
+                                    <em>Trigger</em>: when ProtoNet margin exceeds this, CNN switches to its lower dynamic threshold.
+                                </div>
+                            </div>
+                            <div id="fd-th-multi-row">
+                                <div class="setting-row">
+                                    <span class="label" style="font-size:12px;">Multi threshold:</span>
+                                    <div class="control">
+                                        <input type="number" id="fd_th_multi" min="0.01" max="0.99" step="0.01" style="width:60px;" disabled>
+                                    </div>
+                                </div>
+                                <div style="font-size:10px;color:#777;padding:1px 0 4px 20px;line-height:1.4;">
+                                    Multiclass confidence for fault type classification. Higher = fewer false positives.<br>
+                                    In Verify/Classify strategies, a low internal threshold (0.10) is used for type labeling only.
+                                </div>
                             </div>
                         </div>
                     </div>
@@ -2422,74 +2488,202 @@ if(flvjs.isSupported()){
             }
         }
 
+        // Fault Detection: Model Sets + Thresholds
+        window.fdSetsData = [];
+        window.fdCurrentSet = null;
+
         function updateFdVisibility() {
-            /* Settings always visible; just dim when disabled */
-            const enabled = document.getElementById('fd_enabled').checked;
-            const details = document.getElementById('fd-details');
-            if (details) details.style.opacity = enabled ? '1' : '0.5';
+            /* No-op: settings always visible and usable regardless of enable state. */
         }
 
-        function loadFdModels() {
-            fetch('/api/fault_detect/models')
+        function loadFdSets() {
+            fetch('/api/fault_detect/sets')
                 .then(r => r.json())
                 .then(data => {
-                    const list = document.getElementById('fd-models-list');
-                    if (!list || !data.models) return;
+                    if (!data.sets) return;
+                    window.fdSetsData = data.sets;
 
-                    if (data.models.length === 0) {
-                        list.innerHTML = '<span style="color:#f84;">No models found</span>';
+                    const sel = document.getElementById('fd_model_set');
+                    if (!sel) return;
+                    sel.innerHTML = '';
+
+                    if (data.sets.length === 0) {
+                        sel.innerHTML = '<option value="">No model sets found</option>';
                         return;
                     }
 
-                    // Group by class
-                    const groups = { cnn: [], protonet: [], multiclass: [] };
-                    data.models.forEach(m => {
-                        if (groups[m.class]) groups[m.class].push(m);
+                    // Get saved model_set from template
+                    const savedSet = '$fd_model_set';
+                    const hasSaved = savedSet && savedSet !== '$' + 'fd_model_set';
+
+                    data.sets.forEach(s => {
+                        const opt = document.createElement('option');
+                        opt.value = s.dir_name;
+                        opt.textContent = s.display_name;
+                        if (s.selected || (hasSaved && s.dir_name === savedSet)) opt.selected = true;
+                        sel.appendChild(opt);
                     });
 
-                    let html = '';
-                    const classLabels = { cnn: 'CNN', protonet: 'ProtoNet', multiclass: 'Multiclass' };
-                    for (const [cls, models] of Object.entries(groups)) {
-                        if (models.length === 0) continue;
-                        html += '<div style="margin-bottom:8px;">';
-                        html += '<strong style="color:#aaa;font-size:11px;">' + classLabels[cls] + ':</strong><br>';
-                        models.forEach(m => {
-                            const sel = m.selected ? ' checked' : '';
-                            html += '<label style="display:block;padding:2px 0;font-size:12px;color:#ccc;">';
-                            html += '<input type="radio" name="fd_model_' + cls + '" value="' + m.name + '"' + sel + '> ';
-                            html += m.name;
-                            html += '</label>';
-                        });
-                        html += '</div>';
-                    }
-                    list.innerHTML = html;
+                    // If no selection, select first
+                    if (!sel.value && data.sets.length > 0)
+                        sel.value = data.sets[0].dir_name;
+
+                    onFdSetChange();
                 })
                 .catch(() => {
-                    const list = document.getElementById('fd-models-list');
-                    if (list) list.innerHTML = '<span style="color:#f84;">Failed to load models</span>';
+                    const sel = document.getElementById('fd_model_set');
+                    if (sel) sel.innerHTML = '<option value="">Failed to load</option>';
                 });
         }
 
+        function onFdSetChange() {
+            const sel = document.getElementById('fd_model_set');
+            const setName = sel ? sel.value : '';
+            const setData = window.fdSetsData.find(s => s.dir_name === setName);
+            window.fdCurrentSet = setData;
+
+            const container = document.getElementById('fd-models-container');
+            const list = document.getElementById('fd-models-list');
+            const thSection = document.getElementById('fd-threshold-section');
+
+            if (!setData) {
+                if (container) container.style.display = 'none';
+                if (thSection) thSection.style.display = 'none';
+                return;
+            }
+
+            // Show model list (informational, strategy controls which models are used)
+            let html = '';
+            if (setData.has_cnn) {
+                const dn = setData.cnn_display_name || 'CNN';
+                html += '<div style="padding:2px 0;font-size:12px;"><span style="color:#6b6;">&#x25cf;</span> <strong>CNN:</strong> ' + dn + '</div>';
+            }
+            if (setData.has_protonet) {
+                const dn = setData.proto_display_name || 'ProtoNet';
+                html += '<div style="padding:2px 0;font-size:12px;"><span style="color:#6b6;">&#x25cf;</span> <strong>ProtoNet:</strong> ' + dn + '</div>';
+            }
+            if (setData.has_multiclass) {
+                const dn = setData.multi_display_name || 'Multiclass';
+                html += '<div style="padding:2px 0;font-size:12px;"><span style="color:#6b6;">&#x25cf;</span> <strong>Multiclass:</strong> ' + dn + '</div>';
+            }
+
+            if (list) list.innerHTML = html;
+            if (container) container.style.display = html ? '' : 'none';
+
+            // Show threshold rows based on available models
+            document.getElementById('fd-th-cnn-row').style.display = setData.has_cnn ? '' : 'none';
+            document.getElementById('fd-th-proto-row').style.display = setData.has_protonet ? '' : 'none';
+            document.getElementById('fd-th-multi-row').style.display = setData.has_multiclass ? '' : 'none';
+
+            // Populate profiles dropdown
+            const profSel = document.getElementById('fd_profile');
+            profSel.innerHTML = '';
+            const profKeys = Object.keys(setData.profiles || {});
+            profKeys.forEach(k => {
+                const opt = document.createElement('option');
+                opt.value = k;
+                opt.textContent = k + (setData.profiles[k].description ? ' - ' + setData.profiles[k].description : '');
+                profSel.appendChild(opt);
+            });
+
+            // Show threshold section if profiles exist
+            if (thSection) thSection.style.display = profKeys.length > 0 ? '' : 'none';
+
+            // Apply saved threshold_config if this set is selected
+            const customCb = document.getElementById('fd_custom');
+            if (setData.threshold_config) {
+                const tc = setData.threshold_config;
+                if (tc.profile && profSel.querySelector('option[value="' + tc.profile + '"]'))
+                    profSel.value = tc.profile;
+                customCb.checked = (tc.mode === 'custom');
+                setThresholdInputs(tc);
+                toggleThresholdEditable(tc.mode === 'custom');
+            } else if (profKeys.length > 0) {
+                customCb.checked = false;
+                onFdProfileChange();
+            }
+        }
+
+        function setThresholdInputs(vals) {
+            const ids = {
+                'fd_th_cnn': 'cnn_threshold', 'fd_th_cnn_dyn': 'cnn_dynamic_threshold',
+                'fd_th_proto': 'proto_threshold', 'fd_th_proto_trig': 'proto_dynamic_trigger',
+                'fd_th_multi': 'multi_threshold'
+            };
+            for (const [id, key] of Object.entries(ids)) {
+                const el = document.getElementById(id);
+                if (el && vals[key] !== undefined) el.value = Math.round(vals[key] * 100) / 100;
+            }
+        }
+
+        function toggleThresholdEditable(editable) {
+            ['fd_th_cnn','fd_th_cnn_dyn','fd_th_proto','fd_th_proto_trig','fd_th_multi'].forEach(id => {
+                const el = document.getElementById(id);
+                if (el) {
+                    el.disabled = !editable;
+                    el.style.opacity = editable ? '1' : '0.6';
+                    el.style.cursor = editable ? 'text' : 'default';
+                    el.style.borderColor = editable ? '#666' : '#444';
+                }
+            });
+        }
+
+        function onFdProfileChange() {
+            const profSel = document.getElementById('fd_profile');
+            const set = window.fdCurrentSet;
+            if (!set || !profSel.value) return;
+
+            const prof = (set.profiles || {})[profSel.value];
+            if (prof) {
+                setThresholdInputs(prof);
+                toggleThresholdEditable(document.getElementById('fd_custom').checked);
+            }
+        }
+
+        function onFdCustomToggle() {
+            const custom = document.getElementById('fd_custom').checked;
+            toggleThresholdEditable(custom);
+            if (!custom) {
+                // Revert to profile values
+                onFdProfileChange();
+            }
+        }
+
+        function getThresholdValues() {
+            return {
+                cnn_threshold: parseFloat(document.getElementById('fd_th_cnn').value) || 0,
+                cnn_dynamic_threshold: parseFloat(document.getElementById('fd_th_cnn_dyn').value) || 0,
+                proto_threshold: parseFloat(document.getElementById('fd_th_proto').value) || 0,
+                proto_dynamic_trigger: parseFloat(document.getElementById('fd_th_proto_trig').value) || 0,
+                multi_threshold: parseFloat(document.getElementById('fd_th_multi').value) || 0
+            };
+        }
+
         function applyFdSettings() {
+            const setName = document.getElementById('fd_model_set').value;
+            const set = window.fdCurrentSet;
             const settings = {
                 enabled: document.getElementById('fd_enabled').checked,
+                model_set: setName,
+                cnn_enabled: !!(set && set.has_cnn),
+                proto_enabled: !!(set && set.has_protonet),
+                multi_enabled: !!(set && set.has_multiclass),
                 strategy: document.getElementById('fd_strategy').value,
                 interval: parseInt(document.getElementById('fd_interval').value) || 5,
                 verify_interval: parseInt(document.getElementById('fd_verify_interval').value) || 2
             };
 
-            // Get selected models from radio buttons
-            const cnnRadio = document.querySelector('input[name="fd_model_cnn"]:checked');
-            const protoRadio = document.querySelector('input[name="fd_model_protonet"]:checked');
-            const multiRadio = document.querySelector('input[name="fd_model_multiclass"]:checked');
-
-            settings.cnn_enabled = !!cnnRadio;
-            settings.proto_enabled = !!protoRadio;
-            settings.multi_enabled = !!multiRadio;
-
-            if (cnnRadio) settings.cnn_model = cnnRadio.value;
-            if (protoRadio) settings.proto_model = protoRadio.value;
-            if (multiRadio) settings.multi_model = multiRadio.value;
+            // Build threshold config for this set
+            if (setName && window.fdCurrentSet && Object.keys(window.fdCurrentSet.profiles || {}).length > 0) {
+                const custom = document.getElementById('fd_custom').checked;
+                const thVals = getThresholdValues();
+                settings.thresholds = {};
+                settings.thresholds[setName] = {
+                    mode: custom ? 'custom' : 'profile',
+                    profile: document.getElementById('fd_profile').value,
+                    ...thVals
+                };
+            }
 
             const msgEl = document.getElementById('fd-status-msg');
 
@@ -2530,8 +2724,8 @@ if(flvjs.isSupported()){
                 const sel = document.getElementById('fd_strategy');
                 if (sel) sel.value = strat;
             }
-            // Load models list
-            loadFdModels();
+            // Load model sets
+            loadFdSets();
         })();
     </script>
 </body>

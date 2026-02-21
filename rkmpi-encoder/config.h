@@ -115,11 +115,10 @@ typedef struct {
     char fault_detect_strategy[32];
     int fault_detect_interval;
     int fault_detect_verify_interval;
-    char fault_detect_cnn_model[64];
-    char fault_detect_proto_model[64];
-    char fault_detect_multi_model[64];
+    char fault_detect_model_set[64];    /* Selected model set directory name */
     int fault_detect_min_free_mem;
     int fault_detect_pace_ms;
+    char fd_thresholds_json[2048];      /* Per-set threshold config JSON */
 
     /* Runtime: config file path (not persisted) */
     char config_file[256];

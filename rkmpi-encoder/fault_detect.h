@@ -19,8 +19,12 @@
 #define FD_MODEL_INPUT_SIZE  224
 #define FD_MODEL_INPUT_BYTES (FD_MODEL_INPUT_SIZE * FD_MODEL_INPUT_SIZE * 3)
 
-/* Maximum models per class */
-#define FD_MAX_MODELS 8
+/* Model set limits */
+#define FD_MAX_SETS        4    /* Max model sets to scan */
+#define FD_MAX_PROFILES    8    /* Max threshold profiles per set */
+#define FD_SET_NAME_LEN    64
+#define FD_PROFILE_NAME_LEN 32
+#define FD_DISPLAY_NAME_LEN 64
 
 /* Multi-class fault type indices (alphabetical ImageFolder order) */
 #define FD_MCLASS_CRACKING       0
@@ -65,12 +69,47 @@ typedef enum {
     FD_MODEL_MULTICLASS
 } fd_model_class_t;
 
-/* Scanned model info */
+/* Threshold profile — one profile covers ALL model types in the set */
 typedef struct {
-    char name[64];          /* Subdirectory name, e.g. "sweep-ls005_v1" */
-    char path[256];         /* Full path to model directory */
-    fd_model_class_t cls;   /* Model class type */
-} fd_model_info_t;
+    char name[FD_PROFILE_NAME_LEN];       /* Profile key, e.g. "KS1" */
+    char description[128];
+    float cnn_threshold;                   /* CNN static threshold */
+    float cnn_dynamic_threshold;           /* CNN lowered threshold (Proto gate) */
+    float proto_threshold;                 /* ProtoNet margin threshold */
+    float proto_dynamic_trigger;           /* ProtoNet margin that gates CNN */
+    float multi_threshold;                 /* Multiclass binary threshold */
+} fd_threshold_profile_t;
+
+/* Model set info — discovered by scanning */
+typedef struct {
+    char dir_name[FD_SET_NAME_LEN];       /* Directory name, e.g. "Edge-FDM-Models-KS1" */
+    char path[256];                        /* Full path to set directory */
+    char display_name[FD_DISPLAY_NAME_LEN]; /* From metadata.json "name" field */
+    char description[128];                 /* From metadata.json "description" field */
+    int has_cnn;                           /* 1 if cnn/ subdir with valid .rknn */
+    int has_protonet;                      /* 1 if protonet/ subdir with valid files */
+    int has_multiclass;                    /* 1 if multiclass/ subdir with valid .rknn */
+    char cnn_display_name[FD_DISPLAY_NAME_LEN];
+    char proto_display_name[FD_DISPLAY_NAME_LEN];
+    char multi_display_name[FD_DISPLAY_NAME_LEN];
+    char cnn_file[64];                     /* model filename override */
+    char proto_file[64];                   /* encoder filename override */
+    char proto_prototypes[64];             /* prototypes filename override */
+    char multi_file[64];                   /* multiclass filename override */
+    fd_threshold_profile_t profiles[FD_MAX_PROFILES];
+    int num_profiles;
+} fd_model_set_t;
+
+/* Active threshold config (runtime) */
+typedef struct {
+    int use_custom;                        /* 0 = profile, 1 = custom */
+    char profile[FD_PROFILE_NAME_LEN];    /* Selected profile name */
+    float cnn_threshold;                   /* Active values (profile or custom) */
+    float cnn_dynamic_threshold;
+    float proto_threshold;
+    float proto_dynamic_trigger;
+    float multi_threshold;
+} fd_active_thresholds_t;
 
 /* Detection result (last inference cycle) */
 typedef struct {
@@ -103,11 +142,15 @@ typedef struct {
     fd_strategy_t strategy;
     int interval_s;             /* Normal check interval (default 5) */
     int verify_interval_s;      /* Verification interval (default 2) */
-    char cnn_model[64];         /* Selected CNN model subdir */
-    char proto_model[64];       /* Selected ProtoNet model subdir */
-    char multi_model[64];       /* Selected Multiclass model subdir */
+    char model_set[FD_SET_NAME_LEN]; /* Selected model set directory name */
     int min_free_mem_mb;        /* Min free memory to run (default 20) */
     int pace_ms;                /* Inter-step pause ms to reduce CPU spikes (0=off) */
+    fd_active_thresholds_t thresholds; /* Active thresholds (profile or custom) */
+    /* File overrides from metadata.json (populated by scan) */
+    char cnn_file[64];
+    char proto_file[64];
+    char proto_prototypes[64];
+    char multi_file[64];
 } fd_config_t;
 
 /* ============================================================================
@@ -141,9 +184,9 @@ fd_config_t fault_detect_get_config(void);
 /* Update config. If thread is running, changes take effect next cycle. */
 void fault_detect_set_config(const fd_config_t *config);
 
-/* Scan model directories. Returns number of models found.
- * models array must have room for max_models entries. */
-int fault_detect_scan_models(fd_model_info_t *models, int max_models);
+/* Scan for model sets. Returns number of sets found.
+ * sets array must have room for max_sets entries. */
+int fault_detect_scan_sets(fd_model_set_t *sets, int max_sets);
 
 /* Check if NPU runtime is available (dlopen succeeded). */
 int fault_detect_npu_available(void);

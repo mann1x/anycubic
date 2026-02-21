@@ -14,6 +14,7 @@
 #pragma GCC diagnostic ignored "-Wformat-truncation"
 
 #include "fault_detect.h"
+#include "cJSON.h"
 #include "rknn/rknn_api.h"
 #include <turbojpeg.h>
 #include <stdio.h>
@@ -562,7 +563,8 @@ static int fd_load_prototypes(const char *path)
  * Model path resolution
  * ============================================================================ */
 
-static int fd_resolve_model_path(fd_model_class_t cls, const char *model_name,
+/* Path scheme: {base_dir}/{set_name}/{class_dir}/{filename} */
+static int fd_resolve_model_path(fd_model_class_t cls, const char *set_name,
                                   char *path, size_t path_size)
 {
     const char *class_dir;
@@ -571,22 +573,22 @@ static int fd_resolve_model_path(fd_model_class_t cls, const char *model_name,
     switch (cls) {
     case FD_MODEL_CNN:
         class_dir = "cnn";
-        filename = "model.rknn";
+        filename = g_fd.config.cnn_file[0] ? g_fd.config.cnn_file : "model.rknn";
         break;
     case FD_MODEL_PROTONET:
         class_dir = "protonet";
-        filename = "encoder.rknn";
+        filename = g_fd.config.proto_file[0] ? g_fd.config.proto_file : "encoder.rknn";
         break;
     case FD_MODEL_MULTICLASS:
         class_dir = "multiclass";
-        filename = "multiclass.rknn";
+        filename = g_fd.config.multi_file[0] ? g_fd.config.multi_file : "multiclass.rknn";
         break;
     default:
         return -1;
     }
 
     snprintf(path, path_size, "%s/%s/%s/%s",
-             g_fd.models_base_dir, class_dir, model_name, filename);
+             g_fd.models_base_dir, set_name, class_dir, filename);
 
     /* Check if file exists */
     if (access(path, R_OK) != 0) {
@@ -594,7 +596,7 @@ static int fd_resolve_model_path(fd_model_class_t cls, const char *model_name,
         if (cls == FD_MODEL_MULTICLASS) {
             char dir_path[512];
             snprintf(dir_path, sizeof(dir_path), "%s/%s/%s",
-                     g_fd.models_base_dir, class_dir, model_name);
+                     g_fd.models_base_dir, set_name, class_dir);
             DIR *dir = opendir(dir_path);
             if (dir) {
                 struct dirent *ent;
@@ -619,33 +621,28 @@ static int fd_resolve_model_path(fd_model_class_t cls, const char *model_name,
  * Per-model inference (from detect.c)
  * ============================================================================ */
 
-/* Default thresholds — calibrated for INT8 on RV1106 hardware.
- * These match the detect tool's per-strategy defaults.
+/* Thresholds: read from config, fallback to hardcoded defaults.
+ * Defaults calibrated for INT8 on RV1106 hardware.
  * See BigEdge-FDM-Models CLAUDE.md for calibration details. */
-static void fd_get_thresholds(int strategy,
-                               float *cnn_th, float *proto_th, float *multi_th)
+static void fd_get_thresholds(const fd_config_t *cfg, int strategy,
+                               float *cnn_th, float *proto_th, float *multi_th,
+                               float *cnn_dyn_th, float *proto_dyn_trigger)
 {
-    switch (strategy) {
-    case FD_STRATEGY_OR:
-    case FD_STRATEGY_VERIFY:
-    case FD_STRATEGY_CLASSIFY:
-    case FD_STRATEGY_MAJORITY:
-    case FD_STRATEGY_ALL:
-    case FD_STRATEGY_CNN:
-    case FD_STRATEGY_PROTONET:
-    case FD_STRATEGY_MULTICLASS:
-    default:
-        *cnn_th   = 0.50f;   /* Printer-calibrated: idle max=0.443, p95=0.429 */
-        *proto_th = 0.65f;   /* Printer-calibrated: idle max=0.619, p95=0.584 */
-        break;
-    }
+    const fd_active_thresholds_t *t = &cfg->thresholds;
+
+    *cnn_th   = t->cnn_threshold > 0 ? t->cnn_threshold : 0.50f;
+    *proto_th = t->proto_threshold > 0 ? t->proto_threshold : 0.65f;
+
+    *cnn_dyn_th      = t->cnn_dynamic_threshold > 0 ? t->cnn_dynamic_threshold : 0.45f;
+    *proto_dyn_trigger = t->proto_dynamic_trigger > 0 ? t->proto_dynamic_trigger : 0.60f;
+
     /* Multi-class threshold:
      * - VERIFY/CLASSIFY: low threshold (MC just labels fault type, doesn't decide binary)
-     * - All others: 0.81 printer-calibrated (idle max=0.807, fault min=0.849) */
+     * - All others: configurable, default 0.81 printer-calibrated */
     if (strategy == FD_STRATEGY_VERIFY || strategy == FD_STRATEGY_CLASSIFY)
         *multi_th = 0.10f;
     else
-        *multi_th = 0.81f;
+        *multi_th = t->multi_threshold > 0 ? t->multi_threshold : 0.81f;
 }
 
 static int fd_run_cnn(const uint8_t *input, fd_result_t *r, float threshold)
@@ -653,9 +650,9 @@ static int fd_run_cnn(const uint8_t *input, fd_result_t *r, float threshold)
     fd_rknn_model_t model;
     char path[512];
 
-    if (fd_resolve_model_path(FD_MODEL_CNN, g_fd.config.cnn_model,
+    if (fd_resolve_model_path(FD_MODEL_CNN, g_fd.config.model_set,
                                path, sizeof(path)) < 0) {
-        fd_err("CNN model not found: %s\n", g_fd.config.cnn_model);
+        fd_err("CNN model not found in set: %s\n", g_fd.config.model_set);
         return -1;
     }
 
@@ -694,17 +691,19 @@ static int fd_run_protonet(const uint8_t *input, fd_result_t *r, float proto_thr
     fd_rknn_model_t model;
     char path[512];
 
-    if (fd_resolve_model_path(FD_MODEL_PROTONET, g_fd.config.proto_model,
+    if (fd_resolve_model_path(FD_MODEL_PROTONET, g_fd.config.model_set,
                                path, sizeof(path)) < 0) {
-        fd_err("ProtoNet model not found: %s\n", g_fd.config.proto_model);
+        fd_err("ProtoNet model not found in set: %s\n", g_fd.config.model_set);
         return -1;
     }
 
     /* Load prototypes if not already loaded */
     if (!g_fd.prototypes_loaded) {
+        const char *proto_file = g_fd.config.proto_prototypes[0] ?
+                                  g_fd.config.proto_prototypes : "prototypes.bin";
         char proto_path[512];
-        snprintf(proto_path, sizeof(proto_path), "%s/protonet/%s/prototypes.bin",
-                 g_fd.models_base_dir, g_fd.config.proto_model);
+        snprintf(proto_path, sizeof(proto_path), "%s/%s/protonet/%s",
+                 g_fd.models_base_dir, g_fd.config.model_set, proto_file);
         if (fd_load_prototypes(proto_path) < 0)
             return -1;
     }
@@ -747,9 +746,9 @@ static int fd_run_multiclass(const uint8_t *input, fd_result_t *r, float multi_t
     fd_rknn_model_t model;
     char path[512];
 
-    if (fd_resolve_model_path(FD_MODEL_MULTICLASS, g_fd.config.multi_model,
+    if (fd_resolve_model_path(FD_MODEL_MULTICLASS, g_fd.config.model_set,
                                path, sizeof(path)) < 0) {
-        fd_err("Multiclass model not found: %s\n", g_fd.config.multi_model);
+        fd_err("Multiclass model not found in set: %s\n", g_fd.config.model_set);
         return -1;
     }
 
@@ -816,9 +815,10 @@ static void fd_run_detection(const uint8_t *preprocessed, fd_result_t *result,
     memset(result, 0, sizeof(*result));
     snprintf(result->fault_class_name, sizeof(result->fault_class_name), "-");
 
-    /* Get strategy-dependent thresholds (calibrated for INT8 on RV1106) */
-    float cnn_th, proto_th, multi_th;
-    fd_get_thresholds(cfg->strategy, &cnn_th, &proto_th, &multi_th);
+    /* Get thresholds from config (or fallback to hardcoded defaults) */
+    float cnn_th, proto_th, multi_th, cnn_dyn_th, proto_dyn_trigger;
+    fd_get_thresholds(cfg, cfg->strategy, &cnn_th, &proto_th, &multi_th,
+                      &cnn_dyn_th, &proto_dyn_trigger);
 
     int have_cnn = cfg->cnn_enabled;
     int have_proto = cfg->proto_enabled;
@@ -856,13 +856,11 @@ static void fd_run_detection(const uint8_t *preprocessed, fd_result_t *result,
 
     /* Dynamic CNN threshold: when ProtoNet is moderately suspicious,
      * lower the CNN threshold to catch light faults.
-     * Proto margin >= 0.60 → cnn_th drops from 0.50 to 0.45
-     * Trigger at 0.60 (vs proto_th 0.65) so CNN assists before Proto trips.
-     * 0.45 is safe: idle CNN max=0.443, fires on <2% of idle cycles. */
-    if (have_proto && have_cnn && proto_conf >= 0.60f) {
-        cnn_th = 0.45f;
-        fd_log("  Dynamic CNN threshold: %.2f (proto margin=%.3f)\n",
-               cnn_th, proto_conf);
+     * Trigger below proto_threshold so CNN assists before Proto trips. */
+    if (have_proto && have_cnn && proto_conf >= proto_dyn_trigger) {
+        cnn_th = cnn_dyn_th;
+        fd_log("  Dynamic CNN threshold: %.2f (proto margin=%.3f, trigger=%.2f)\n",
+               cnn_th, proto_conf, proto_dyn_trigger);
     }
 
     /* Run CNN */
@@ -1209,25 +1207,27 @@ int fault_detect_start(void)
      * to avoid CMA conflicts with the running hardware encoder) */
     if (cfg.cnn_enabled || cfg.strategy == FD_STRATEGY_CNN) {
         char path[512];
-        if (fd_resolve_model_path(FD_MODEL_CNN, cfg.cnn_model,
+        if (fd_resolve_model_path(FD_MODEL_CNN, cfg.model_set,
                                    path, sizeof(path)) < 0) {
-            fd_err("CNN model not found: %s\n", cfg.cnn_model);
+            fd_err("CNN model not found in set: %s\n", cfg.model_set);
             fd_set_state(FD_STATUS_ERROR, NULL, "CNN model not found");
             return -1;
         }
     }
     if (cfg.proto_enabled || cfg.strategy == FD_STRATEGY_PROTONET) {
         char path[512];
-        if (fd_resolve_model_path(FD_MODEL_PROTONET, cfg.proto_model,
+        if (fd_resolve_model_path(FD_MODEL_PROTONET, cfg.model_set,
                                    path, sizeof(path)) < 0) {
-            fd_err("ProtoNet model not found: %s\n", cfg.proto_model);
+            fd_err("ProtoNet model not found in set: %s\n", cfg.model_set);
             fd_set_state(FD_STATUS_ERROR, NULL, "ProtoNet model not found");
             return -1;
         }
+        const char *proto_file = cfg.proto_prototypes[0] ?
+                                  cfg.proto_prototypes : "prototypes.bin";
         char proto_path[512];
         snprintf(proto_path, sizeof(proto_path),
-                 "%s/protonet/%s/prototypes.bin",
-                 g_fd.models_base_dir, cfg.proto_model);
+                 "%s/%s/protonet/%s",
+                 g_fd.models_base_dir, cfg.model_set, proto_file);
         if (access(proto_path, R_OK) != 0) {
             fd_err("ProtoNet prototypes not found: %s\n", proto_path);
             fd_set_state(FD_STATUS_ERROR, NULL, "prototypes.bin not found");
@@ -1236,14 +1236,14 @@ int fault_detect_start(void)
     }
     if (cfg.multi_enabled || cfg.strategy == FD_STRATEGY_MULTICLASS) {
         char path[512];
-        if (fd_resolve_model_path(FD_MODEL_MULTICLASS, cfg.multi_model,
+        if (fd_resolve_model_path(FD_MODEL_MULTICLASS, cfg.model_set,
                                    path, sizeof(path)) < 0) {
-            fd_err("Multiclass model not found: %s\n", cfg.multi_model);
+            fd_err("Multiclass model not found in set: %s\n", cfg.model_set);
             fd_set_state(FD_STATUS_ERROR, NULL, "Multiclass model not found");
             return -1;
         }
     }
-    fd_log("Model files verified\n");
+    fd_log("Model files verified (set: %s)\n", cfg.model_set);
 
     /* Start thread */
     g_fd.thread_stop = 0;
@@ -1333,48 +1333,182 @@ void fault_detect_set_config(const fd_config_t *config)
     g_fd.prototypes_loaded = 0;
 }
 
-int fault_detect_scan_models(fd_model_info_t *models, int max_models)
+/* Check if a model file exists in {set_path}/{class_dir}/{filename} */
+static int fd_check_model_file(const char *set_path, const char *class_dir,
+                                const char *filename)
+{
+    char path[512];
+    if (filename && filename[0]) {
+        snprintf(path, sizeof(path), "%s/%s/%s", set_path, class_dir, filename);
+        return access(path, R_OK) == 0 ? 0 : -1;
+    }
+    /* No specific filename — scan for any .rknn file */
+    char dir_path[512];
+    snprintf(dir_path, sizeof(dir_path), "%s/%s", set_path, class_dir);
+    DIR *dir = opendir(dir_path);
+    if (!dir) return -1;
+    struct dirent *ent;
+    int found = -1;
+    while ((ent = readdir(dir)) != NULL) {
+        size_t len = strlen(ent->d_name);
+        if (len > 5 && strcmp(ent->d_name + len - 5, ".rknn") == 0) {
+            found = 0;
+            break;
+        }
+    }
+    closedir(dir);
+    return found;
+}
+
+/* Helper: get string from cJSON, return NULL if missing */
+static const char *fd_json_str(const cJSON *obj, const char *key)
+{
+    const cJSON *item = cJSON_GetObjectItemCaseSensitive(obj, key);
+    if (item && cJSON_IsString(item) && item->valuestring)
+        return item->valuestring;
+    return NULL;
+}
+
+/* Helper: get float from cJSON, return 0 if missing */
+static float fd_json_float(const cJSON *obj, const char *key)
+{
+    const cJSON *item = cJSON_GetObjectItemCaseSensitive(obj, key);
+    if (item && cJSON_IsNumber(item))
+        return (float)item->valuedouble;
+    return 0.0f;
+}
+
+/* Parse metadata.json for a model set */
+static void fd_parse_set_metadata(fd_model_set_t *s)
+{
+    char meta_path[512];
+    snprintf(meta_path, sizeof(meta_path), "%s/metadata.json", s->path);
+
+    FILE *f = fopen(meta_path, "r");
+    if (!f) return;
+
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (fsize <= 0 || fsize > 32 * 1024) { fclose(f); return; }
+
+    char *buf = (char *)malloc(fsize + 1);
+    if (!buf) { fclose(f); return; }
+    size_t nread = fread(buf, 1, fsize, f);
+    fclose(f);
+    buf[nread] = '\0';
+
+    cJSON *root = cJSON_Parse(buf);
+    free(buf);
+    if (!root) return;
+
+    /* Top-level fields */
+    const char *name = fd_json_str(root, "name");
+    if (name)
+        snprintf(s->display_name, sizeof(s->display_name), "%s", name);
+    const char *desc = fd_json_str(root, "description");
+    if (desc)
+        snprintf(s->description, sizeof(s->description), "%s", desc);
+
+    /* Models object */
+    const cJSON *models = cJSON_GetObjectItemCaseSensitive(root, "models");
+    if (models && cJSON_IsObject(models)) {
+        const cJSON *cnn = cJSON_GetObjectItemCaseSensitive(models, "cnn");
+        if (cnn) {
+            const char *dn = fd_json_str(cnn, "display_name");
+            if (dn) snprintf(s->cnn_display_name, sizeof(s->cnn_display_name), "%s", dn);
+            const char *fn = fd_json_str(cnn, "file");
+            if (fn) snprintf(s->cnn_file, sizeof(s->cnn_file), "%s", fn);
+        }
+        const cJSON *proto = cJSON_GetObjectItemCaseSensitive(models, "protonet");
+        if (proto) {
+            const char *dn = fd_json_str(proto, "display_name");
+            if (dn) snprintf(s->proto_display_name, sizeof(s->proto_display_name), "%s", dn);
+            const char *fn = fd_json_str(proto, "file");
+            if (fn) snprintf(s->proto_file, sizeof(s->proto_file), "%s", fn);
+            const char *pf = fd_json_str(proto, "prototypes");
+            if (pf) snprintf(s->proto_prototypes, sizeof(s->proto_prototypes), "%s", pf);
+        }
+        const cJSON *multi = cJSON_GetObjectItemCaseSensitive(models, "multiclass");
+        if (multi) {
+            const char *dn = fd_json_str(multi, "display_name");
+            if (dn) snprintf(s->multi_display_name, sizeof(s->multi_display_name), "%s", dn);
+            const char *fn = fd_json_str(multi, "file");
+            if (fn) snprintf(s->multi_file, sizeof(s->multi_file), "%s", fn);
+        }
+    }
+
+    /* Profiles object (ordered — iterate keys) */
+    const cJSON *profiles = cJSON_GetObjectItemCaseSensitive(root, "profiles");
+    if (profiles && cJSON_IsObject(profiles)) {
+        const cJSON *prof;
+        cJSON_ArrayForEach(prof, profiles) {
+            if (s->num_profiles >= FD_MAX_PROFILES) break;
+            fd_threshold_profile_t *p = &s->profiles[s->num_profiles];
+            snprintf(p->name, sizeof(p->name), "%s", prof->string);
+            const char *pdesc = fd_json_str(prof, "description");
+            if (pdesc) snprintf(p->description, sizeof(p->description), "%s", pdesc);
+            p->cnn_threshold = fd_json_float(prof, "cnn_threshold");
+            p->cnn_dynamic_threshold = fd_json_float(prof, "cnn_dynamic_threshold");
+            p->proto_threshold = fd_json_float(prof, "proto_threshold");
+            p->proto_dynamic_trigger = fd_json_float(prof, "proto_dynamic_trigger");
+            p->multi_threshold = fd_json_float(prof, "multi_threshold");
+            s->num_profiles++;
+        }
+    }
+
+    cJSON_Delete(root);
+}
+
+int fault_detect_scan_sets(fd_model_set_t *sets, int max_sets)
 {
     int count = 0;
-    const char *class_dirs[] = {"cnn", "protonet", "multiclass"};
-    fd_model_class_t class_types[] = {FD_MODEL_CNN, FD_MODEL_PROTONET,
-                                       FD_MODEL_MULTICLASS};
+    DIR *dir = opendir(g_fd.models_base_dir);
+    if (!dir) return 0;
 
-    for (int c = 0; c < 3 && count < max_models; c++) {
-        char dir_path[512];
-        snprintf(dir_path, sizeof(dir_path), "%s/%s",
-                 g_fd.models_base_dir, class_dirs[c]);
+    struct dirent *ent;
+    while ((ent = readdir(dir)) != NULL && count < max_sets) {
+        if (ent->d_name[0] == '.') continue;
 
-        DIR *dir = opendir(dir_path);
-        if (!dir) continue;
+        char sub_path[512];
+        snprintf(sub_path, sizeof(sub_path), "%s/%s",
+                 g_fd.models_base_dir, ent->d_name);
+        struct stat st;
+        if (stat(sub_path, &st) != 0 || !S_ISDIR(st.st_mode))
+            continue;
 
-        struct dirent *ent;
-        while ((ent = readdir(dir)) != NULL && count < max_models) {
-            if (ent->d_name[0] == '.') continue;
+        fd_model_set_t *s = &sets[count];
+        memset(s, 0, sizeof(*s));
+        snprintf(s->dir_name, sizeof(s->dir_name), "%s", ent->d_name);
+        snprintf(s->path, sizeof(s->path), "%s", sub_path);
 
-            /* Check if it's a directory */
-            char sub_path[512];
-            snprintf(sub_path, sizeof(sub_path), "%s/%s",
-                     dir_path, ent->d_name);
-            struct stat st;
-            if (stat(sub_path, &st) != 0 || !S_ISDIR(st.st_mode))
-                continue;
+        /* Check which model types exist (default filenames) */
+        s->has_cnn = (fd_check_model_file(sub_path, "cnn", "model.rknn") == 0);
+        s->has_protonet = (fd_check_model_file(sub_path, "protonet", "encoder.rknn") == 0);
+        s->has_multiclass = (fd_check_model_file(sub_path, "multiclass", NULL) == 0);
 
-            /* Verify model file exists */
-            char model_path[512];
-            if (fd_resolve_model_path(class_types[c], ent->d_name,
-                                       model_path, sizeof(model_path)) < 0)
-                continue;
+        /* Parse metadata.json if present */
+        fd_parse_set_metadata(s);
 
-            snprintf(models[count].name, sizeof(models[count].name),
-                     "%.63s", ent->d_name);
-            snprintf(models[count].path, sizeof(models[count].path),
-                     "%.255s", sub_path);
-            models[count].cls = class_types[c];
-            count++;
-        }
-        closedir(dir);
+        /* Re-check with overridden filenames from metadata */
+        if (s->cnn_file[0])
+            s->has_cnn = (fd_check_model_file(sub_path, "cnn", s->cnn_file) == 0);
+        if (s->proto_file[0])
+            s->has_protonet = (fd_check_model_file(sub_path, "protonet", s->proto_file) == 0);
+        if (s->multi_file[0])
+            s->has_multiclass = (fd_check_model_file(sub_path, "multiclass", s->multi_file) == 0);
+
+        /* Must have at least one model type */
+        if (!s->has_cnn && !s->has_protonet && !s->has_multiclass)
+            continue;
+
+        /* Default display_name to dir_name if metadata.json missing */
+        if (!s->display_name[0])
+            snprintf(s->display_name, sizeof(s->display_name), "%s", ent->d_name);
+
+        count++;
     }
+    closedir(dir);
     return count;
 }
 

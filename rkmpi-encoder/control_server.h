@@ -26,7 +26,7 @@
 #define CTRL_MAX_POST_BODY  8192
 
 /* Maximum template size after substitution */
-#define CTRL_MAX_TEMPLATE   (128 * 1024)
+#define CTRL_MAX_TEMPLATE   (192 * 1024)
 
 /* Maximum key-value pairs in form data */
 #define CTRL_MAX_FORM_PARAMS 64

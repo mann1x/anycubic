@@ -155,11 +155,10 @@ void config_set_defaults(AppConfig *cfg) {
     strncpy(cfg->fault_detect_strategy, "or", sizeof(cfg->fault_detect_strategy) - 1);
     cfg->fault_detect_interval = 5;
     cfg->fault_detect_verify_interval = 2;
-    cfg->fault_detect_cnn_model[0] = '\0';
-    cfg->fault_detect_proto_model[0] = '\0';
-    cfg->fault_detect_multi_model[0] = '\0';
+    cfg->fault_detect_model_set[0] = '\0';
     cfg->fault_detect_min_free_mem = 20;
     cfg->fault_detect_pace_ms = 0;
+    cfg->fd_thresholds_json[0] = '\0';
 }
 
 int config_load(AppConfig *cfg, const char *path) {
@@ -308,16 +307,22 @@ int config_load(AppConfig *cfg, const char *path) {
         json_get_int(root, "fault_detect_interval", cfg->fault_detect_interval), 1, 60);
     cfg->fault_detect_verify_interval = clamp_int(
         json_get_int(root, "fault_detect_verify_interval", cfg->fault_detect_verify_interval), 1, 30);
-    const char *fd_cnn = json_get_str(root, "fault_detect_cnn_model", cfg->fault_detect_cnn_model);
-    strncpy(cfg->fault_detect_cnn_model, fd_cnn, sizeof(cfg->fault_detect_cnn_model) - 1);
-    const char *fd_proto = json_get_str(root, "fault_detect_proto_model", cfg->fault_detect_proto_model);
-    strncpy(cfg->fault_detect_proto_model, fd_proto, sizeof(cfg->fault_detect_proto_model) - 1);
-    const char *fd_multi = json_get_str(root, "fault_detect_multi_model", cfg->fault_detect_multi_model);
-    strncpy(cfg->fault_detect_multi_model, fd_multi, sizeof(cfg->fault_detect_multi_model) - 1);
+    const char *fd_set = json_get_str(root, "fault_detect_model_set", cfg->fault_detect_model_set);
+    strncpy(cfg->fault_detect_model_set, fd_set, sizeof(cfg->fault_detect_model_set) - 1);
     cfg->fault_detect_min_free_mem = clamp_int(
         json_get_int(root, "fault_detect_min_free_mem", cfg->fault_detect_min_free_mem), 5, 100);
     cfg->fault_detect_pace_ms = clamp_int(
         json_get_int(root, "fault_detect_pace_ms", cfg->fault_detect_pace_ms), 0, 500);
+
+    /* Per-set threshold settings */
+    const cJSON *fd_th = cJSON_GetObjectItemCaseSensitive(root, "fd_thresholds");
+    if (fd_th && cJSON_IsObject(fd_th)) {
+        char *th_str = cJSON_PrintUnformatted(fd_th);
+        if (th_str) {
+            strncpy(cfg->fd_thresholds_json, th_str, sizeof(cfg->fd_thresholds_json) - 1);
+            free(th_str);
+        }
+    }
 
     cJSON_Delete(root);
 
@@ -447,11 +452,18 @@ int config_save(const AppConfig *cfg, const char *path) {
     json_set_str(root, "fault_detect_strategy", cfg->fault_detect_strategy);
     json_set_int(root, "fault_detect_interval", cfg->fault_detect_interval);
     json_set_int(root, "fault_detect_verify_interval", cfg->fault_detect_verify_interval);
-    json_set_str(root, "fault_detect_cnn_model", cfg->fault_detect_cnn_model);
-    json_set_str(root, "fault_detect_proto_model", cfg->fault_detect_proto_model);
-    json_set_str(root, "fault_detect_multi_model", cfg->fault_detect_multi_model);
+    json_set_str(root, "fault_detect_model_set", cfg->fault_detect_model_set);
     json_set_int(root, "fault_detect_min_free_mem", cfg->fault_detect_min_free_mem);
     json_set_int(root, "fault_detect_pace_ms", cfg->fault_detect_pace_ms);
+
+    /* Per-set threshold settings */
+    if (cfg->fd_thresholds_json[0]) {
+        cJSON *fd_th = cJSON_Parse(cfg->fd_thresholds_json);
+        if (fd_th) {
+            cJSON_DeleteItemFromObjectCaseSensitive(root, "fd_thresholds");
+            cJSON_AddItemToObject(root, "fd_thresholds", fd_th);
+        }
+    }
 
     /* Per-camera settings */
     if (cfg->cameras_json[0]) {
