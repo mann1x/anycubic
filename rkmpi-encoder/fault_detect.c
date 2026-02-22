@@ -639,7 +639,8 @@ static void fd_get_thresholds(const fd_config_t *cfg, int strategy,
     /* Multi-class threshold:
      * - VERIFY/CLASSIFY: low threshold (MC just labels fault type, doesn't decide binary)
      * - All others: configurable, default 0.81 printer-calibrated */
-    if (strategy == FD_STRATEGY_VERIFY || strategy == FD_STRATEGY_CLASSIFY)
+    if (strategy == FD_STRATEGY_VERIFY || strategy == FD_STRATEGY_CLASSIFY ||
+        strategy == FD_STRATEGY_CLASSIFY_AND)
         *multi_th = 0.10f;
     else
         *multi_th = t->multi_threshold > 0 ? t->multi_threshold : 0.81f;
@@ -879,7 +880,8 @@ static void fd_run_detection(const uint8_t *preprocessed, fd_result_t *result,
     /* VERIFY/CLASSIFY: only run multiclass if CNN or ProtoNet flagged FAULT */
     int run_multi = have_multi;
     if (run_multi && (cfg->strategy == FD_STRATEGY_VERIFY ||
-                      cfg->strategy == FD_STRATEGY_CLASSIFY)) {
+                      cfg->strategy == FD_STRATEGY_CLASSIFY ||
+                      cfg->strategy == FD_STRATEGY_CLASSIFY_AND)) {
         int or_fault = 0;
         if (have_cnn && cnn_class == FD_CLASS_FAULT) or_fault = 1;
         if (have_proto && proto_class == FD_CLASS_FAULT) or_fault = 1;
@@ -961,6 +963,17 @@ static void fd_run_detection(const uint8_t *preprocessed, fd_result_t *result,
         if (have_cnn && cnn_class == FD_CLASS_FAULT) or_fault = 1;
         if (have_proto && proto_class == FD_CLASS_FAULT) or_fault = 1;
         result->result = or_fault ? FD_CLASS_FAULT : FD_CLASS_OK;
+        break;
+    }
+    case FD_STRATEGY_CLASSIFY_AND: {
+        int and_fault = 0;
+        if (have_cnn && have_proto)
+            and_fault = (cnn_class == FD_CLASS_FAULT && proto_class == FD_CLASS_FAULT);
+        else if (have_cnn)
+            and_fault = (cnn_class == FD_CLASS_FAULT);
+        else if (have_proto)
+            and_fault = (proto_class == FD_CLASS_FAULT);
+        result->result = and_fault ? FD_CLASS_FAULT : FD_CLASS_OK;
         break;
     }
     }
@@ -1522,7 +1535,7 @@ int fault_detect_npu_available(void)
  * ============================================================================ */
 
 static const char *g_strategy_names[] = {
-    "or", "majority", "all", "verify", "classify",
+    "or", "majority", "all", "verify", "classify", "classify_and",
     "cnn", "protonet", "multiclass"
 };
 

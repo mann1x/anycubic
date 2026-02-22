@@ -57,6 +57,7 @@ typedef enum {
     FD_STRATEGY_ALL,        /* FAULT only if all agree */
     FD_STRATEGY_VERIFY,     /* 2-model OR, then multiclass confirms */
     FD_STRATEGY_CLASSIFY,   /* 2-model OR decides, multiclass adds type */
+    FD_STRATEGY_CLASSIFY_AND, /* 2-model AND decides, multiclass adds type */
     FD_STRATEGY_CNN,        /* CNN only */
     FD_STRATEGY_PROTONET,   /* ProtoNet only */
     FD_STRATEGY_MULTICLASS  /* Multiclass only */

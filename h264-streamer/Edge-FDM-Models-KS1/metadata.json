@@ -19,10 +19,10 @@
     "profiles": {
         "KS1": {
             "description": "Kobra S1 calibrated (Feb 2026)",
-            "cnn_threshold": 0.50,
-            "cnn_dynamic_threshold": 0.45,
+            "cnn_threshold": 0.60,
+            "cnn_dynamic_threshold": 0.55,
             "proto_threshold": 0.65,
-            "proto_dynamic_trigger": 0.60,
+            "proto_dynamic_trigger": 0.70,
             "multi_threshold": 0.81
         }
     }
