@@ -9,26 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## h264-streamer
 
-### [Unreleased]
+### [2.1.0] - 2026-02-23
 
 #### Added
+- Fault detection spatial heatmap — 7x7 grid localizes faults within the image using a spatial encoder model, with color-coded canvas visualization in the control page
+- AND voting strategy — requires both CNN and ProtoNet to agree before declaring a fault, reducing false positives
 - Rolling log buffer with configurable max size (`log_max_size` setting, default 1024KB)
-  - Prevents unbounded log growth from filling /tmp (tmpfs = RAM)
-  - Truncates and rewinds log file when size limit is exceeded
-  - Configurable 100-5120KB via control page UI
-- PID number in log truncation message for multi-process identification
+- Orphaned timelapse frame recovery — detects crashed instances at startup and encodes salvageable frames
+- Fault detection visibility toggle — FD panels hidden when models are not installed
 
 #### Changed
-- Condensed fault detection logging from ~10 lines to ~3-4 lines per cycle
-  - Each model now logs a single compact result line with timing
-  - Removed raw INT8 quantization dump and per-class probability listing
-  - Removed redundant per-model summary (now inline in each model function)
-  - Shortened dynamic CNN threshold log line
+- Timelapse temp frames moved from /tmp (tmpfs = RAM) to persistent NAND storage, preventing out-of-memory crashes during long prints
+- Default fault detection strategy changed from OR to AND for fewer false positives
+- Condensed fault detection logging from ~10 lines to ~3-4 per cycle
+- FLV proxy relay timeout increased to 30s with disconnect reason logging
 
 #### Fixed
-- Dynamic CNN threshold firing incorrectly with classify_and/all strategies
-  - Was lowering CNN threshold when Proto margin exceeded trigger, causing false agreement between models
-  - Now only applies dynamic threshold for OR/majority/verify/classify strategies where it's beneficial
+- **Timelapse frames filling /tmp (tmpfs) causing printer out-of-memory during long prints** — frames now stored on persistent NAND
+- Dynamic CNN threshold firing incorrectly with AND/classify_and/all strategies, causing false agreement between models
+- CMA memory handling — removed drop_caches/compact_memory kernel purge that destabilized the system, replaced with simple retry
+- Memory gates added before each model to gracefully skip inference on low memory
 
 ### [2.0.0] - 2026-02-20
 
@@ -199,6 +199,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ---
 
 ## rkmpi-encoder
+
+### [1.6.0] - 2026-02-23
+
+#### Added
+- Fault detection spatial heatmap (`fd_run_heatmap`) — 7x7 per-location cosine similarity using spatial encoder model, runs only on fault cycles
+- AND voting strategy (`FD_STRATEGY_AND`) — CNN+ProtoNet must agree, no multiclass needed
+- `fault_detect_installed()` API to check if models directory exists
+- Per-model memory gates — skip inference gracefully when available memory drops below threshold
+- Model init retry on CMA allocation failure (200ms delay, single retry)
+- Orphaned timelapse frame recovery at startup (`timelapse_recover_orphaned`)
+- Rolling log file rotation (`log_check_size`) with configurable max size
+- FLV proxy disconnect reason tracking and byte counter
+
+#### Changed
+- Timelapse temp directory moved from `/tmp` (tmpfs = RAM) to `/useremain/home/rinkhals/.timelapse_frames` (persistent NAND)
+- Default fault detection strategy changed to AND, default pace_ms to 150ms
+- Condensed fault detection logging — each model now logs a single compact result line
+- `fd_model_run()` takes explicit source size to prevent over-read on stride-padded inputs
+- `fd_resolve_model_path()` takes config parameter instead of reading global state
+- FLV proxy relay timeout increased from 10s to 30s for keyframe gaps
+
+#### Fixed
+- Timelapse frames accumulating in tmpfs (RAM) causing OOM on 256MB systems during long prints
+- Dynamic CNN threshold incorrectly firing with AND/classify_and/all strategies
+- Removed `drop_caches`/`compact_memory` kernel purge — destabilized system, replaced with simple retry
+- Bounds check in `fd_resize_crop_gray` for edge cases with small source images
 
 ### [1.5.0] - 2026-02-20
 
