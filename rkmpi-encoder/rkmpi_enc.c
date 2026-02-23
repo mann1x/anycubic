@@ -42,6 +42,7 @@
 #include <pthread.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <linux/videodev2.h>
 
 #include "rk_mpi_sys.h"
@@ -490,6 +491,21 @@ static void log_error(const char *fmt, ...) {
     vfprintf(stderr, fmt, args);
     va_end(args);
     fflush(stderr);
+}
+
+/* Check stderr log file size and truncate if exceeds limit */
+static void log_check_size(int max_kb) {
+    if (max_kb <= 0) return;
+    int fd = fileno(stderr);
+    struct stat st;
+    if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode)) {
+        if (st.st_size > (off_t)max_kb * 1024) {
+            ftruncate(fd, 0);
+            lseek(fd, 0, SEEK_SET);
+            fprintf(stderr, "[PID %d] Log truncated at %ldKB, limit=%dKB\n",
+                    getpid(), (long)(st.st_size / 1024), max_kb);
+        }
+    }
 }
 
 static void signal_handler(int sig) {
@@ -1932,6 +1948,7 @@ static void on_config_changed(AppConfig *cfg) {
                  cfg->fault_detect_model_set);
         fd_cfg.min_free_mem_mb = cfg->fault_detect_min_free_mem;
         fd_cfg.pace_ms = cfg->fault_detect_pace_ms;
+        fd_cfg.heatmap_enabled = cfg->heatmap_enabled;
         apply_fd_thresholds(&fd_cfg, cfg);
         apply_fd_file_overrides(&fd_cfg);
         fault_detect_set_config(&fd_cfg);
@@ -2284,6 +2301,7 @@ int main(int argc, char *argv[]) {
                      app_config.fault_detect_model_set);
             fd_cfg.min_free_mem_mb = app_config.fault_detect_min_free_mem;
             fd_cfg.pace_ms = app_config.fault_detect_pace_ms;
+            fd_cfg.heatmap_enabled = app_config.heatmap_enabled;
             apply_fd_thresholds(&fd_cfg, &app_config);
             apply_fd_file_overrides(&fd_cfg);
             fault_detect_set_config(&fd_cfg);
@@ -2379,6 +2397,11 @@ int main(int argc, char *argv[]) {
                 }
             }
         }
+    }
+
+    /* Recover orphaned timelapse frames from previous crashed instances */
+    if (cfg.primary_mode) {
+        timelapse_recover_orphaned();
     }
 
     log_info("Combined MJPEG/H.264 Streamer v%s starting...\n", VERSION);
@@ -3255,6 +3278,9 @@ skip_jpeg_output:
                      g_ctrl.h264_enabled ? "on" : "off", g_ctrl.skip_ratio,
                      g_ctrl.auto_skip ? " auto" : "");
             last_stats_time = now;
+
+            /* Truncate log file if it exceeds max size */
+            log_check_size(app_config.log_max_size);
 
             /* Check secondary camera processes (primary mode, every 5s) */
             if (cfg.primary_mode && num_managed > 0) {

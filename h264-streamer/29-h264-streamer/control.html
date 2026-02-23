@@ -412,6 +412,14 @@
                         </div>
                     </div>
                 </div>
+                <div class="setting">
+                    <div class="setting-row">
+                        <span class="label">Log Max Size (KB):</span>
+                        <div class="control">
+                            <input type="number" name="log_max_size" value="$log_max_size" min="100" max="5120" step="100" style="width:80px">
+                        </div>
+                    </div>
+                </div>
                 <div class="setting rkmpi-mjpeg-only h264-local-setting">
                     <div class="setting-row">
                         <span class="label">H.264 Encoding:</span>
@@ -801,6 +809,13 @@
                 <span class="label">Inference:</span>
                 <span class="value" id="fd-timing">-</span>
             </div>
+            <div class="row" id="fd-heatmap-row" style="display:none">
+                <span class="label">Heatmap:</span>
+                <div class="value" style="display:flex;align-items:center;gap:10px;">
+                    <canvas id="fd-heatmap-canvas" width="140" height="140" style="border:1px solid #555;border-radius:4px;image-rendering:pixelated;"></canvas>
+                    <span id="fd-heatmap-info" style="font-size:11px;color:#ccc;"></span>
+                </div>
+            </div>
         </div>
 
         <div class="section" id="fd-config-section">
@@ -847,6 +862,7 @@
                             <span class="label">Strategy:</span>
                             <div class="control">
                                 <select id="fd_strategy" style="padding:8px;border-radius:4px;border:1px solid #555;background:#333;color:#fff;">
+                                    <option value="and">AND (CNN+Proto)</option>
                                     <option value="or">OR (any model)</option>
                                     <option value="majority">Majority</option>
                                     <option value="all">All Agree</option>
@@ -857,6 +873,19 @@
                                     <option value="protonet">ProtoNet Only</option>
                                     <option value="multiclass">Multiclass Only</option>
                                 </select>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="setting">
+                        <div class="setting-row">
+                            <span class="label">Fault Heatmap:</span>
+                            <div class="control">
+                                <label class="toggle">
+                                    <input type="checkbox" id="fd_heatmap" $heatmap_checked>
+                                    <span class="slider"></span>
+                                </label>
+                                <span style="font-size:11px;color:#888;margin-left:8px;">7x7 spatial localization on faults</span>
                             </div>
                         </div>
                     </div>
@@ -1494,6 +1523,7 @@
             data.append('encoder_type', newType);
             data.append('autolanmode', formData.has('autolanmode') ? '1' : '0');
             data.append('logging', formData.has('logging') ? '1' : '0');
+            data.append('log_max_size', document.querySelector('[name=log_max_size]').value);
             data.append('h264_enabled', formData.has('h264_enabled') ? '1' : '0');
             data.append('skip_ratio', document.querySelector('[name=skip_ratio]').value);
             data.append('auto_skip', formData.has('auto_skip') ? '1' : '0');
@@ -2281,6 +2311,7 @@ if(flvjs.isSupported()){
             data.append('encoder_type', document.querySelector('[name=encoder_type]').value);
             data.append('autolanmode', formData.has('autolanmode') ? '1' : '0');
             data.append('logging', formData.has('logging') ? '1' : '0');
+            data.append('log_max_size', document.querySelector('[name=log_max_size]').value);
             data.append('h264_enabled', formData.has('h264_enabled') ? '1' : '0');
             data.append('skip_ratio', document.querySelector('[name=skip_ratio]').value);
             data.append('auto_skip', formData.has('auto_skip') ? '1' : '0');
@@ -2413,6 +2444,60 @@ if(flvjs.isSupported()){
         // Fault Detection
         // ============================================================
 
+        function drawHeatmap(heatmap) {
+            const canvas = document.getElementById('fd-heatmap-canvas');
+            const info = document.getElementById('fd-heatmap-info');
+            const row = document.getElementById('fd-heatmap-row');
+            if (!canvas || !row) return;
+
+            if (!heatmap || !heatmap.has_data || !heatmap.grid) {
+                row.style.display = 'none';
+                return;
+            }
+
+            row.style.display = '';
+            const ctx = canvas.getContext('2d');
+            const cellW = canvas.width / 7;
+            const cellH = canvas.height / 7;
+            const grid = heatmap.grid;
+
+            for (let h = 0; h < 7; h++) {
+                for (let w = 0; w < 7; w++) {
+                    const v = grid[h][w];
+                    // Map margin: <0 = green (OK), 0 = yellow, >0 = red (fault)
+                    const t = Math.max(0, Math.min(1, (v + 0.5) / 1.5));
+                    let r, g, b;
+                    if (t < 0.5) {
+                        // green to yellow
+                        const s = t * 2;
+                        r = Math.round(s * 255);
+                        g = 200;
+                        b = Math.round((1 - s) * 60);
+                    } else {
+                        // yellow to red
+                        const s = (t - 0.5) * 2;
+                        r = 255;
+                        g = Math.round((1 - s) * 200);
+                        b = 0;
+                    }
+                    ctx.fillStyle = 'rgb(' + r + ',' + g + ',' + b + ')';
+                    ctx.fillRect(w * cellW, h * cellH, cellW, cellH);
+
+                    // Mark max location
+                    if (h === heatmap.max_row && w === heatmap.max_col) {
+                        ctx.strokeStyle = '#fff';
+                        ctx.lineWidth = 2;
+                        ctx.strokeRect(w * cellW + 1, h * cellH + 1, cellW - 2, cellH - 2);
+                    }
+                }
+            }
+
+            if (info) {
+                info.textContent = 'max=' + heatmap.max.toFixed(2) +
+                    ' at [' + heatmap.max_row + ',' + heatmap.max_col + ']';
+            }
+        }
+
         function updateFdStatus(fd) {
             const statusEl = document.getElementById('fd-status');
             const detEl = document.getElementById('fd-detection');
@@ -2479,6 +2564,14 @@ if(flvjs.isSupported()){
                     timingRow.style.display = '';
                     timingEl.textContent = fd.inference_ms + ' ms';
                 }
+
+                // Heatmap
+                if (fd.heatmap && fd.heatmap.has_data && fd.detection === 'fault') {
+                    drawHeatmap(fd.heatmap);
+                } else {
+                    const hmRow = document.getElementById('fd-heatmap-row');
+                    if (hmRow) hmRow.style.display = 'none';
+                }
             } else {
                 detEl.textContent = '-';
                 detEl.style.color = '#ccc';
@@ -2486,6 +2579,8 @@ if(flvjs.isSupported()){
                 confRow.style.display = 'none';
                 timingRow.style.display = 'none';
                 classRow.style.display = 'none';
+                const hmRow = document.getElementById('fd-heatmap-row');
+                if (hmRow) hmRow.style.display = 'none';
             }
         }
 
@@ -2670,6 +2765,7 @@ if(flvjs.isSupported()){
                 proto_enabled: !!(set && set.has_protonet),
                 multi_enabled: !!(set && set.has_multiclass),
                 strategy: document.getElementById('fd_strategy').value,
+                heatmap_enabled: document.getElementById('fd_heatmap').checked,
                 interval: parseInt(document.getElementById('fd_interval').value) || 5,
                 verify_interval: parseInt(document.getElementById('fd_verify_interval').value) || 2
             };
@@ -2718,6 +2814,15 @@ if(flvjs.isSupported()){
 
         // Initialize fault detection UI
         (function() {
+            // Hide FD sections entirely if not installed
+            const fdInstalled = '$fd_installed' === 'true';
+            if (!fdInstalled) {
+                const s1 = document.getElementById('fd-status-section');
+                const s2 = document.getElementById('fd-config-section');
+                if (s1) s1.style.display = 'none';
+                if (s2) s2.style.display = 'none';
+                return;
+            }
             updateFdVisibility();
             // Set strategy from template
             const strat = '$fd_strategy';

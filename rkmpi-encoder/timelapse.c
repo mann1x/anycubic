@@ -22,6 +22,8 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
+#include <time.h>
 
 /* Global timelapse state */
 TimelapseState g_timelapse = {0};
@@ -1137,4 +1139,176 @@ void timelapse_set_custom_mode(int enabled) {
 
 int timelapse_get_frame_count(void) {
     return g_timelapse.active ? g_timelapse.frame_count : 0;
+}
+
+/*
+ * Count sequential frame_NNNN.jpg files in a directory.
+ * Returns the count (0 if none found).
+ */
+static int count_frames_in_dir(const char *dir_path) {
+    int count = 0;
+    char path[TIMELAPSE_PATH_MAX];
+
+    while (1) {
+        snprintf(path, sizeof(path), "%s/frame_%04d.jpg", dir_path, count);
+        if (access(path, F_OK) != 0) break;
+        count++;
+    }
+
+    return count;
+}
+
+/*
+ * Attempt to recover an orphaned timelapse from saved frames.
+ * Uses ffmpeg to encode (VENC requires hardware state not available at startup).
+ * Returns 0 on success, -1 on failure.
+ */
+static int recover_orphaned_frames(const char *orphan_dir, int frame_count) {
+    const char *output_dir = get_output_dir();
+
+    /* Ensure output directory exists */
+    if (ensure_directory(output_dir) != 0) {
+        return -1;
+    }
+
+    /* Generate output filename with timestamp for uniqueness */
+    time_t now = time(NULL);
+    struct tm *tm = localtime(&now);
+    char timestamp[32];
+    strftime(timestamp, sizeof(timestamp), "%Y%m%d_%H%M%S", tm);
+
+    char output_mp4[TIMELAPSE_PATH_MAX];
+    snprintf(output_mp4, sizeof(output_mp4), "%s/recovered_%s.mp4",
+             output_dir, timestamp);
+
+    char output_thumb[TIMELAPSE_PATH_MAX];
+    snprintf(output_thumb, sizeof(output_thumb), "%s/recovered_%s_%d.jpg",
+             output_dir, timestamp, frame_count);
+
+    /* Build input pattern */
+    char input_pattern[TIMELAPSE_PATH_MAX];
+    snprintf(input_pattern, sizeof(input_pattern), "%s/frame_%%04d.jpg", orphan_dir);
+
+    /* Use default encoding settings */
+    int fps = DEFAULT_OUTPUT_FPS;
+    int crf = DEFAULT_CRF;
+
+    timelapse_log("Recovery: encoding %d frames -> %s (fps=%d, crf=%d)\n",
+                  frame_count, output_mp4, fps, crf);
+
+    /* Try bundled ffmpeg first */
+    int ret = run_ffmpeg(TIMELAPSE_FFMPEG_PATH, NULL,
+                         fps, input_pattern, "",
+                         "libx264", crf, 0, output_mp4);
+
+    /* Fallback to stock ffmpeg */
+    if (ret != 0) {
+        timelapse_log("Recovery: static ffmpeg failed, trying stock...\n");
+        ret = run_ffmpeg(TIMELAPSE_FFMPEG_STOCK, TIMELAPSE_FFMPEG_LIBS,
+                         fps, input_pattern, "",
+                         "libx264", crf, 0, output_mp4);
+    }
+
+    /* Fallback to mpeg4 codec */
+    if (ret != 0) {
+        timelapse_log("Recovery: libx264 failed, trying mpeg4...\n");
+        ret = run_ffmpeg(TIMELAPSE_FFMPEG_STOCK, TIMELAPSE_FFMPEG_LIBS,
+                         fps, input_pattern, "",
+                         "mpeg4", 0, 5, output_mp4);
+    }
+
+    if (ret == 0) {
+        timelapse_log("Recovery: created %s\n", output_mp4);
+
+        /* Copy last frame as thumbnail */
+        char last_frame[TIMELAPSE_PATH_MAX];
+        snprintf(last_frame, sizeof(last_frame), "%s/frame_%04d.jpg",
+                 orphan_dir, frame_count - 1);
+        if (copy_file(last_frame, output_thumb) == 0) {
+            timelapse_log("Recovery: created thumbnail %s\n", output_thumb);
+        }
+    } else {
+        timelapse_log("Recovery: encoding failed (code %d), cleaning up frames\n", ret);
+    }
+
+    return ret == 0 ? 0 : -1;
+}
+
+void timelapse_recover_orphaned(void) {
+    const char *base = get_temp_dir_base();
+
+    /* Split base into parent dir and prefix
+     * base = "/useremain/home/rinkhals/.timelapse_frames"
+     * parent = "/useremain/home/rinkhals"
+     * prefix = ".timelapse_frames_"
+     */
+    char parent_dir[TIMELAPSE_PATH_MAX];
+    char prefix[256];
+
+    const char *last_slash = strrchr(base, '/');
+    if (!last_slash || last_slash == base) return;
+
+    size_t parent_len = last_slash - base;
+    if (parent_len >= sizeof(parent_dir)) return;
+    memcpy(parent_dir, base, parent_len);
+    parent_dir[parent_len] = '\0';
+
+    snprintf(prefix, sizeof(prefix), "%s_", last_slash + 1);
+    size_t prefix_len = strlen(prefix);
+
+    DIR *dir = opendir(parent_dir);
+    if (!dir) return;
+
+    pid_t my_pid = getpid();
+    struct dirent *entry;
+    int recovered = 0;
+
+    while ((entry = readdir(dir)) != NULL) {
+        if (strncmp(entry->d_name, prefix, prefix_len) != 0)
+            continue;
+
+        /* Extract PID from suffix */
+        const char *pid_str = entry->d_name + prefix_len;
+        int pid = atoi(pid_str);
+        if (pid <= 0) continue;
+
+        /* Skip our own temp dir */
+        if (pid == (int)my_pid) continue;
+
+        /* Check if the owning process is still running */
+        if (kill(pid, 0) == 0) {
+            timelapse_log("Recovery: skipping %s (PID %d still alive)\n",
+                          entry->d_name, pid);
+            continue;
+        }
+
+        /* Build full path */
+        char orphan_dir[TIMELAPSE_PATH_MAX];
+        snprintf(orphan_dir, sizeof(orphan_dir), "%s/%s", parent_dir, entry->d_name);
+
+        /* Count sequential frames */
+        int frame_count = count_frames_in_dir(orphan_dir);
+
+        if (frame_count == 0) {
+            timelapse_log("Recovery: removing empty orphaned dir %s\n", orphan_dir);
+            cleanup_temp_dir(orphan_dir);
+            continue;
+        }
+
+        timelapse_log("Recovery: found %d orphaned frames in %s\n",
+                      frame_count, orphan_dir);
+
+        /* Try to encode the recovered frames */
+        recover_orphaned_frames(orphan_dir, frame_count);
+
+        /* Always clean up regardless of encoding success */
+        cleanup_temp_dir(orphan_dir);
+        recovered++;
+    }
+
+    closedir(dir);
+
+    if (recovered > 0) {
+        timelapse_log("Recovery: processed %d orphaned timelapse dir(s)\n", recovered);
+    }
 }

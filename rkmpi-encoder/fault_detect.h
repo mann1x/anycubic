@@ -19,6 +19,11 @@
 #define FD_MODEL_INPUT_SIZE  224
 #define FD_MODEL_INPUT_BYTES (FD_MODEL_INPUT_SIZE * FD_MODEL_INPUT_SIZE * 3)
 
+/* Spatial heatmap grid dimensions */
+#define FD_SPATIAL_H     7
+#define FD_SPATIAL_W     7
+#define FD_SPATIAL_TOTAL (FD_SPATIAL_H * FD_SPATIAL_W * 1024)  /* 50176 floats */
+
 /* Model set limits */
 #define FD_MAX_SETS        4    /* Max model sets to scan */
 #define FD_MAX_PROFILES    8    /* Max threshold profiles per set */
@@ -58,6 +63,7 @@ typedef enum {
     FD_STRATEGY_VERIFY,     /* 2-model OR, then multiclass confirms */
     FD_STRATEGY_CLASSIFY,   /* 2-model OR decides, multiclass adds type */
     FD_STRATEGY_CLASSIFY_AND, /* 2-model AND decides, multiclass adds type */
+    FD_STRATEGY_AND,        /* FAULT only if CNN AND ProtoNet agree (no multiclass) */
     FD_STRATEGY_CNN,        /* CNN only */
     FD_STRATEGY_PROTONET,   /* ProtoNet only */
     FD_STRATEGY_MULTICLASS  /* Multiclass only */
@@ -67,7 +73,8 @@ typedef enum {
 typedef enum {
     FD_MODEL_CNN = 0,
     FD_MODEL_PROTONET,
-    FD_MODEL_MULTICLASS
+    FD_MODEL_MULTICLASS,
+    FD_MODEL_SPATIAL       /* spatial encoder (protonet without GAP) */
 } fd_model_class_t;
 
 /* Threshold profile — one profile covers ALL model types in the set */
@@ -123,6 +130,13 @@ typedef struct {
     float proto_ms;
     float multi_ms;
     int agreement;          /* Number of models agreeing */
+    /* Spatial heatmap */
+    int has_heatmap;
+    float heatmap[FD_SPATIAL_H][FD_SPATIAL_W]; /* cosine margin per location */
+    float heatmap_max;       /* max fault margin in grid */
+    int heatmap_max_h;       /* row index of max */
+    int heatmap_max_w;       /* col index of max */
+    float spatial_ms;        /* spatial inference time */
 } fd_result_t;
 
 /* Detection state (thread-safe snapshot) */
@@ -147,6 +161,7 @@ typedef struct {
     int min_free_mem_mb;        /* Min free memory to run (default 20) */
     int pace_ms;                /* Inter-step pause ms to reduce CPU spikes (0=off) */
     fd_active_thresholds_t thresholds; /* Active thresholds (profile or custom) */
+    int heatmap_enabled;        /* 0=off, 1=on (spatial heatmap on faults) */
     /* File overrides from metadata.json (populated by scan) */
     char cnn_file[64];
     char proto_file[64];
@@ -191,6 +206,9 @@ int fault_detect_scan_sets(fd_model_set_t *sets, int max_sets);
 
 /* Check if NPU runtime is available (dlopen succeeded). */
 int fault_detect_npu_available(void);
+
+/* Check if fault detection is installed (models directory exists). */
+int fault_detect_installed(void);
 
 /* Strategy name helpers */
 const char *fd_strategy_name(fd_strategy_t strategy);

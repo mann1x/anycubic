@@ -468,6 +468,7 @@ static void serve_control_page(ControlServer *srv, int fd) {
      * a $variable_name in the template */
     char sp_str[12], cp_str[12], br_str[12], fps_str[12], sr_str[12];
     char tc_str[12], jq_str[12], dfps_str[12], mcfps_str[12];
+    char log_max_size_str[12];
 
     snprintf(sp_str, sizeof(sp_str), "%d", cfg->streaming_port);
     snprintf(cp_str, sizeof(cp_str), "%d", cfg->control_port);
@@ -482,6 +483,7 @@ static void serve_control_page(ControlServer *srv, int fd) {
     if (srv->cameras && srv->num_cameras > 0 && srv->cameras[0].max_fps > 0)
         hw_max_fps = srv->cameras[0].max_fps;
     snprintf(mcfps_str, sizeof(mcfps_str), "%d", hw_max_fps);
+    snprintf(log_max_size_str, sizeof(log_max_size_str), "%d", cfg->log_max_size);
 
     /* Timelapse strings */
     char tl_hi_str[12], tl_ofps_str[12], tl_tl_str[12];
@@ -543,6 +545,7 @@ static void serve_control_page(ControlServer *srv, int fd) {
         { "encoder_rkmpi_yuyv_selected", enc_rkmpi_yuyv_sel },
         { "autolanmode_checked", cfg->autolanmode ? checked : empty },
         { "logging_checked", cfg->logging ? checked : empty },
+        { "log_max_size", log_max_size_str },
         { "h264_enabled_checked", cfg->h264_enabled ? checked : empty },
         { "auto_skip_checked", cfg->auto_skip ? checked : empty },
         { "bitrate", br_str },
@@ -591,6 +594,7 @@ static void serve_control_page(ControlServer *srv, int fd) {
         { "timelapse_flip_y_checked", cfg->timelapse_flip_y ? checked : empty },
         { "timelapse_end_delay", tl_ed_str },
         /* Fault detection */
+        { "fd_installed", fault_detect_installed() ? "true" : "false" },
         { "fd_npu_available", fault_detect_npu_available() ? "true" : "false" },
         { "fd_enabled_checked", cfg->fault_detect_enabled ? checked : empty },
         { "fd_cnn_enabled_checked", cfg->fault_detect_cnn_enabled ? checked : empty },
@@ -598,6 +602,7 @@ static void serve_control_page(ControlServer *srv, int fd) {
         { "fd_multi_enabled_checked", cfg->fault_detect_multi_enabled ? checked : empty },
         { "fd_strategy", cfg->fault_detect_strategy },
         { "fd_model_set", cfg->fault_detect_model_set },
+        { "heatmap_checked", cfg->heatmap_enabled ? checked : empty },
     };
     int nvars = sizeof(vars) / sizeof(vars[0]);
 
@@ -632,6 +637,11 @@ static void handle_control_post(ControlServer *srv, int fd,
                        strcmp(form_get(params, nparams, "autolanmode"), "1") == 0;
     cfg->logging = form_has(params, nparams, "logging") &&
                    strcmp(form_get(params, nparams, "logging"), "1") == 0;
+
+    if (form_has(params, nparams, "log_max_size")) {
+        int lms = atoi(form_get(params, nparams, "log_max_size"));
+        if (lms >= 100 && lms <= 5120) cfg->log_max_size = lms;
+    }
 
     if (form_has(params, nparams, "h264_enabled")) {
         cfg->h264_enabled = strcmp(form_get(params, nparams, "h264_enabled"), "1") == 0;
@@ -795,6 +805,38 @@ static void serve_api_stats(ControlServer *srv, int fd) {
             (double)fd_state.cycle_count);
         cJSON_AddBoolToObject(fd_obj, "npu_available",
             fault_detect_npu_available());
+
+        /* Spatial heatmap data */
+        {
+            cJSON *hm = cJSON_CreateObject();
+            cJSON_AddBoolToObject(hm, "enabled",
+                srv->config->heatmap_enabled ? 1 : 0);
+            if (fd_state.last_result.has_heatmap) {
+                cJSON_AddBoolToObject(hm, "has_data", 1);
+                cJSON_AddNumberToObject(hm, "max",
+                    ((int)(fd_state.last_result.heatmap_max * 100 + 0.5f)) / 100.0);
+                cJSON_AddNumberToObject(hm, "max_row",
+                    fd_state.last_result.heatmap_max_h);
+                cJSON_AddNumberToObject(hm, "max_col",
+                    fd_state.last_result.heatmap_max_w);
+                cJSON *grid = cJSON_CreateArray();
+                for (int h = 0; h < FD_SPATIAL_H; h++) {
+                    cJSON *row = cJSON_CreateArray();
+                    for (int w = 0; w < FD_SPATIAL_W; w++) {
+                        float v = fd_state.last_result.heatmap[h][w];
+                        cJSON_AddItemToArray(row,
+                            cJSON_CreateNumber(
+                                ((int)(v * 100 + 0.5f)) / 100.0));
+                    }
+                    cJSON_AddItemToArray(grid, row);
+                }
+                cJSON_AddItemToObject(hm, "grid", grid);
+            } else {
+                cJSON_AddBoolToObject(hm, "has_data", 0);
+            }
+            cJSON_AddItemToObject(fd_obj, "heatmap", hm);
+        }
+
         cJSON_AddItemToObject(root, "fault_detect", fd_obj);
     }
 
@@ -901,6 +943,7 @@ static void serve_fault_detect_sets(ControlServer *srv, int fd) {
 
     cJSON *root = cJSON_CreateObject();
     cJSON_AddItemToObject(root, "sets", arr);
+    cJSON_AddBoolToObject(root, "installed", fault_detect_installed());
     cJSON_AddBoolToObject(root, "npu_available", fault_detect_npu_available());
 
     send_json_response(fd, 200, root);
@@ -941,6 +984,9 @@ static void handle_fault_detect_settings(ControlServer *srv, int fd,
 
     item = cJSON_GetObjectItemCaseSensitive(root, "multi_enabled");
     if (item) cfg->fault_detect_multi_enabled = cJSON_IsTrue(item) ? 1 : 0;
+
+    item = cJSON_GetObjectItemCaseSensitive(root, "heatmap_enabled");
+    if (item) cfg->heatmap_enabled = cJSON_IsTrue(item) ? 1 : 0;
 
     item = cJSON_GetObjectItemCaseSensitive(root, "strategy");
     if (item && cJSON_IsString(item) && item->valuestring)

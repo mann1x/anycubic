@@ -146,14 +146,6 @@ static int fd_get_available_memory_mb(void)
     return avail_kb > 0 ? avail_kb / 1024 : -1;
 }
 
-static void fd_purge_memory(void)
-{
-    FILE *f = fopen("/proc/sys/vm/drop_caches", "w");
-    if (f) { fputs("3\n", f); fclose(f); }
-    f = fopen("/proc/sys/vm/compact_memory", "w");
-    if (f) { fputs("1\n", f); fclose(f); }
-}
-
 static void fd_softmax(float *arr, int n)
 {
     float max_val = arr[0];
@@ -296,17 +288,9 @@ static int fd_model_init(fd_rknn_model_t *m, const char *model_path)
     /* Allocate input memory (CMA) */
     m->input_mem = g_rknn.create_mem(m->ctx, m->input_attr.size_with_stride);
     if (!m->input_mem) {
-        /* CMA failure: purge and retry once */
-        fd_log("CMA alloc failed for input, purging memory...\n");
-        fd_purge_memory();
-        usleep(100000);  /* 100ms settle */
-        m->input_mem = g_rknn.create_mem(m->ctx,
-                                          m->input_attr.size_with_stride);
-        if (!m->input_mem) {
-            fd_err("CMA alloc failed for input after purge\n");
-            ret = -1;
-            goto fail;
-        }
+        fd_err("CMA alloc failed for input\n");
+        ret = -2;  /* memory failure */
+        goto fail;
     }
     ret = g_rknn.set_io_mem(m->ctx, m->input_mem, &m->input_attr);
     if (ret < 0) {
@@ -328,7 +312,7 @@ static int fd_model_init(fd_rknn_model_t *m, const char *model_path)
                                                 m->output_attrs[i].size_with_stride);
         if (!m->output_mems[i]) {
             fd_err("CMA alloc failed for output[%u]\n", i);
-            ret = -1;
+            ret = -2;  /* memory failure */
             goto fail;
         }
         ret = g_rknn.set_io_mem(m->ctx, m->output_mems[i],
@@ -358,9 +342,36 @@ fail:
     return ret;
 }
 
-static int fd_model_run(fd_rknn_model_t *m, const uint8_t *input_data)
+/* Retry model init once after a short delay (CMA alloc can be transient).
+ * No compact_memory or drop_caches — those destabilize the system.
+ * Returns 0=ok, -1=generic error, -2=memory/CMA failure */
+static int fd_model_init_retry(fd_rknn_model_t *m, const char *model_path)
 {
-    memcpy(m->input_mem->virt_addr, input_data, m->input_size);
+    int ret = fd_model_init(m, model_path);
+    if (ret == 0)
+        return 0;
+
+    fd_log("Retrying model init after 200ms...\n");
+    usleep(200000);
+    ret = fd_model_init(m, model_path);
+    if (ret == 0)
+        return 0;
+
+    fd_err("Model init failed after retry: %s\n", model_path);
+    return ret;  /* preserve -2 for CMA failures */
+}
+
+static int fd_model_run(fd_rknn_model_t *m, const uint8_t *input_data,
+                         uint32_t src_size)
+{
+    /* Cap copy at source size to prevent over-read when
+     * size_with_stride (NC1HWC2 padded) > actual NHWC data */
+    uint32_t copy_size = src_size < m->input_size ? src_size : m->input_size;
+    memcpy(m->input_mem->virt_addr, input_data, copy_size);
+    /* Zero-fill stride padding so NPU gets clean data */
+    if (copy_size < m->input_size)
+        memset((uint8_t *)m->input_mem->virt_addr + copy_size, 0,
+               m->input_size - copy_size);
     return g_rknn.run(m->ctx, NULL);
 }
 
@@ -482,10 +493,16 @@ static void fd_resize_crop_gray(const uint8_t *src, int sw, int sh,
     float x_ratio = (float)sw / (float)rw;
     float y_ratio = (float)sh / (float)rh;
 
+    if (sw < 2 || sh < 2) {
+        memset(dst, 0, dw * dh * 3);
+        return;
+    }
+
     for (int dy = 0; dy < dh; dy++) {
         float sy_f = (dy + cy) * y_ratio;
         int sy = (int)sy_f;
         float y_diff = sy_f - sy;
+        if (sy < 0) { sy = 0; y_diff = 0.0f; }
         if (sy >= sh - 1) { sy = sh - 2; y_diff = 1.0f; }
 
         const uint8_t *row0 = src + sy * sw * 3;
@@ -495,6 +512,7 @@ static void fd_resize_crop_gray(const uint8_t *src, int sw, int sh,
             float sx_f = (dx + cx) * x_ratio;
             int sx = (int)sx_f;
             float x_diff = sx_f - sx;
+            if (sx < 0) { sx = 0; x_diff = 0.0f; }
             if (sx >= sw - 1) { sx = sw - 2; x_diff = 1.0f; }
 
             const uint8_t *a = row0 + sx * 3;
@@ -565,7 +583,8 @@ static int fd_load_prototypes(const char *path)
 
 /* Path scheme: {base_dir}/{set_name}/{class_dir}/{filename} */
 static int fd_resolve_model_path(fd_model_class_t cls, const char *set_name,
-                                  char *path, size_t path_size)
+                                  char *path, size_t path_size,
+                                  const fd_config_t *cfg)
 {
     const char *class_dir;
     const char *filename;
@@ -573,15 +592,19 @@ static int fd_resolve_model_path(fd_model_class_t cls, const char *set_name,
     switch (cls) {
     case FD_MODEL_CNN:
         class_dir = "cnn";
-        filename = g_fd.config.cnn_file[0] ? g_fd.config.cnn_file : "model.rknn";
+        filename = cfg->cnn_file[0] ? cfg->cnn_file : "model.rknn";
         break;
     case FD_MODEL_PROTONET:
         class_dir = "protonet";
-        filename = g_fd.config.proto_file[0] ? g_fd.config.proto_file : "encoder.rknn";
+        filename = cfg->proto_file[0] ? cfg->proto_file : "encoder.rknn";
         break;
     case FD_MODEL_MULTICLASS:
         class_dir = "multiclass";
-        filename = g_fd.config.multi_file[0] ? g_fd.config.multi_file : "multiclass.rknn";
+        filename = cfg->multi_file[0] ? cfg->multi_file : "multiclass.rknn";
+        break;
+    case FD_MODEL_SPATIAL:
+        class_dir = "protonet";
+        filename = "spatial_encoder.rknn";
         break;
     default:
         return -1;
@@ -646,22 +669,24 @@ static void fd_get_thresholds(const fd_config_t *cfg, int strategy,
         *multi_th = t->multi_threshold > 0 ? t->multi_threshold : 0.81f;
 }
 
-static int fd_run_cnn(const uint8_t *input, fd_result_t *r, float threshold)
+static int fd_run_cnn(const uint8_t *input, fd_result_t *r, float threshold,
+                       const fd_config_t *cfg)
 {
     fd_rknn_model_t model;
     char path[512];
 
-    if (fd_resolve_model_path(FD_MODEL_CNN, g_fd.config.model_set,
-                               path, sizeof(path)) < 0) {
-        fd_err("CNN model not found in set: %s\n", g_fd.config.model_set);
+    if (fd_resolve_model_path(FD_MODEL_CNN, cfg->model_set,
+                               path, sizeof(path), cfg) < 0) {
+        fd_err("CNN model not found in set: %s\n", cfg->model_set);
         return -1;
     }
 
-    if (fd_model_init(&model, path) < 0)
-        return -1;
+    int init_ret = fd_model_init_retry(&model, path);
+    if (init_ret < 0)
+        return init_ret;
 
     double t0 = fd_get_time_ms();
-    int ret = fd_model_run(&model, input);
+    int ret = fd_model_run(&model, input, FD_MODEL_INPUT_BYTES);
     if (ret < 0) {
         fd_err("CNN run failed: %d\n", ret);
         fd_model_release(&model);
@@ -676,44 +701,48 @@ static int fd_run_cnn(const uint8_t *input, fd_result_t *r, float threshold)
     fd_model_release(&model);
 
     fd_softmax(logits, 2);
-    fd_log("  CNN probs: fail=%.3f succ=%.3f (th=%.2f)\n",
-           logits[0], logits[1], threshold);
 
     int cnn_class = logits[0] > threshold ? FD_CLASS_FAULT : FD_CLASS_OK;
     float cnn_conf = logits[0] > logits[1] ? logits[0] : logits[1];
+
+    fd_log("  CNN: fail=%.3f th=%.2f -> %s (%.0fms)\n",
+           logits[0], threshold,
+           cnn_class == FD_CLASS_FAULT ? "FAULT" : "OK", r->cnn_ms);
 
     r->result = cnn_class;
     r->confidence = cnn_conf;
     return 0;
 }
 
-static int fd_run_protonet(const uint8_t *input, fd_result_t *r, float proto_threshold)
+static int fd_run_protonet(const uint8_t *input, fd_result_t *r,
+                            float proto_threshold, const fd_config_t *cfg)
 {
     fd_rknn_model_t model;
     char path[512];
 
-    if (fd_resolve_model_path(FD_MODEL_PROTONET, g_fd.config.model_set,
-                               path, sizeof(path)) < 0) {
-        fd_err("ProtoNet model not found in set: %s\n", g_fd.config.model_set);
+    if (fd_resolve_model_path(FD_MODEL_PROTONET, cfg->model_set,
+                               path, sizeof(path), cfg) < 0) {
+        fd_err("ProtoNet model not found in set: %s\n", cfg->model_set);
         return -1;
     }
 
     /* Load prototypes if not already loaded */
     if (!g_fd.prototypes_loaded) {
-        const char *proto_file = g_fd.config.proto_prototypes[0] ?
-                                  g_fd.config.proto_prototypes : "prototypes.bin";
+        const char *proto_file = cfg->proto_prototypes[0] ?
+                                  cfg->proto_prototypes : "prototypes.bin";
         char proto_path[512];
         snprintf(proto_path, sizeof(proto_path), "%s/%s/protonet/%s",
-                 g_fd.models_base_dir, g_fd.config.model_set, proto_file);
+                 g_fd.models_base_dir, cfg->model_set, proto_file);
         if (fd_load_prototypes(proto_path) < 0)
             return -1;
     }
 
-    if (fd_model_init(&model, path) < 0)
-        return -1;
+    int init_ret = fd_model_init_retry(&model, path);
+    if (init_ret < 0)
+        return init_ret;
 
     double t0 = fd_get_time_ms();
-    int ret = fd_model_run(&model, input);
+    int ret = fd_model_run(&model, input, FD_MODEL_INPUT_BYTES);
     if (ret < 0) {
         fd_err("ProtoNet run failed: %d\n", ret);
         fd_model_release(&model);
@@ -733,31 +762,34 @@ static int fd_run_protonet(const uint8_t *input, fd_result_t *r, float proto_thr
                                            g_fd.proto_norms[1], EMB_DIM);
     float cos_margin = cos_fail - cos_succ;
 
-    fd_log("  Proto cos: fail=%.4f succ=%.4f margin=%.4f (th=%.2f, norms: %.1f, %.1f)\n",
-           cos_fail, cos_succ, cos_margin, proto_threshold,
-           g_fd.proto_norms[0], g_fd.proto_norms[1]);
-
     r->result = cos_margin > proto_threshold ? FD_CLASS_FAULT : FD_CLASS_OK;
     r->confidence = fabsf(cos_margin);
+
+    fd_log("  Proto: margin=%.3f th=%.2f -> %s (%.0fms)\n",
+           cos_margin, proto_threshold,
+           r->result == FD_CLASS_FAULT ? "FAULT" : "OK", r->proto_ms);
+
     return 0;
 }
 
-static int fd_run_multiclass(const uint8_t *input, fd_result_t *r, float multi_threshold)
+static int fd_run_multiclass(const uint8_t *input, fd_result_t *r,
+                              float multi_threshold, const fd_config_t *cfg)
 {
     fd_rknn_model_t model;
     char path[512];
 
-    if (fd_resolve_model_path(FD_MODEL_MULTICLASS, g_fd.config.model_set,
-                               path, sizeof(path)) < 0) {
-        fd_err("Multiclass model not found in set: %s\n", g_fd.config.model_set);
+    if (fd_resolve_model_path(FD_MODEL_MULTICLASS, cfg->model_set,
+                               path, sizeof(path), cfg) < 0) {
+        fd_err("Multiclass model not found in set: %s\n", cfg->model_set);
         return -1;
     }
 
-    if (fd_model_init(&model, path) < 0)
-        return -1;
+    int init_ret = fd_model_init_retry(&model, path);
+    if (init_ret < 0)
+        return init_ret;
 
     double t0 = fd_get_time_ms();
-    int ret = fd_model_run(&model, input);
+    int ret = fd_model_run(&model, input, FD_MODEL_INPUT_BYTES);
     if (ret < 0) {
         fd_err("Multiclass run failed: %d\n", ret);
         fd_model_release(&model);
@@ -769,23 +801,9 @@ static int fd_run_multiclass(const uint8_t *input, fd_result_t *r, float multi_t
     double t1 = fd_get_time_ms();
     r->multi_ms = (float)(t1 - t0);
 
-    /* Log raw INT8 values before releasing model memory */
-    {
-        const int8_t *raw = (const int8_t *)model.output_mems[0]->virt_addr;
-        fd_log("  Multi raw INT8[0..6]: %d %d %d %d %d %d %d (zp=%d scale=%.6f n_elems=%u)\n",
-               raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6],
-               (int)model.output_attrs[0].zp, model.output_attrs[0].scale,
-               model.output_attrs[0].n_elems);
-    }
-
     fd_model_release(&model);
 
     fd_softmax(logits, FD_MCLASS_COUNT);
-
-    fd_log("  Multi probs: Crack=%.3f LayShft=%.3f Spag=%.3f Str=%.3f "
-           "Succ=%.3f UndrEx=%.3f Warp=%.3f\n",
-           logits[0], logits[1], logits[2], logits[3],
-           logits[4], logits[5], logits[6]);
 
     /* Find argmax */
     int best = 0;
@@ -797,11 +815,100 @@ static int fd_run_multiclass(const uint8_t *input, fd_result_t *r, float multi_t
 
     /* Binary collapse: FAULT if 1 - p(Success) > threshold */
     float multi_conf = 1.0f - logits[FD_MCLASS_SUCCESS];
-    fd_log("  Multi binary: 1-p(Succ)=%.3f th=%.2f -> %s\n",
-           multi_conf, multi_threshold,
-           multi_conf > multi_threshold ? "FAULT" : "OK");
     r->result = multi_conf > multi_threshold ? FD_CLASS_FAULT : FD_CLASS_OK;
     r->confidence = multi_conf;
+
+    fd_log("  Multi: 1-p(Succ)=%.3f class=%s -> %s (%.0fms)\n",
+           multi_conf, r->fault_class_name,
+           r->result == FD_CLASS_FAULT ? "FAULT" : "OK", r->multi_ms);
+
+    return 0;
+}
+
+/* ============================================================================
+ * Spatial heatmap inference
+ * ============================================================================ */
+
+/* Run spatial encoder and compute per-location cosine similarity heatmap.
+ * Requires prototypes to be loaded (run ProtoNet first).
+ * spatial_buf must be pre-allocated (FD_SPATIAL_TOTAL floats).
+ * Returns 0=ok, -1=error, -2=CMA failure */
+static int fd_run_heatmap(const uint8_t *input, fd_result_t *r,
+                          const fd_config_t *cfg, float *spatial_buf)
+{
+    fd_rknn_model_t model;
+    char path[512];
+
+    if (fd_resolve_model_path(FD_MODEL_SPATIAL, cfg->model_set,
+                               path, sizeof(path), cfg) < 0) {
+        fd_err("Spatial model not found in set: %s\n", cfg->model_set);
+        return -1;
+    }
+
+    /* Memory gate */
+    int mem_mb = fd_get_available_memory_mb();
+    if (mem_mb > 0 && mem_mb < cfg->min_free_mem_mb) {
+        fd_log("  Heatmap: skipping, %dMB free < %dMB min\n",
+               mem_mb, cfg->min_free_mem_mb);
+        return -2;
+    }
+
+    int init_ret = fd_model_init_retry(&model, path);
+    if (init_ret < 0)
+        return init_ret;
+
+    double t0 = fd_get_time_ms();
+    int ret = fd_model_run(&model, input, FD_MODEL_INPUT_BYTES);
+    if (ret < 0) {
+        fd_err("Spatial run failed: %d\n", ret);
+        fd_model_release(&model);
+        return -1;
+    }
+
+    /* Read NHWC [1,7,7,1024] output — dequantize INT8 to float.
+     * fd_model_get_output handles INT8→float via zp/scale. */
+    int n = fd_model_get_output(&model, 0, spatial_buf, FD_SPATIAL_TOTAL);
+    double t1 = fd_get_time_ms();
+
+    fd_model_release(&model);
+
+    if (n < FD_SPATIAL_TOTAL) {
+        fd_err("Spatial output too short: %d vs %d\n", n, FD_SPATIAL_TOTAL);
+        return -1;
+    }
+
+    /* Per-location cosine similarity to prototypes.
+     * NHWC layout: features[h][w][c] = spatial_buf[(h * W + w) * C + c] */
+    float max_margin = -999.0f;
+    int max_h = 0, max_w = 0;
+
+    for (int h = 0; h < FD_SPATIAL_H; h++) {
+        for (int w = 0; w < FD_SPATIAL_W; w++) {
+            const float *vec = &spatial_buf[(h * FD_SPATIAL_W + w) * EMB_DIM];
+            float cos_fail = fd_cosine_similarity(vec, g_fd.prototypes[0],
+                                                   g_fd.proto_norms[0], EMB_DIM);
+            float cos_succ = fd_cosine_similarity(vec, g_fd.prototypes[1],
+                                                   g_fd.proto_norms[1], EMB_DIM);
+            float margin = cos_fail - cos_succ;
+            r->heatmap[h][w] = margin;
+
+            if (margin > max_margin) {
+                max_margin = margin;
+                max_h = h;
+                max_w = w;
+            }
+        }
+    }
+
+    r->has_heatmap = 1;
+    r->heatmap_max = max_margin;
+    r->heatmap_max_h = max_h;
+    r->heatmap_max_w = max_w;
+    r->spatial_ms = (float)(t1 - t0);
+
+    fd_log("  Heatmap: max=%.2f at [%d,%d] (%.0fms)\n",
+           max_margin, max_h, max_w, r->spatial_ms);
+
     return 0;
 }
 
@@ -809,8 +916,9 @@ static int fd_run_multiclass(const uint8_t *input, fd_result_t *r, float multi_t
  * Combined detection + strategy (from detect.c)
  * ============================================================================ */
 
-static void fd_run_detection(const uint8_t *preprocessed, fd_result_t *result,
-                              fd_config_t *cfg)
+/* Returns 0 on success, -1 if a model failed to load (skip cycle) */
+static int fd_run_detection(const uint8_t *preprocessed, fd_result_t *result,
+                             fd_config_t *cfg, float *spatial_buf)
 {
     double t0 = fd_get_time_ms();
     memset(result, 0, sizeof(*result));
@@ -832,6 +940,8 @@ static void fd_run_detection(const uint8_t *preprocessed, fd_result_t *result,
         have_cnn = 0; have_proto = 1; have_multi = 0;
     } else if (cfg->strategy == FD_STRATEGY_MULTICLASS) {
         have_cnn = 0; have_proto = 0; have_multi = 1;
+    } else if (cfg->strategy == FD_STRATEGY_AND) {
+        have_multi = 0;  /* AND: CNN+Proto only, no multiclass */
     }
 
     /* Per-model results */
@@ -840,14 +950,15 @@ static void fd_run_detection(const uint8_t *preprocessed, fd_result_t *result,
     fd_result_t model_result;
 
     int pace_us = cfg->pace_ms * 1000;
+    int rc;
 
     /* Run ProtoNet FIRST (its margin gates the CNN threshold) */
     if (have_proto) {
         memset(&model_result, 0, sizeof(model_result));
-        if (fd_run_protonet(preprocessed, &model_result, proto_th) < 0) {
-            result->result = FD_CLASS_OK;
+        rc = fd_run_protonet(preprocessed, &model_result, proto_th, cfg);
+        if (rc < 0) {
             result->total_ms = (float)(fd_get_time_ms() - t0);
-            return;
+            return rc;
         }
         proto_class = model_result.result;
         proto_conf = model_result.confidence;
@@ -857,20 +968,34 @@ static void fd_run_detection(const uint8_t *preprocessed, fd_result_t *result,
 
     /* Dynamic CNN threshold: when ProtoNet is moderately suspicious,
      * lower the CNN threshold to catch light faults.
-     * Trigger below proto_threshold so CNN assists before Proto trips. */
-    if (have_proto && have_cnn && proto_conf >= proto_dyn_trigger) {
+     * Only for OR/majority/verify/classify — for AND/all strategies it's
+     * counterproductive (increases false agreement between models). */
+    if (have_proto && have_cnn && proto_conf >= proto_dyn_trigger &&
+        cfg->strategy != FD_STRATEGY_AND &&
+        cfg->strategy != FD_STRATEGY_CLASSIFY_AND &&
+        cfg->strategy != FD_STRATEGY_ALL) {
         cnn_th = cnn_dyn_th;
-        fd_log("  Dynamic CNN threshold: %.2f (proto margin=%.3f, trigger=%.2f)\n",
+        fd_log("  Dynamic CNN th: %.2f (proto=%.3f trigger=%.2f)\n",
                cnn_th, proto_conf, proto_dyn_trigger);
+    }
+
+    /* Memory gate: skip remaining models if memory is low */
+    if (have_cnn) {
+        int mem_mb = fd_get_available_memory_mb();
+        if (mem_mb > 0 && mem_mb < cfg->min_free_mem_mb) {
+            fd_log("  Skipping CNN: %dMB free < %dMB min\n",
+                   mem_mb, cfg->min_free_mem_mb);
+            have_cnn = 0;
+        }
     }
 
     /* Run CNN */
     if (have_cnn) {
         memset(&model_result, 0, sizeof(model_result));
-        if (fd_run_cnn(preprocessed, &model_result, cnn_th) < 0) {
-            result->result = FD_CLASS_OK;
+        rc = fd_run_cnn(preprocessed, &model_result, cnn_th, cfg);
+        if (rc < 0) {
             result->total_ms = (float)(fd_get_time_ms() - t0);
-            return;
+            return rc;
         }
         cnn_class = model_result.result;
         cnn_conf = model_result.confidence;
@@ -888,11 +1013,21 @@ static void fd_run_detection(const uint8_t *preprocessed, fd_result_t *result,
         run_multi = or_fault;
     }
 
+    /* Memory gate before multiclass */
+    if (run_multi) {
+        int mem_mb = fd_get_available_memory_mb();
+        if (mem_mb > 0 && mem_mb < cfg->min_free_mem_mb) {
+            fd_log("  Skipping Multi: %dMB free < %dMB min\n",
+                   mem_mb, cfg->min_free_mem_mb);
+            run_multi = 0;
+        }
+    }
+
     /* Run Multiclass */
     if (run_multi) {
         if (pace_us > 0) usleep(pace_us);
         memset(&model_result, 0, sizeof(model_result));
-        if (fd_run_multiclass(preprocessed, &model_result, multi_th) == 0) {
+        if (fd_run_multiclass(preprocessed, &model_result, multi_th, cfg) == 0) {
             multi_class = model_result.result;
             multi_conf = model_result.confidence;
             result->multi_ms = model_result.multi_ms;
@@ -902,18 +1037,6 @@ static void fd_run_detection(const uint8_t *preprocessed, fd_result_t *result,
                      model_result.fault_class_name);
         }
     }
-
-    /* Log per-model details */
-    if (have_cnn)
-        fd_log("  CNN: %s conf=%.3f (%.0fms)\n",
-               cnn_class == FD_CLASS_FAULT ? "FAULT" : "OK", cnn_conf, result->cnn_ms);
-    if (have_proto)
-        fd_log("  Proto: %s margin=%.3f (%.0fms)\n",
-               proto_class == FD_CLASS_FAULT ? "FAULT" : "OK", proto_conf, result->proto_ms);
-    if (run_multi)
-        fd_log("  Multi: %s conf=%.3f class=%s (%.0fms)\n",
-               multi_class == FD_CLASS_FAULT ? "FAULT" : "OK", multi_conf,
-               result->fault_class_name, result->multi_ms);
 
     /* Combine results by strategy */
     int n_models = 0, n_fault = 0;
@@ -965,6 +1088,7 @@ static void fd_run_detection(const uint8_t *preprocessed, fd_result_t *result,
         result->result = or_fault ? FD_CLASS_FAULT : FD_CLASS_OK;
         break;
     }
+    case FD_STRATEGY_AND:
     case FD_STRATEGY_CLASSIFY_AND: {
         int and_fault = 0;
         if (have_cnn && have_proto)
@@ -1007,7 +1131,20 @@ static void fd_run_detection(const uint8_t *preprocessed, fd_result_t *result,
         result->confidence = 0.5f;
     }
 
+    /* Spatial heatmap: run only on faults, when enabled and prototypes loaded */
+    if (result->result == FD_CLASS_FAULT && cfg->heatmap_enabled &&
+        g_fd.prototypes_loaded && spatial_buf) {
+        if (pace_us > 0) usleep(pace_us);
+        int hm_ret = fd_run_heatmap(preprocessed, result, cfg, spatial_buf);
+        if (hm_ret < 0) {
+            fd_log("  Heatmap: skipped (%s)\n",
+                   hm_ret == -2 ? "low memory" : "error");
+            result->has_heatmap = 0;
+        }
+    }
+
     result->total_ms = (float)(fd_get_time_ms() - t0);
+    return 0;
 }
 
 /* ============================================================================
@@ -1037,6 +1174,12 @@ static void *fd_thread_func(void *arg)
         fd_err("Failed to allocate preprocess buffer\n");
         fd_set_state(FD_STATUS_ERROR, NULL, "malloc failed");
         return NULL;
+    }
+
+    /* Persistent spatial buffer (~196KB) — allocated once, reused each cycle */
+    float *spatial_buf = (float *)malloc(FD_SPATIAL_TOTAL * sizeof(float));
+    if (!spatial_buf) {
+        fd_log("Warning: spatial buffer alloc failed, heatmap disabled\n");
     }
 
     int consecutive_ok = 0;
@@ -1125,7 +1268,14 @@ static void *fd_thread_func(void *arg)
 
         /* Run detection (pacing between models handled inside) */
         fd_result_t result;
-        fd_run_detection(preprocessed, &result, &cfg);
+        int det_ret = fd_run_detection(preprocessed, &result, &cfg, spatial_buf);
+        if (det_ret < 0) {
+            if (det_ret == -2)
+                fd_set_state(FD_STATUS_MEM_LOW, NULL, "CMA alloc failed");
+            else
+                fd_set_state(FD_STATUS_ERROR, NULL, "model load failed");
+            continue;  /* Skip cycle entirely */
+        }
 
         /* Update state */
         pthread_mutex_lock(&g_fd.state_mutex);
@@ -1159,6 +1309,7 @@ static void *fd_thread_func(void *arg)
     }
 
     free(preprocessed);
+    free(spatial_buf);
     fd_log("Detection thread stopped\n");
     return NULL;
 }
@@ -1221,7 +1372,7 @@ int fault_detect_start(void)
     if (cfg.cnn_enabled || cfg.strategy == FD_STRATEGY_CNN) {
         char path[512];
         if (fd_resolve_model_path(FD_MODEL_CNN, cfg.model_set,
-                                   path, sizeof(path)) < 0) {
+                                   path, sizeof(path), &cfg) < 0) {
             fd_err("CNN model not found in set: %s\n", cfg.model_set);
             fd_set_state(FD_STATUS_ERROR, NULL, "CNN model not found");
             return -1;
@@ -1230,7 +1381,7 @@ int fault_detect_start(void)
     if (cfg.proto_enabled || cfg.strategy == FD_STRATEGY_PROTONET) {
         char path[512];
         if (fd_resolve_model_path(FD_MODEL_PROTONET, cfg.model_set,
-                                   path, sizeof(path)) < 0) {
+                                   path, sizeof(path), &cfg) < 0) {
             fd_err("ProtoNet model not found in set: %s\n", cfg.model_set);
             fd_set_state(FD_STATUS_ERROR, NULL, "ProtoNet model not found");
             return -1;
@@ -1250,7 +1401,7 @@ int fault_detect_start(void)
     if (cfg.multi_enabled || cfg.strategy == FD_STRATEGY_MULTICLASS) {
         char path[512];
         if (fd_resolve_model_path(FD_MODEL_MULTICLASS, cfg.model_set,
-                                   path, sizeof(path)) < 0) {
+                                   path, sizeof(path), &cfg) < 0) {
             fd_err("Multiclass model not found in set: %s\n", cfg.model_set);
             fd_set_state(FD_STATUS_ERROR, NULL, "Multiclass model not found");
             return -1;
@@ -1530,12 +1681,18 @@ int fault_detect_npu_available(void)
     return g_rknn.handle != NULL ? 1 : 0;
 }
 
+int fault_detect_installed(void)
+{
+    struct stat st;
+    return (stat(g_fd.models_base_dir, &st) == 0 && S_ISDIR(st.st_mode)) ? 1 : 0;
+}
+
 /* ============================================================================
  * Name/enum helpers
  * ============================================================================ */
 
 static const char *g_strategy_names[] = {
-    "or", "majority", "all", "verify", "classify", "classify_and",
+    "or", "majority", "all", "verify", "classify", "classify_and", "and",
     "cnn", "protonet", "multiclass"
 };
 

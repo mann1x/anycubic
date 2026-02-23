@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## h264-streamer
 
+### [Unreleased]
+
+#### Added
+- Rolling log buffer with configurable max size (`log_max_size` setting, default 1024KB)
+  - Prevents unbounded log growth from filling /tmp (tmpfs = RAM)
+  - Truncates and rewinds log file when size limit is exceeded
+  - Configurable 100-5120KB via control page UI
+- PID number in log truncation message for multi-process identification
+
+#### Changed
+- Condensed fault detection logging from ~10 lines to ~3-4 lines per cycle
+  - Each model now logs a single compact result line with timing
+  - Removed raw INT8 quantization dump and per-class probability listing
+  - Removed redundant per-model summary (now inline in each model function)
+  - Shortened dynamic CNN threshold log line
+
+#### Fixed
+- Dynamic CNN threshold firing incorrectly with classify_and/all strategies
+  - Was lowering CNN threshold when Proto margin exceeded trigger, causing false agreement between models
+  - Now only applies dynamic threshold for OR/majority/verify/classify strategies where it's beneficial
+
 ### [2.0.0] - 2026-02-20
 
 #### Added

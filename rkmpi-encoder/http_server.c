@@ -1386,9 +1386,9 @@ static void *flv_proxy_thread(void *arg) {
         return NULL;
     }
 
-    struct timeval tv = { .tv_sec = 10, .tv_usec = 0 };
-    setsockopt(upstream, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-    setsockopt(upstream, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    struct timeval tv_connect = { .tv_sec = 10, .tv_usec = 0 };
+    setsockopt(upstream, SOL_SOCKET, SO_SNDTIMEO, &tv_connect, sizeof(tv_connect));
+    setsockopt(upstream, SOL_SOCKET, SO_RCVTIMEO, &tv_connect, sizeof(tv_connect));
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
@@ -1449,15 +1449,30 @@ static void *flv_proxy_thread(void *arg) {
 
     fprintf(stderr, "FLV proxy: relaying from %s\n", url);
 
+    /* Increase recv timeout for relay — upstream may have gaps between keyframes */
+    struct timeval tv_relay = { .tv_sec = 30, .tv_usec = 0 };
+    setsockopt(upstream, SOL_SOCKET, SO_RCVTIMEO, &tv_relay, sizeof(tv_relay));
+
     /* FLV tag counter for FPS tracking */
     FlvTagCounter flv_counter;
     flv_counter_init(&flv_counter);
 
     /* Transparent byte relay with FLV tag counting */
     char buf[8192];
+    size_t total_bytes = 0;
+    const char *disconnect_reason = "server shutdown";
     while (g_flv_server.running) {
         ssize_t n = recv(upstream, buf, sizeof(buf), 0);
-        if (n <= 0) break;
+        if (n <= 0) {
+            if (n == 0)
+                disconnect_reason = "upstream closed";
+            else if (errno == EAGAIN || errno == EWOULDBLOCK)
+                disconnect_reason = "upstream timeout";
+            else
+                disconnect_reason = strerror(errno);
+            break;
+        }
+        total_bytes += n;
 
         /* Count FLV video tags for FPS tracking */
         flv_count_tags(&flv_counter, (const uint8_t *)buf, (int)n);
@@ -1470,6 +1485,7 @@ static void *flv_proxy_thread(void *arg) {
                     usleep(1000);
                     continue;
                 }
+                disconnect_reason = "client write error";
                 goto proxy_done;
             }
             sent += w;
@@ -1477,7 +1493,8 @@ static void *flv_proxy_thread(void *arg) {
     }
 
 proxy_done:
-    fprintf(stderr, "FLV proxy: client disconnected\n");
+    fprintf(stderr, "FLV proxy: disconnected (%s, %zuKB relayed)\n",
+            disconnect_reason, total_bytes / 1024);
     g_flv_proxy_fps = 0.0f;
     close(upstream);
     close(client_fd);

@@ -61,6 +61,7 @@ typedef struct {
     char mode[20];                  /* "go-klipper" or "vanilla-klipper" */
     int autolanmode;
     int logging;
+    int log_max_size;               /* Max log file size in KB (100-5120) */
     int acproxycam_flv_proxy;
 
     /* Internal USB port for camera detection */
@@ -118,6 +119,7 @@ typedef struct {
     char fault_detect_model_set[64];    /* Selected model set directory name */
     int fault_detect_min_free_mem;
     int fault_detect_pace_ms;
+    int heatmap_enabled;                /* Spatial heatmap on fault detection */
     char fd_thresholds_json[2048];      /* Per-set threshold config JSON */
 
     /* Runtime: config file path (not persisted) */

@@ -103,6 +103,7 @@ void config_set_defaults(AppConfig *cfg) {
     strncpy(cfg->mode, "go-klipper", sizeof(cfg->mode) - 1);
     cfg->autolanmode = 1;
     cfg->logging = 0;
+    cfg->log_max_size = 1024;
     cfg->acproxycam_flv_proxy = 0;
 
     /* Internal USB port */
@@ -152,12 +153,13 @@ void config_set_defaults(AppConfig *cfg) {
     cfg->fault_detect_cnn_enabled = 0;
     cfg->fault_detect_proto_enabled = 0;
     cfg->fault_detect_multi_enabled = 0;
-    strncpy(cfg->fault_detect_strategy, "or", sizeof(cfg->fault_detect_strategy) - 1);
+    strncpy(cfg->fault_detect_strategy, "and", sizeof(cfg->fault_detect_strategy) - 1);
     cfg->fault_detect_interval = 5;
     cfg->fault_detect_verify_interval = 2;
     cfg->fault_detect_model_set[0] = '\0';
     cfg->fault_detect_min_free_mem = 20;
-    cfg->fault_detect_pace_ms = 0;
+    cfg->fault_detect_pace_ms = 150;
+    cfg->heatmap_enabled = 0;
     cfg->fd_thresholds_json[0] = '\0';
 }
 
@@ -228,6 +230,7 @@ int config_load(AppConfig *cfg, const char *path) {
     /* Modes */
     cfg->autolanmode = json_get_bool(root, "autolanmode", cfg->autolanmode);
     cfg->logging = json_get_bool(root, "logging", cfg->logging);
+    cfg->log_max_size = clamp_int(json_get_int(root, "log_max_size", cfg->log_max_size), 100, 5120);
     cfg->acproxycam_flv_proxy = json_get_bool(root, "acproxycam_flv_proxy", cfg->acproxycam_flv_proxy);
 
     /* Internal USB port */
@@ -313,6 +316,7 @@ int config_load(AppConfig *cfg, const char *path) {
         json_get_int(root, "fault_detect_min_free_mem", cfg->fault_detect_min_free_mem), 5, 100);
     cfg->fault_detect_pace_ms = clamp_int(
         json_get_int(root, "fault_detect_pace_ms", cfg->fault_detect_pace_ms), 0, 500);
+    cfg->heatmap_enabled = json_get_bool(root, "heatmap_enabled", cfg->heatmap_enabled);
 
     /* Per-set threshold settings */
     const cJSON *fd_th = cJSON_GetObjectItemCaseSensitive(root, "fd_thresholds");
@@ -402,6 +406,7 @@ int config_save(const AppConfig *cfg, const char *path) {
     /* Modes */
     json_set_bool(root, "autolanmode", cfg->autolanmode);
     json_set_bool(root, "logging", cfg->logging);
+    json_set_int(root, "log_max_size", cfg->log_max_size);
     json_set_bool(root, "acproxycam_flv_proxy", cfg->acproxycam_flv_proxy);
 
     /* Internal USB port */
@@ -455,6 +460,7 @@ int config_save(const AppConfig *cfg, const char *path) {
     json_set_str(root, "fault_detect_model_set", cfg->fault_detect_model_set);
     json_set_int(root, "fault_detect_min_free_mem", cfg->fault_detect_min_free_mem);
     json_set_int(root, "fault_detect_pace_ms", cfg->fault_detect_pace_ms);
+    json_set_bool(root, "heatmap_enabled", cfg->heatmap_enabled);
 
     /* Per-set threshold settings */
     if (cfg->fd_thresholds_json[0]) {

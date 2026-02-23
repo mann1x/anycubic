@@ -13,7 +13,9 @@
 
 /* Default output directory for timelapse videos */
 #define TIMELAPSE_OUTPUT_DIR    "/useremain/app/gk/Time-lapse-Video/"
-#define TIMELAPSE_TEMP_DIR      "/tmp/timelapse_frames"
+/* Temp frames on persistent storage — /tmp is tmpfs (RAM), frames
+ * accumulate 50-100+ MB during a print and cause OOM on 256MB systems */
+#define TIMELAPSE_TEMP_DIR      "/useremain/home/rinkhals/.timelapse_frames"
 
 /* FFmpeg configuration
  * Primary: Our bundled static ffmpeg (no dependencies)
@@ -162,5 +164,14 @@ void timelapse_set_custom_mode(int enabled);
  * @return Number of frames captured, 0 if not active
  */
 int timelapse_get_frame_count(void);
+
+/*
+ * Recover orphaned timelapse frames from previous crashed instances.
+ * Scans for temp directories from dead processes, encodes whatever frames
+ * are available into MP4, then cleans up.
+ *
+ * Should be called once at startup before the main loop.
+ */
+void timelapse_recover_orphaned(void);
 
 #endif /* TIMELAPSE_H */
