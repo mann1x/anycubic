@@ -379,6 +379,22 @@ int config_load(AppConfig *cfg, const char *path) {
                          (unsigned long long)old_mask);
             }
         }
+
+        /* Migrate old 4-word mask (14x14 grid) to 7-word (14x28 grid) */
+        int colons = 0;
+        for (const char *p = cfg->fd_setup_mask_hex; *p; p++)
+            if (*p == ':') colons++;
+        if (colons == 3) {
+            fprintf(stderr, "Config: Migrating old 4-word mask to 7-word (14x28 grid)\n");
+            if (cfg->fd_setup_status > FD_SETUP_NONE) {
+                fprintf(stderr, "Config: Grid changed, resetting setup status to NONE\n");
+                cfg->fd_setup_status = FD_SETUP_NONE;
+            }
+            /* Reset to full-grid default */
+            strncpy(cfg->fd_setup_mask_hex,
+                "00000000000000ff:ffffffffffffffff:ffffffffffffffff:ffffffffffffffff:ffffffffffffffff:ffffffffffffffff:ffffffffffffffff",
+                sizeof(cfg->fd_setup_mask_hex) - 1);
+        }
     }
     cfg->fd_bed_size_x = clamp_int(
         json_get_int(root, "fd_bed_size_x", cfg->fd_bed_size_x), 100, 500);

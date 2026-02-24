@@ -228,6 +228,10 @@ static struct {
     float crop_x, crop_y, crop_w, crop_h;
     int crop_valid;
 
+    /* CNN logit EMA for temporal smoothing */
+    float cnn_ema_logits[2];
+    int cnn_ema_init;
+
     /* Initialized flag */
     int initialized;
 } g_fd;
@@ -509,10 +513,9 @@ static int fd_model_get_output(fd_rknn_model_t *m, int out_idx,
     return n;
 }
 
-/* Get spatial model output with NC1HWC2 → NHWC conversion.
- * RKNN native output uses NC1HWC2 blocked format: [N, ceil(C/16), H, W, 16].
- * Prototypes are calibrated from Python NHWC output, so we must reorder.
- * out_buf must hold H*W*C floats in NHWC order: [h][w][c]. */
+/* Get spatial model output as NHWC float.
+ * Output queried with RKNN_QUERY_NATIVE_NHWC_OUTPUT_ATTR is already in NHWC
+ * layout — just dequantize linearly. out_buf: H*W*C floats, [h][w][c]. */
 static int fd_model_get_output_nhwc(fd_rknn_model_t *m, int out_idx,
                                      float *out_buf, int H, int W, int C)
 {
@@ -523,19 +526,11 @@ static int fd_model_get_output_nhwc(fd_rknn_model_t *m, int out_idx,
     const int8_t *raw = (const int8_t *)m->output_mems[out_idx]->virt_addr;
     int32_t zp = attr->zp;
     float scale = attr->scale;
-    int C1 = (C + 15) / 16;  /* channel blocks */
     int total = H * W * C;
 
-    for (int h = 0; h < H; h++) {
-        for (int w = 0; w < W; w++) {
-            for (int c = 0; c < C; c++) {
-                /* NC1HWC2 source index: [0, c/16, h, w, c%16] */
-                int src = (c / 16) * H * W * 16 + h * W * 16 + w * 16 + (c % 16);
-                int dst = (h * W + w) * C + c;  /* NHWC */
-                out_buf[dst] = ((float)raw[src] - zp) * scale;
-            }
-        }
-    }
+    /* NHWC output: data is already in [H, W, C] order, just dequantize */
+    for (int i = 0; i < total; i++)
+        out_buf[i] = ((float)raw[i] - zp) * scale;
 
     return total;
 }
@@ -1017,6 +1012,26 @@ static int fd_run_cnn(const uint8_t *input, fd_result_t *r, float threshold,
 
     fd_model_release(&model);
 
+    /* EMA smoothing on logits to reduce camera noise sensitivity.
+     * The model amplifies tiny pixel-level noise into large logit swings
+     * (~30% softmax spread on near-identical frames). Alpha=0.3 gives
+     * ~3x noise reduction with ~15s effective time constant at 5s interval. */
+    {
+        const float alpha = 0.3f;
+        if (!g_fd.cnn_ema_init) {
+            g_fd.cnn_ema_logits[0] = logits[0];
+            g_fd.cnn_ema_logits[1] = logits[1];
+            g_fd.cnn_ema_init = 1;
+        } else {
+            g_fd.cnn_ema_logits[0] = alpha * logits[0] +
+                                      (1.0f - alpha) * g_fd.cnn_ema_logits[0];
+            g_fd.cnn_ema_logits[1] = alpha * logits[1] +
+                                      (1.0f - alpha) * g_fd.cnn_ema_logits[1];
+        }
+        logits[0] = g_fd.cnn_ema_logits[0];
+        logits[1] = g_fd.cnn_ema_logits[1];
+    }
+
     fd_softmax(logits, 2);
 
     int cnn_class = logits[0] > threshold ? FD_CLASS_FAULT : FD_CLASS_OK;
@@ -1184,10 +1199,12 @@ static float fd_compute_heatmap(const float *features, int sp_h, int sp_w,
 }
 
 /* Run a single spatial encoder and read output features into spatial_buf.
+ * Output is converted from RKNN NC1HWC2 format to NHWC for correct per-cell
+ * channel ordering (required for heatmap cosine similarity computation).
  * Returns 0=ok, -1=error, timing stored in *ms_out. */
 static int fd_run_spatial_encoder(const char *model_path, const uint8_t *input,
-                                   float *spatial_buf, int sp_total,
-                                   float *ms_out)
+                                   float *spatial_buf, int sp_h, int sp_w,
+                                   int emb_dim, float *ms_out)
 {
     fd_rknn_model_t model;
     int init_ret = fd_model_init_retry(&model, model_path);
@@ -1202,7 +1219,9 @@ static int fd_run_spatial_encoder(const char *model_path, const uint8_t *input,
         return -1;
     }
 
-    int n = fd_model_get_output(&model, 0, spatial_buf, sp_total);
+    int sp_total = sp_h * sp_w * emb_dim;
+    int n = fd_model_get_output_nhwc(&model, 0, spatial_buf,
+                                      sp_h, sp_w, emb_dim);
     double t1 = fd_get_time_ms();
     fd_model_release(&model);
 
@@ -1212,6 +1231,7 @@ static int fd_run_spatial_encoder(const char *model_path, const uint8_t *input,
         fd_err("Spatial output too short: %d vs %d\n", n, sp_total);
         return -1;
     }
+
     return 0;
 }
 
@@ -1275,7 +1295,7 @@ static int fd_run_heatmap(const uint8_t *input, fd_result_t *r,
          * then compact to flat array for upscaling (stride=cw). */
         float coarse_ms = 0;
         int rc = fd_run_spatial_encoder(coarse_path, input, spatial_buf,
-                                         ch * cw * c_emb, &coarse_ms);
+                                         ch, cw, c_emb, &coarse_ms);
         if (rc < 0) return rc;
 
         float coarse_hm[FD_SPATIAL_H_MAX][FD_SPATIAL_W_MAX] = {{0}};
@@ -1292,7 +1312,7 @@ static int fd_run_heatmap(const uint8_t *input, fd_result_t *r,
         /* Step 2: Run fine encoder → compute fine heatmap */
         float fine_ms = 0;
         rc = fd_run_spatial_encoder(fine_path, input, spatial_buf,
-                                     fh * fw * f_emb, &fine_ms);
+                                     fh, fw, f_emb, &fine_ms);
         if (rc < 0) return rc;
 
         float fine_hm[FD_SPATIAL_H_MAX][FD_SPATIAL_W_MAX] = {{0}};
@@ -1396,7 +1416,7 @@ static int fd_run_heatmap(const uint8_t *input, fd_result_t *r,
 
     float enc_ms = 0;
     int rc = fd_run_spatial_encoder(model_path, input, spatial_buf,
-                                     sp_h * sp_w * emb_dim, &enc_ms);
+                                     sp_h, sp_w, emb_dim, &enc_ms);
     if (rc < 0) return rc;
 
     fd_compute_heatmap(spatial_buf, sp_h, sp_w, emb_dim, protos, proto_norms,
@@ -2215,9 +2235,10 @@ void fault_detect_set_config(const fd_config_t *config)
     g_fd.config = *config;
     pthread_mutex_unlock(&g_fd.config_mutex);
 
-    /* Invalidate prototypes cache when model changes */
+    /* Invalidate prototypes cache and EMA state when model changes */
     g_fd.prototypes_loaded = 0;
     g_fd.spatial_protos_loaded = 0;
+    g_fd.cnn_ema_init = 0;
 }
 
 void fault_detect_set_current_z(float z_mm)
@@ -2439,9 +2460,11 @@ void fault_detect_get_spatial_dims(int *h, int *w)
         if (h) *h = g_fd.spatial_h;
         if (w) *w = g_fd.spatial_w;
     } else {
-        /* Default to 7x7 if spatial prototypes not loaded */
-        if (h) *h = 7;
-        if (w) *w = 7;
+        /* Default to max grid size so masks cover all cells even before
+         * models load.  Old default of 7x7 caused a 49-bit mask that
+         * excluded rows 2-13 of the 14x28 grid. */
+        if (h) *h = FD_SPATIAL_H_MAX;
+        if (w) *w = FD_SPATIAL_W_MAX;
     }
 }
 

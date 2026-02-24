@@ -1,24 +1,44 @@
 {
     "name": "Edge FDM Models KS1",
-    "description": "BigEdge FDM fault detection models calibrated for Kobra S1 (color input, Feb 2026)",
-    "input": "448x224 RGB color, ImageNet normalization",
+    "description": "BigEdge FDM fault detection models for Kobra S1 (448x224 RGB color, ImageNet normalization, Feb 2026)",
+    "input": "448x224 RGB color (TJPF_RGB), ImageNet mean/std baked into RKNN config",
+    "calibration": "RGB (matching on-device TJPF_RGB input)",
     "models": {
         "cnn": {
             "display_name": "MobileNetV2 Color LS 0.05",
-            "file": "model.rknn"
+            "onnx": "model.onnx",
+            "rknn": "model.rknn",
+            "source": "candidate_models/results/mobilenetv2-448x224-color/"
         },
         "protonet": {
             "display_name": "ProtoNet Color SupCon Temp 0.05",
-            "file": "encoder.rknn",
+            "onnx": "encoder.onnx",
+            "rknn": "encoder.rknn",
             "prototypes": "prototypes.bin",
-            "spatial": "spatial_encoder.rknn",
-            "spatial_prototypes": "spatial_prototypes.bin",
-            "spatial_coarse": "spatial_encoder_coarse.rknn",
-            "spatial_coarse_prototypes": "spatial_prototypes_coarse.bin"
+            "spatial_fine": {
+                "onnx": "spatial_encoder.onnx",
+                "rknn": "spatial_encoder.rknn",
+                "prototypes": "spatial_prototypes.bin",
+                "grid": "14x28",
+                "channels": 232,
+                "source": "protonet/weights/spatial-color/fine/"
+            },
+            "spatial_coarse": {
+                "onnx": "spatial_encoder_coarse.onnx",
+                "rknn": "spatial_encoder_coarse.rknn",
+                "prototypes": "spatial_prototypes_coarse.bin",
+                "grid": "7x14",
+                "channels": 1024,
+                "source": "protonet/weights/spatial-color/coarse/"
+            },
+            "source": "protonet/weights/supcon-448x224-color/"
         },
         "multiclass": {
             "display_name": "Multiclass Color SupCon 7-class",
-            "file": "multiclass.rknn"
+            "onnx": "multiclass.onnx",
+            "rknn": "multiclass.rknn",
+            "classes": ["Cracking", "Layer_shifting", "Spaghetti", "Stringing", "Success", "Under_Extrusion", "Warping"],
+            "source": "multiclass_cnn/scripts/results/mc-448x224-color/"
         }
     },
     "profiles": {

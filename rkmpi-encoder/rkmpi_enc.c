@@ -1951,7 +1951,14 @@ static void on_config_changed(AppConfig *cfg) {
         fd_cfg.heatmap_enabled = cfg->heatmap_enabled;
         fd_cfg.beep_pattern = cfg->fd_beep_pattern;
         fd_cfg.setup_mode = 0;  /* only set via API, not from config */
-        fd_mask_from_hex(cfg->fd_setup_mask_hex, &fd_cfg.heatmap_mask);
+        /* Only apply saved mask when setup is complete; otherwise full grid */
+        if (cfg->fd_setup_status == FD_SETUP_OK) {
+            fd_mask_from_hex(cfg->fd_setup_mask_hex, &fd_cfg.heatmap_mask);
+        } else {
+            int gh, gw;
+            fault_detect_get_spatial_dims(&gh, &gw);
+            fd_cfg.heatmap_mask = fd_mask_all_ones(gh * gw);
+        }
         apply_fd_thresholds(&fd_cfg, cfg);
         apply_fd_file_overrides(&fd_cfg);
         fault_detect_set_config(&fd_cfg);
@@ -2307,7 +2314,14 @@ int main(int argc, char *argv[]) {
             fd_cfg.heatmap_enabled = app_config.heatmap_enabled;
             fd_cfg.beep_pattern = app_config.fd_beep_pattern;
             fd_cfg.setup_mode = 0;  /* only set via API, not from config */
-            fd_mask_from_hex(app_config.fd_setup_mask_hex, &fd_cfg.heatmap_mask);
+            /* Only apply saved mask when setup is complete; otherwise full grid */
+            if (app_config.fd_setup_status == FD_SETUP_OK) {
+                fd_mask_from_hex(app_config.fd_setup_mask_hex, &fd_cfg.heatmap_mask);
+            } else {
+                int gh, gw;
+                fault_detect_get_spatial_dims(&gh, &gw);
+                fd_cfg.heatmap_mask = fd_mask_all_ones(gh * gw);
+            }
             apply_fd_thresholds(&fd_cfg, &app_config);
             apply_fd_file_overrides(&fd_cfg);
             fault_detect_set_config(&fd_cfg);

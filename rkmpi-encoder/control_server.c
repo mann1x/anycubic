@@ -1494,10 +1494,8 @@ static void handle_setup_post(ControlServer *srv, int fd,
                        sizeof(cfg->fd_setup_mask_hex));
         cfg->fd_setup_status = FD_SETUP_INPROGRESS;
 
-        /* Propagate mask to FD config */
-        fd_config_t fd_cfg = fault_detect_get_config();
-        fd_cfg.heatmap_mask = computed_mask;
-        fault_detect_set_config(&fd_cfg);
+        /* Mask stored in config for setup page display, but NOT applied to
+         * live fault detection until setup is completed */
 
         config_save(cfg, cfg->config_file);
 
@@ -1618,10 +1616,37 @@ static void handle_setup_post(ControlServer *srv, int fd,
         cfg->fd_setup_status = FD_SETUP_OK;
         cfg->fd_setup_timestamp = (int64_t)time(NULL);
 
-        /* Disable setup mode */
+        /* Disable setup mode and apply the computed mask to live FD */
         fd_config_t fd_cfg = fault_detect_get_config();
         fd_cfg.setup_mode = 0;
+        fd_mask_from_hex(cfg->fd_setup_mask_hex, &fd_cfg.heatmap_mask);
         fault_detect_set_config(&fd_cfg);
+
+        /* Apply Z-masks if any were collected during setup */
+        if (cfg->fd_z_masks_json[0]) {
+            cJSON *zm_arr = cJSON_Parse(cfg->fd_z_masks_json);
+            if (zm_arr && cJSON_IsArray(zm_arr)) {
+                int n = cJSON_GetArraySize(zm_arr);
+                if (n > FD_Z_MASK_MAX_ENTRIES) n = FD_Z_MASK_MAX_ENTRIES;
+                fd_z_mask_entry_t entries[FD_Z_MASK_MAX_ENTRIES];
+                int count = 0;
+                for (int i = 0; i < n; i++) {
+                    cJSON *pair = cJSON_GetArrayItem(zm_arr, i);
+                    if (cJSON_IsArray(pair) && cJSON_GetArraySize(pair) >= 2) {
+                        entries[count].z_mm = (float)cJSON_GetArrayItem(pair, 0)->valuedouble;
+                        cJSON *mask_item = cJSON_GetArrayItem(pair, 1);
+                        if (cJSON_IsString(mask_item) && mask_item->valuestring)
+                            fd_mask_from_hex(mask_item->valuestring, &entries[count].mask);
+                        else
+                            entries[count].mask = fd_mask_from_u64((uint64_t)mask_item->valuedouble);
+                        count++;
+                    }
+                }
+                if (count > 0)
+                    fault_detect_set_z_masks(entries, count);
+            }
+            if (zm_arr) cJSON_Delete(zm_arr);
+        }
 
         config_save(cfg, cfg->config_file);
 
@@ -1641,16 +1666,18 @@ static void handle_setup_post(ControlServer *srv, int fd,
         cfg->fd_setup_status = FD_SETUP_NONE;
         cfg->fd_setup_timestamp = 0;
         memset(cfg->fd_setup_corners, 0, sizeof(cfg->fd_setup_corners));
-        /* All 196 bits active */
+        /* All 392 bits active for 14x28 grid */
         strncpy(cfg->fd_setup_mask_hex,
-            "000000000000000f:ffffffffffffffff:ffffffffffffffff:ffffffffffffffff",
+            "00000000000000ff:ffffffffffffffff:ffffffffffffffff:ffffffffffffffff:ffffffffffffffff:ffffffffffffffff:ffffffffffffffff",
             sizeof(cfg->fd_setup_mask_hex) - 1);
         cfg->fd_setup_results_json[0] = '\0';
         cfg->fd_z_masks_json[0] = '\0';
 
-        /* Propagate to FD config */
+        /* Clear active mask to full grid (setup not complete → no filtering) */
         fd_config_t fd_cfg = fault_detect_get_config();
-        fd_mask_from_hex(cfg->fd_setup_mask_hex, &fd_cfg.heatmap_mask);
+        int gh, gw;
+        fault_detect_get_spatial_dims(&gh, &gw);
+        fd_cfg.heatmap_mask = fd_mask_all_ones(gh * gw);
         fd_cfg.setup_mode = 0;
         fault_detect_set_config(&fd_cfg);
         fault_detect_set_z_masks(NULL, 0);
