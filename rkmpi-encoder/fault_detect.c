@@ -27,11 +27,104 @@
 #include <dirent.h>
 #include <sys/time.h>
 #include <sys/stat.h>
+#include <fcntl.h>
 #include <errno.h>
 
 /* Logging macros (match rkmpi_enc.c style) */
 #define fd_log(fmt, ...) fprintf(stderr, "[FD] " fmt, ##__VA_ARGS__)
 #define fd_err(fmt, ...) fprintf(stderr, "[FD] ERROR: " fmt, ##__VA_ARGS__)
+
+/* Forward declarations (defined in Helpers section) */
+static double fd_get_time_ms(void);
+static fd_mask196_t fd_get_mask_for_z(const fd_config_t *cfg, float z);
+
+/* ============================================================================
+ * Buzzer (PWM piezo)
+ * ============================================================================ */
+
+#define FD_BUZZER_PWM_DIR   "/sys/class/pwm/pwmchip0/pwm0"
+#define FD_BUZZER_PWM_PATH  FD_BUZZER_PWM_DIR "/enable"
+#define FD_BEEP_COOLDOWN_MS 15000
+
+/* PWM tone: ~4kHz, 50% duty cycle */
+#define FD_BUZZER_PERIOD    "250000"
+#define FD_BUZZER_DUTY      "125000"
+
+static int g_buzzer_fd = -1;
+static uint64_t g_last_beep_time = 0;
+
+static void fd_write_sysfs(const char *path, const char *val)
+{
+    int fd = open(path, O_WRONLY);
+    if (fd >= 0) {
+        write(fd, val, strlen(val));
+        close(fd);
+    }
+}
+
+static void fd_buzzer_init(void)
+{
+    /* Configure PWM tone before opening enable file */
+    fd_write_sysfs(FD_BUZZER_PWM_DIR "/period", FD_BUZZER_PERIOD);
+    fd_write_sysfs(FD_BUZZER_PWM_DIR "/duty_cycle", FD_BUZZER_DUTY);
+
+    g_buzzer_fd = open(FD_BUZZER_PWM_PATH, O_WRONLY);
+    if (g_buzzer_fd < 0)
+        fd_log("Buzzer: cannot open %s: %s\n", FD_BUZZER_PWM_PATH, strerror(errno));
+    else
+        fd_log("Buzzer: ready (period=%s duty=%s)\n", FD_BUZZER_PERIOD, FD_BUZZER_DUTY);
+}
+
+static void fd_buzzer_cleanup(void)
+{
+    if (g_buzzer_fd >= 0) {
+        close(g_buzzer_fd);
+        g_buzzer_fd = -1;
+    }
+}
+
+static void fd_buzz(int ms)
+{
+    if (g_buzzer_fd < 0) return;
+    lseek(g_buzzer_fd, 0, SEEK_SET);
+    write(g_buzzer_fd, "1", 1);
+    usleep(ms * 1000);
+    lseek(g_buzzer_fd, 0, SEEK_SET);
+    write(g_buzzer_fd, "0", 1);
+}
+
+static void fd_play_pattern(int pattern)
+{
+    if (pattern <= 0 || g_buzzer_fd < 0) return;
+
+    /* Cooldown check */
+    uint64_t now_ms = (uint64_t)(fd_get_time_ms());
+    if (g_last_beep_time > 0 && (now_ms - g_last_beep_time) < FD_BEEP_COOLDOWN_MS)
+        return;
+    g_last_beep_time = now_ms;
+
+    switch (pattern) {
+    case 1: /* Short */
+        fd_buzz(200);
+        break;
+    case 2: /* 2 Short */
+        fd_buzz(200); usleep(150000); fd_buzz(200);
+        break;
+    case 3: /* 3 Short */
+        fd_buzz(200); usleep(150000); fd_buzz(200); usleep(150000); fd_buzz(200);
+        break;
+    case 4: /* 2 Short + Long */
+        fd_buzz(200); usleep(150000); fd_buzz(200); usleep(150000); fd_buzz(600);
+        break;
+    case 5: /* SOS: ···−−−··· */
+        for (int i = 0; i < 3; i++) { fd_buzz(100); usleep(100000); }
+        usleep(200000);
+        for (int i = 0; i < 3; i++) { fd_buzz(300); usleep(100000); }
+        usleep(200000);
+        for (int i = 0; i < 3; i++) { fd_buzz(100); usleep(100000); }
+        break;
+    }
+}
 
 /* ============================================================================
  * RKNN dlopen function pointers
@@ -110,10 +203,30 @@ static struct {
     /* Model directory */
     char models_base_dir[256];
 
-    /* ProtoNet prototypes */
+    /* ProtoNet prototypes (classification — 1024-dim) */
     float prototypes[2][EMB_DIM];
     float proto_norms[2];
     int prototypes_loaded;
+
+    /* Spatial prototypes (separate — variable dim from header) */
+    float spatial_protos[2][FD_SPATIAL_EMB_MAX];
+    float spatial_proto_norms[2];
+    int spatial_protos_loaded;
+    int spatial_h, spatial_w, spatial_emb_dim, spatial_total;
+
+    /* Coarse spatial prototypes (for multi-scale fusion) */
+    float spatial_coarse_protos[2][FD_SPATIAL_EMB_MAX];
+    float spatial_coarse_proto_norms[2];
+    int spatial_coarse_loaded;
+    int spatial_coarse_h, spatial_coarse_w, spatial_coarse_emb_dim, spatial_coarse_total;
+
+    /* Z-dependent mask */
+    float current_z;
+    pthread_mutex_t z_mutex;
+
+    /* Center-crop region (computed from decoded image dimensions) */
+    float crop_x, crop_y, crop_w, crop_h;
+    int crop_valid;
 
     /* Initialized flag */
     int initialized;
@@ -388,11 +501,43 @@ static int fd_model_get_output(fd_rknn_model_t *m, int out_idx,
     int n = (int)attr->n_elems;
     if (n > max_elems) n = max_elems;
 
-    /* NC1HWC2 dequantization — linear read works for H=W=1 */
+    /* Linear dequantization — works for H=W=1 models (CNN, ProtoNet, Multiclass)
+     * where NC1HWC2 layout is equivalent to flat channel order. */
     for (int i = 0; i < n; i++)
         out_buf[i] = ((float)raw[i] - zp) * scale;
 
     return n;
+}
+
+/* Get spatial model output with NC1HWC2 → NHWC conversion.
+ * RKNN native output uses NC1HWC2 blocked format: [N, ceil(C/16), H, W, 16].
+ * Prototypes are calibrated from Python NHWC output, so we must reorder.
+ * out_buf must hold H*W*C floats in NHWC order: [h][w][c]. */
+static int fd_model_get_output_nhwc(fd_rknn_model_t *m, int out_idx,
+                                     float *out_buf, int H, int W, int C)
+{
+    if (out_idx < 0 || (uint32_t)out_idx >= m->io_num.n_output)
+        return -1;
+
+    rknn_tensor_attr *attr = &m->output_attrs[out_idx];
+    const int8_t *raw = (const int8_t *)m->output_mems[out_idx]->virt_addr;
+    int32_t zp = attr->zp;
+    float scale = attr->scale;
+    int C1 = (C + 15) / 16;  /* channel blocks */
+    int total = H * W * C;
+
+    for (int h = 0; h < H; h++) {
+        for (int w = 0; w < W; w++) {
+            for (int c = 0; c < C; c++) {
+                /* NC1HWC2 source index: [0, c/16, h, w, c%16] */
+                int src = (c / 16) * H * W * 16 + h * W * 16 + w * 16 + (c % 16);
+                int dst = (h * W + w) * C + c;  /* NHWC */
+                out_buf[dst] = ((float)raw[src] - zp) * scale;
+            }
+        }
+    }
+
+    return total;
 }
 
 static void fd_model_release(fd_rknn_model_t *m)
@@ -437,7 +582,10 @@ static int fd_decode_jpeg(const uint8_t *jpeg_data, size_t jpeg_size,
         return -1;
     }
 
-    /* Find smallest TurboJPEG scaling factor where shortest side >= 256 */
+    /* Find smallest TurboJPEG scaling factor where the decoded image is
+     * large enough for fd_resize_crop to downscale (not upscale).
+     * Need: resize scale = max(256/sh, 512/sw) <= 1.0
+     * i.e., sw >= 512 AND sh >= 256 */
     int num_sf = 0;
     tjscalingfactor *sf = tjGetScalingFactors(&num_sf);
     tjscalingfactor best_sf = {1, 1};  /* default: no scaling */
@@ -445,10 +593,9 @@ static int fd_decode_jpeg(const uint8_t *jpeg_data, size_t jpeg_size,
         for (int i = 0; i < num_sf; i++) {
             int sw = TJSCALED(width, sf[i]);
             int sh = TJSCALED(height, sf[i]);
-            int shortest = sw < sh ? sw : sh;
             int best_w = TJSCALED(width, best_sf);
             int best_h = TJSCALED(height, best_sf);
-            if (shortest >= 256 && sw * sh < best_w * best_h) {
+            if (sw >= 512 && sh >= 256 && sw * sh < best_w * best_h) {
                 best_sf = sf[i];
             }
         }
@@ -477,15 +624,17 @@ static int fd_decode_jpeg(const uint8_t *jpeg_data, size_t jpeg_size,
     return 0;
 }
 
-/* Fused resize + center crop + grayscale in single pass (no intermediate buffer).
- * Resizes shortest side to 256, center-crops 224×224, converts to BT.601
- * grayscale replicated to 3 channels. Bilinear interpolation. */
-static void fd_resize_crop_gray(const uint8_t *src, int sw, int sh,
-                                 uint8_t *dst)
+/* Fused resize + center crop in single pass (no intermediate buffer).
+ * Resizes so result >= 512x256, center-crops 448x224, keeps RGB color.
+ * Bilinear interpolation. */
+static void fd_resize_crop(const uint8_t *src, int sw, int sh,
+                            uint8_t *dst)
 {
-    const int dw = FD_MODEL_INPUT_SIZE;
-    const int dh = FD_MODEL_INPUT_SIZE;
-    float scale = 256.0f / (sw < sh ? sw : sh);
+    const int dw = FD_MODEL_INPUT_WIDTH;
+    const int dh = FD_MODEL_INPUT_HEIGHT;
+    float scale_h = 256.0f / (float)sh;
+    float scale_w = 512.0f / (float)sw;
+    float scale = scale_h > scale_w ? scale_h : scale_w;
     int rw = (int)(sw * scale);
     int rh = (int)(sh * scale);
     int cx = (rw - dw) / 2;
@@ -525,24 +674,23 @@ static void fd_resize_crop_gray(const uint8_t *src, int sw, int sh,
             float w01 = (1.0f - x_diff) * y_diff;
             float w11 = x_diff * y_diff;
 
-            /* Bilinear interpolate each channel, then BT.601 grayscale */
-            float r = a[0]*w00 + b[0]*w10 + c[0]*w01 + d[0]*w11;
-            float g = a[1]*w00 + b[1]*w10 + c[1]*w01 + d[1]*w11;
-            float bl = a[2]*w00 + b[2]*w10 + c[2]*w01 + d[2]*w11;
-            int gray = (int)((306*r + 601*g + 117*bl) / 1024.0f + 0.5f);
-            if (gray < 0) gray = 0;
-            if (gray > 255) gray = 255;
-            uint8_t g8 = (uint8_t)gray;
+            /* Bilinear interpolate each channel, keep RGB color */
             int off = (dy * dw + dx) * 3;
-            dst[off] = dst[off + 1] = dst[off + 2] = g8;
+            for (int ch = 0; ch < 3; ch++) {
+                float v = a[ch]*w00 + b[ch]*w10 + c[ch]*w01 + d[ch]*w11;
+                int iv = (int)(v + 0.5f);
+                if (iv < 0) iv = 0;
+                if (iv > 255) iv = 255;
+                dst[off + ch] = (uint8_t)iv;
+            }
         }
     }
 }
 
-/* Preprocess: scaled-decode image → fused resize+crop+grayscale */
+/* Preprocess: scaled-decode image → fused resize+crop (color RGB) */
 static int fd_preprocess(const fd_image_t *img, uint8_t *out_buf)
 {
-    fd_resize_crop_gray(img->data, img->width, img->height, out_buf);
+    fd_resize_crop(img->data, img->width, img->height, out_buf);
     return 0;
 }
 
@@ -577,6 +725,171 @@ static int fd_load_prototypes(const char *path)
     return 0;
 }
 
+/* Load spatial prototypes with header: [h][w][emb_dim][n_classes] + float data */
+static int fd_load_spatial_prototypes(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        fd_log("Spatial prototypes not found: %s (will use classification protos)\n", path);
+        return -1;
+    }
+
+    /* Read header: 4 x uint32_t */
+    uint32_t header[4];
+    if (fread(header, sizeof(uint32_t), 4, f) != 4) {
+        fd_err("spatial prototypes header too short: %s\n", path);
+        fclose(f);
+        return -1;
+    }
+
+    int sp_h = (int)header[0];
+    int sp_w = (int)header[1];
+    int emb_dim = (int)header[2];
+    int n_classes = (int)header[3];
+
+    if (sp_h < 1 || sp_h > FD_SPATIAL_H_MAX || sp_w < 1 || sp_w > FD_SPATIAL_W_MAX) {
+        fd_err("spatial prototypes: invalid grid %dx%d (max %dx%d)\n",
+               sp_h, sp_w, FD_SPATIAL_H_MAX, FD_SPATIAL_W_MAX);
+        fclose(f);
+        return -1;
+    }
+    if (emb_dim < 1 || emb_dim > FD_SPATIAL_EMB_MAX) {
+        fd_err("spatial prototypes: invalid emb_dim %d (max %d)\n",
+               emb_dim, FD_SPATIAL_EMB_MAX);
+        fclose(f);
+        return -1;
+    }
+    if (n_classes != 2) {
+        fd_err("spatial prototypes: expected 2 classes, got %d\n", n_classes);
+        fclose(f);
+        return -1;
+    }
+
+    /* Read prototype vectors — must read each class separately since the
+     * array stride is FD_SPATIAL_EMB_MAX (1024) while actual dim may be less */
+    memset(g_fd.spatial_protos, 0, sizeof(g_fd.spatial_protos));
+    for (int k = 0; k < 2; k++) {
+        if (fread(g_fd.spatial_protos[k], sizeof(float), emb_dim, f)
+            != (size_t)emb_dim) {
+            fd_err("spatial prototypes data too short for class %d\n", k);
+            fclose(f);
+            return -1;
+        }
+    }
+    fclose(f);
+
+    /* Compute norms */
+    for (int k = 0; k < 2; k++) {
+        float sum = 0.0f;
+        for (int i = 0; i < emb_dim; i++)
+            sum += g_fd.spatial_protos[k][i] * g_fd.spatial_protos[k][i];
+        g_fd.spatial_proto_norms[k] = sqrtf(sum);
+    }
+
+    g_fd.spatial_h = sp_h;
+    g_fd.spatial_w = sp_w;
+    g_fd.spatial_emb_dim = emb_dim;
+    g_fd.spatial_total = sp_h * sp_w * emb_dim;
+    g_fd.spatial_protos_loaded = 1;
+
+    fd_log("Spatial prototypes loaded: %dx%d grid, %d-dim embeddings, "
+           "norms=[%.4f, %.4f], first5_fail=[%.4f,%.4f,%.4f,%.4f,%.4f], "
+           "first5_succ=[%.4f,%.4f,%.4f,%.4f,%.4f]\n",
+           sp_h, sp_w, emb_dim,
+           g_fd.spatial_proto_norms[0], g_fd.spatial_proto_norms[1],
+           g_fd.spatial_protos[0][0], g_fd.spatial_protos[0][1],
+           g_fd.spatial_protos[0][2], g_fd.spatial_protos[0][3],
+           g_fd.spatial_protos[0][4],
+           g_fd.spatial_protos[1][0], g_fd.spatial_protos[1][1],
+           g_fd.spatial_protos[1][2], g_fd.spatial_protos[1][3],
+           g_fd.spatial_protos[1][4]);
+    return 0;
+}
+
+/* Load coarse spatial prototypes (for multi-scale fusion) */
+static int fd_load_spatial_prototypes_coarse(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        fd_log("Coarse spatial prototypes not found: %s\n", path);
+        return -1;
+    }
+
+    uint32_t header[4];
+    if (fread(header, sizeof(uint32_t), 4, f) != 4) {
+        fd_err("coarse spatial prototypes header too short: %s\n", path);
+        fclose(f);
+        return -1;
+    }
+
+    int sp_h = (int)header[0];
+    int sp_w = (int)header[1];
+    int emb_dim = (int)header[2];
+    int n_classes = (int)header[3];
+
+    if (sp_h < 1 || sp_h > FD_SPATIAL_H_MAX || sp_w < 1 || sp_w > FD_SPATIAL_W_MAX ||
+        emb_dim < 1 || emb_dim > FD_SPATIAL_EMB_MAX || n_classes != 2) {
+        fd_err("coarse spatial prototypes: invalid header %dx%dx%d classes=%d\n",
+               sp_h, sp_w, emb_dim, n_classes);
+        fclose(f);
+        return -1;
+    }
+
+    memset(g_fd.spatial_coarse_protos, 0, sizeof(g_fd.spatial_coarse_protos));
+    for (int k = 0; k < 2; k++) {
+        if (fread(g_fd.spatial_coarse_protos[k], sizeof(float), emb_dim, f)
+            != (size_t)emb_dim) {
+            fd_err("coarse spatial prototypes data too short for class %d\n", k);
+            fclose(f);
+            return -1;
+        }
+    }
+    fclose(f);
+
+    for (int k = 0; k < 2; k++) {
+        float sum = 0.0f;
+        for (int i = 0; i < emb_dim; i++)
+            sum += g_fd.spatial_coarse_protos[k][i] * g_fd.spatial_coarse_protos[k][i];
+        g_fd.spatial_coarse_proto_norms[k] = sqrtf(sum);
+    }
+
+    g_fd.spatial_coarse_h = sp_h;
+    g_fd.spatial_coarse_w = sp_w;
+    g_fd.spatial_coarse_emb_dim = emb_dim;
+    g_fd.spatial_coarse_total = sp_h * sp_w * emb_dim;
+    g_fd.spatial_coarse_loaded = 1;
+
+    fd_log("Coarse spatial prototypes loaded: %dx%d grid, %d-dim, norms=[%.4f, %.4f]\n",
+           sp_h, sp_w, emb_dim,
+           g_fd.spatial_coarse_proto_norms[0], g_fd.spatial_coarse_proto_norms[1]);
+    return 0;
+}
+
+/* Bilinear upscale heatmap from src_h x src_w to dst_h x dst_w */
+static void fd_bilinear_upscale(const float *src, int src_h, int src_w,
+                                 float *dst, int dst_h, int dst_w)
+{
+    for (int r = 0; r < dst_h; r++) {
+        float sy = (r + 0.5f) * src_h / (float)dst_h - 0.5f;
+        int y0 = (int)floorf(sy);
+        float fy = sy - y0;
+        if (y0 < 0) { y0 = 0; fy = 0.0f; }
+        if (y0 >= src_h - 1) { y0 = src_h - 2; fy = 1.0f; }
+        for (int c = 0; c < dst_w; c++) {
+            float sx = (c + 0.5f) * src_w / (float)dst_w - 0.5f;
+            int x0 = (int)floorf(sx);
+            float fx = sx - x0;
+            if (x0 < 0) { x0 = 0; fx = 0.0f; }
+            if (x0 >= src_w - 1) { x0 = src_w - 2; fx = 1.0f; }
+            float v = src[y0 * src_w + x0] * (1 - fy) * (1 - fx)
+                    + src[y0 * src_w + (x0 + 1)] * (1 - fy) * fx
+                    + src[(y0 + 1) * src_w + x0] * fy * (1 - fx)
+                    + src[(y0 + 1) * src_w + (x0 + 1)] * fy * fx;
+            dst[r * dst_w + c] = v;
+        }
+    }
+}
+
 /* ============================================================================
  * Model path resolution
  * ============================================================================ */
@@ -605,6 +918,10 @@ static int fd_resolve_model_path(fd_model_class_t cls, const char *set_name,
     case FD_MODEL_SPATIAL:
         class_dir = "protonet";
         filename = "spatial_encoder.rknn";
+        break;
+    case FD_MODEL_SPATIAL_COARSE:
+        class_dir = "protonet";
+        filename = "spatial_encoder_coarse.rknn";
         break;
     default:
         return -1;
@@ -763,7 +1080,7 @@ static int fd_run_protonet(const uint8_t *input, fd_result_t *r,
     float cos_margin = cos_fail - cos_succ;
 
     r->result = cos_margin > proto_threshold ? FD_CLASS_FAULT : FD_CLASS_OK;
-    r->confidence = fabsf(cos_margin);
+    r->confidence = cos_margin;  /* signed margin for threshold-relative confidence */
 
     fd_log("  Proto: margin=%.3f th=%.2f -> %s (%.0fms)\n",
            cos_margin, proto_threshold,
@@ -829,20 +1146,109 @@ static int fd_run_multiclass(const uint8_t *input, fd_result_t *r,
  * Spatial heatmap inference
  * ============================================================================ */
 
-/* Run spatial encoder and compute per-location cosine similarity heatmap.
- * Requires prototypes to be loaded (run ProtoNet first).
- * spatial_buf must be pre-allocated (FD_SPATIAL_TOTAL floats).
- * Returns 0=ok, -1=error, -2=CMA failure */
-static int fd_run_heatmap(const uint8_t *input, fd_result_t *r,
-                          const fd_config_t *cfg, float *spatial_buf)
+/* Compute per-location heatmap from features and prototypes.
+ * Returns max margin value. Fills heatmap array. */
+static float fd_compute_heatmap(const float *features, int sp_h, int sp_w,
+                                 int emb_dim,
+                                 const float protos[][FD_SPATIAL_EMB_MAX],
+                                 const float *proto_norms,
+                                 float heatmap[][FD_SPATIAL_W_MAX])
+{
+    int use_dot_product = (proto_norms[0] < 1.1f && proto_norms[1] < 1.1f);
+    float max_margin = -999.0f;
+
+    for (int h = 0; h < sp_h; h++) {
+        for (int w = 0; w < sp_w; w++) {
+            const float *vec = &features[(h * sp_w + w) * emb_dim];
+            float margin;
+            if (use_dot_product) {
+                float dot_fail = 0.0f, dot_succ = 0.0f;
+                for (int i = 0; i < emb_dim; i++) {
+                    dot_fail += vec[i] * protos[0][i];
+                    dot_succ += vec[i] * protos[1][i];
+                }
+                margin = dot_fail - dot_succ;
+            } else {
+                float cos_fail = fd_cosine_similarity(vec, protos[0],
+                                                       proto_norms[0], emb_dim);
+                float cos_succ = fd_cosine_similarity(vec, protos[1],
+                                                       proto_norms[1], emb_dim);
+                margin = cos_fail - cos_succ;
+            }
+            heatmap[h][w] = margin;
+            if (margin > max_margin)
+                max_margin = margin;
+        }
+    }
+    return max_margin;
+}
+
+/* Run a single spatial encoder and read output features into spatial_buf.
+ * Returns 0=ok, -1=error, timing stored in *ms_out. */
+static int fd_run_spatial_encoder(const char *model_path, const uint8_t *input,
+                                   float *spatial_buf, int sp_total,
+                                   float *ms_out)
 {
     fd_rknn_model_t model;
-    char path[512];
+    int init_ret = fd_model_init_retry(&model, model_path);
+    if (init_ret < 0)
+        return init_ret;
 
-    if (fd_resolve_model_path(FD_MODEL_SPATIAL, cfg->model_set,
-                               path, sizeof(path), cfg) < 0) {
-        fd_err("Spatial model not found in set: %s\n", cfg->model_set);
+    double t0 = fd_get_time_ms();
+    int ret = fd_model_run(&model, input, FD_MODEL_INPUT_BYTES);
+    if (ret < 0) {
+        fd_err("Spatial run failed: %d (model=%s)\n", ret, model_path);
+        fd_model_release(&model);
         return -1;
+    }
+
+    int n = fd_model_get_output(&model, 0, spatial_buf, sp_total);
+    double t1 = fd_get_time_ms();
+    fd_model_release(&model);
+
+    if (ms_out) *ms_out = (float)(t1 - t0);
+
+    if (n < sp_total) {
+        fd_err("Spatial output too short: %d vs %d\n", n, sp_total);
+        return -1;
+    }
+    return 0;
+}
+
+/* Run spatial encoder and compute per-location heatmap.
+ * Auto-detects multi-scale mode when both coarse + fine encoders exist.
+ * spatial_buf must be pre-allocated (large enough for model output).
+ * Returns 0=ok, -1=error, -2=CMA failure */
+static int fd_run_heatmap(const uint8_t *input, fd_result_t *r,
+                          const fd_config_t *cfg, float *spatial_buf,
+                          fd_mask196_t active_mask)
+{
+    char fine_path[512], coarse_path[512];
+
+    int have_fine = (fd_resolve_model_path(FD_MODEL_SPATIAL, cfg->model_set,
+                                            fine_path, sizeof(fine_path), cfg) == 0);
+    int have_coarse = (fd_resolve_model_path(FD_MODEL_SPATIAL_COARSE, cfg->model_set,
+                                              coarse_path, sizeof(coarse_path), cfg) == 0);
+
+    if (!have_fine && !have_coarse) {
+        fd_err("No spatial model found in set: %s\n", cfg->model_set);
+        return -1;
+    }
+
+    /* Load fine spatial prototypes on first call */
+    if (have_fine && !g_fd.spatial_protos_loaded) {
+        char sp_path[512];
+        snprintf(sp_path, sizeof(sp_path), "%s/%s/protonet/spatial_prototypes.bin",
+                 g_fd.models_base_dir, cfg->model_set);
+        fd_load_spatial_prototypes(sp_path);
+    }
+
+    /* Load coarse spatial prototypes on first call */
+    if (have_coarse && !g_fd.spatial_coarse_loaded) {
+        char sp_path[512];
+        snprintf(sp_path, sizeof(sp_path), "%s/%s/protonet/spatial_prototypes_coarse.bin",
+                 g_fd.models_base_dir, cfg->model_set);
+        fd_load_spatial_prototypes_coarse(sp_path);
     }
 
     /* Memory gate */
@@ -853,47 +1259,160 @@ static int fd_run_heatmap(const uint8_t *input, fd_result_t *r,
         return -2;
     }
 
-    int init_ret = fd_model_init_retry(&model, path);
-    if (init_ret < 0)
-        return init_ret;
+    /* Clear entire heatmap array */
+    memset(r->heatmap, 0, sizeof(r->heatmap));
+    double t_total_start = fd_get_time_ms();
 
-    double t0 = fd_get_time_ms();
-    int ret = fd_model_run(&model, input, FD_MODEL_INPUT_BYTES);
-    if (ret < 0) {
-        fd_err("Spatial run failed: %d\n", ret);
-        fd_model_release(&model);
-        return -1;
+    /* ---- Multi-scale mode: coarse + fine → blend ---- */
+    if (have_coarse && g_fd.spatial_coarse_loaded && have_fine && g_fd.spatial_protos_loaded) {
+        int ch = g_fd.spatial_coarse_h, cw = g_fd.spatial_coarse_w;
+        int c_emb = g_fd.spatial_coarse_emb_dim;
+        int fh = g_fd.spatial_h, fw = g_fd.spatial_w;
+        int f_emb = g_fd.spatial_emb_dim;
+
+        /* Step 1: Run coarse encoder → compute coarse heatmap.
+         * Use a temporary 2D array for fd_compute_heatmap (stride=FD_SPATIAL_W_MAX),
+         * then compact to flat array for upscaling (stride=cw). */
+        float coarse_ms = 0;
+        int rc = fd_run_spatial_encoder(coarse_path, input, spatial_buf,
+                                         ch * cw * c_emb, &coarse_ms);
+        if (rc < 0) return rc;
+
+        float coarse_hm[FD_SPATIAL_H_MAX][FD_SPATIAL_W_MAX] = {{0}};
+        fd_compute_heatmap(spatial_buf, ch, cw, c_emb,
+                           (const float (*)[FD_SPATIAL_EMB_MAX])g_fd.spatial_coarse_protos,
+                           g_fd.spatial_coarse_proto_norms, coarse_hm);
+
+        /* Compact coarse heatmap to flat array (stride=cw) for bilinear upscale */
+        float coarse_flat[FD_SPATIAL_H_MAX * FD_SPATIAL_W_MAX];
+        for (int h = 0; h < ch; h++)
+            for (int w = 0; w < cw; w++)
+                coarse_flat[h * cw + w] = coarse_hm[h][w];
+
+        /* Step 2: Run fine encoder → compute fine heatmap */
+        float fine_ms = 0;
+        rc = fd_run_spatial_encoder(fine_path, input, spatial_buf,
+                                     fh * fw * f_emb, &fine_ms);
+        if (rc < 0) return rc;
+
+        float fine_hm[FD_SPATIAL_H_MAX][FD_SPATIAL_W_MAX] = {{0}};
+        fd_compute_heatmap(spatial_buf, fh, fw, f_emb,
+                           (const float (*)[FD_SPATIAL_EMB_MAX])g_fd.spatial_protos,
+                           g_fd.spatial_proto_norms, fine_hm);
+
+        /* Step 3: Upscale coarse to fine resolution */
+        float coarse_up[FD_SPATIAL_H_MAX * FD_SPATIAL_W_MAX];
+        fd_bilinear_upscale(coarse_flat, ch, cw, coarse_up, fh, fw);
+
+        /* Step 4: Normalize fine to match coarse value range */
+        float c_min = 999.0f, c_max = -999.0f;
+        float f_min = 999.0f, f_max = -999.0f;
+        for (int i = 0; i < fh * fw; i++) {
+            if (coarse_up[i] < c_min) c_min = coarse_up[i];
+            if (coarse_up[i] > c_max) c_max = coarse_up[i];
+        }
+        for (int h = 0; h < fh; h++)
+            for (int w = 0; w < fw; w++) {
+                if (fine_hm[h][w] < f_min) f_min = fine_hm[h][w];
+                if (fine_hm[h][w] > f_max) f_max = fine_hm[h][w];
+            }
+        float c_range = c_max - c_min;
+        float f_range = f_max - f_min;
+        float fine_scale = (f_range > 1e-8f) ? c_range / f_range : 0.0f;
+
+        /* Step 5: Blend — 70% coarse + 30% fine (scaled) */
+        float max_margin = -999.0f;
+        int max_h = 0, max_w = 0;
+        int mask_active = !fd_mask_is_zero(&active_mask);
+
+        for (int h = 0; h < fh; h++) {
+            for (int w = 0; w < fw; w++) {
+                float v = 0.7f * coarse_up[h * fw + w]
+                        + 0.3f * fine_hm[h][w] * fine_scale;
+                r->heatmap[h][w] = v;
+
+                int cell_idx = h * fw + w;
+                if (mask_active && !fd_mask_test_bit(&active_mask, cell_idx))
+                    continue;
+                if (v > max_margin) {
+                    max_margin = v;
+                    max_h = h;
+                    max_w = w;
+                }
+            }
+        }
+
+        r->has_heatmap = 1;
+        r->spatial_h = fh;
+        r->spatial_w = fw;
+        r->heatmap_max = max_margin;
+        r->heatmap_max_h = max_h;
+        r->heatmap_max_w = max_w;
+        r->spatial_ms = (float)(fd_get_time_ms() - t_total_start);
+
+        fd_log("  Heatmap: %dx%d multi-scale max=%.2f at [%d,%d] "
+               "(coarse=%.0fms fine=%.0fms total=%.0fms)\n",
+               fh, fw, max_margin, max_h, max_w,
+               coarse_ms, fine_ms, r->spatial_ms);
+        return 0;
     }
 
-    /* Read NHWC [1,7,7,1024] output — dequantize INT8 to float.
-     * fd_model_get_output handles INT8→float via zp/scale. */
-    int n = fd_model_get_output(&model, 0, spatial_buf, FD_SPATIAL_TOTAL);
-    double t1 = fd_get_time_ms();
+    /* ---- Single-encoder mode (fallback) ---- */
+    const char *model_path;
+    int sp_h, sp_w, emb_dim;
+    const float (*protos)[FD_SPATIAL_EMB_MAX];
+    const float *proto_norms;
 
-    fd_model_release(&model);
-
-    if (n < FD_SPATIAL_TOTAL) {
-        fd_err("Spatial output too short: %d vs %d\n", n, FD_SPATIAL_TOTAL);
-        return -1;
+    if (have_coarse && g_fd.spatial_coarse_loaded) {
+        model_path = coarse_path;
+        sp_h = g_fd.spatial_coarse_h;
+        sp_w = g_fd.spatial_coarse_w;
+        emb_dim = g_fd.spatial_coarse_emb_dim;
+        protos = (const float (*)[FD_SPATIAL_EMB_MAX])g_fd.spatial_coarse_protos;
+        proto_norms = g_fd.spatial_coarse_proto_norms;
+    } else if (have_fine && g_fd.spatial_protos_loaded) {
+        model_path = fine_path;
+        sp_h = g_fd.spatial_h;
+        sp_w = g_fd.spatial_w;
+        emb_dim = g_fd.spatial_emb_dim;
+        protos = (const float (*)[FD_SPATIAL_EMB_MAX])g_fd.spatial_protos;
+        proto_norms = g_fd.spatial_proto_norms;
+    } else if (have_fine && g_fd.prototypes_loaded) {
+        /* Fallback: fine encoder with classification prototypes */
+        model_path = fine_path;
+        sp_h = 7;
+        sp_w = 7;
+        emb_dim = EMB_DIM;
+        protos = (const float (*)[FD_SPATIAL_EMB_MAX])g_fd.prototypes;
+        proto_norms = g_fd.proto_norms;
+    } else {
+        model_path = have_coarse ? coarse_path : fine_path;
+        sp_h = 7;
+        sp_w = 7;
+        emb_dim = EMB_DIM;
+        protos = (const float (*)[FD_SPATIAL_EMB_MAX])g_fd.prototypes;
+        proto_norms = g_fd.proto_norms;
     }
 
-    /* Per-location cosine similarity to prototypes.
-     * NHWC layout: features[h][w][c] = spatial_buf[(h * W + w) * C + c] */
+    float enc_ms = 0;
+    int rc = fd_run_spatial_encoder(model_path, input, spatial_buf,
+                                     sp_h * sp_w * emb_dim, &enc_ms);
+    if (rc < 0) return rc;
+
+    fd_compute_heatmap(spatial_buf, sp_h, sp_w, emb_dim, protos, proto_norms,
+                       r->heatmap);
+
+    /* Find max within active mask */
     float max_margin = -999.0f;
     int max_h = 0, max_w = 0;
-
-    for (int h = 0; h < FD_SPATIAL_H; h++) {
-        for (int w = 0; w < FD_SPATIAL_W; w++) {
-            const float *vec = &spatial_buf[(h * FD_SPATIAL_W + w) * EMB_DIM];
-            float cos_fail = fd_cosine_similarity(vec, g_fd.prototypes[0],
-                                                   g_fd.proto_norms[0], EMB_DIM);
-            float cos_succ = fd_cosine_similarity(vec, g_fd.prototypes[1],
-                                                   g_fd.proto_norms[1], EMB_DIM);
-            float margin = cos_fail - cos_succ;
-            r->heatmap[h][w] = margin;
-
-            if (margin > max_margin) {
-                max_margin = margin;
+    int mask_active = !fd_mask_is_zero(&active_mask);
+    for (int h = 0; h < sp_h; h++) {
+        for (int w = 0; w < sp_w; w++) {
+            int cell_idx = h * sp_w + w;
+            if (mask_active && !fd_mask_test_bit(&active_mask, cell_idx))
+                continue;
+            if (r->heatmap[h][w] > max_margin) {
+                max_margin = r->heatmap[h][w];
                 max_h = h;
                 max_w = w;
             }
@@ -901,13 +1420,15 @@ static int fd_run_heatmap(const uint8_t *input, fd_result_t *r,
     }
 
     r->has_heatmap = 1;
+    r->spatial_h = sp_h;
+    r->spatial_w = sp_w;
     r->heatmap_max = max_margin;
     r->heatmap_max_h = max_h;
     r->heatmap_max_w = max_w;
-    r->spatial_ms = (float)(t1 - t0);
+    r->spatial_ms = enc_ms;
 
-    fd_log("  Heatmap: max=%.2f at [%d,%d] (%.0fms)\n",
-           max_margin, max_h, max_w, r->spatial_ms);
+    fd_log("  Heatmap: %dx%d max=%.2f at [%d,%d] (%.0fms)\n",
+           sp_h, sp_w, max_margin, max_h, max_w, r->spatial_ms);
 
     return 0;
 }
@@ -1109,37 +1630,175 @@ static int fd_run_detection(const uint8_t *preprocessed, fd_result_t *result,
             result->agreement++;
     }
 
-    /* Combined confidence */
-    float conf_sum = 0.0f;
-    int conf_n = 0;
-    if (have_cnn) { conf_sum += cnn_conf; conf_n++; }
+    /* Combined confidence — continuous fault likelihood [0, 1].
+     * Each model produces a directional score (higher = more likely fault)
+     * independent of the binary threshold decision. Combined by strategy
+     * so confidence varies smoothly, no cliff at threshold boundaries. */
+    float cnn_fault_lk = 0.5f;
+    float proto_fault_lk = 0.5f;
+    float multi_fault_lk = 0.5f;
+
+    if (have_cnn) {
+        /* CNN softmax: fail_prob already in [0, 1] */
+        cnn_fault_lk = (cnn_class == FD_CLASS_FAULT) ? cnn_conf : 1.0f - cnn_conf;
+    }
     if (have_proto) {
-        conf_sum += 0.5f + 0.5f * proto_conf;
-        conf_n++;
+        /* Proto confidence is signed margin in ~[-1, 1], map to [0, 1] */
+        proto_fault_lk = 0.5f + 0.5f * proto_conf;
+        if (proto_fault_lk < 0.0f) proto_fault_lk = 0.0f;
+        if (proto_fault_lk > 1.0f) proto_fault_lk = 1.0f;
     }
     if (run_multi) {
-        conf_sum += multi_conf > 0.5f ? multi_conf : 1.0f - multi_conf;
-        conf_n++;
+        /* Multi: 1-p(success) is already a [0, 1] fault likelihood */
+        multi_fault_lk = multi_conf;
     }
 
-    if (conf_n > 0) {
-        if (result->agreement == n_models)
-            result->confidence = conf_sum / conf_n;
-        else
-            result->confidence = 0.5f * conf_sum / conf_n;
-    } else {
-        result->confidence = 0.5f;
+    /* Store per-model detail in result */
+    result->cnn_ran = have_cnn;
+    result->proto_ran = have_proto;
+    result->multi_ran = run_multi;
+    result->cnn_raw = cnn_fault_lk;           /* fail prob [0,1] */
+    result->proto_raw = proto_conf;            /* signed margin ~[-1,1] */
+    result->multi_raw = multi_conf;            /* 1-p(success) [0,1] */
+    result->cnn_fault_lk = cnn_fault_lk;
+    result->proto_fault_lk = proto_fault_lk;
+    result->multi_fault_lk = multi_fault_lk;
+
+    /* Combine by strategy — each strategy's confidence matches its
+     * decision logic so the score varies smoothly around thresholds. */
+    switch (cfg->strategy) {
+    case FD_STRATEGY_AND:
+    case FD_STRATEGY_CLASSIFY_AND: {
+        /* AND: weakest of CNN + Proto (multi is labeling only) */
+        float min_lk = 1.0f;
+        if (have_cnn && cnn_fault_lk < min_lk) min_lk = cnn_fault_lk;
+        if (have_proto && proto_fault_lk < min_lk) min_lk = proto_fault_lk;
+        result->confidence = min_lk;
+        break;
+    }
+    case FD_STRATEGY_ALL: {
+        /* ALL: weakest of all active models */
+        float min_lk = 1.0f;
+        if (have_cnn && cnn_fault_lk < min_lk) min_lk = cnn_fault_lk;
+        if (have_proto && proto_fault_lk < min_lk) min_lk = proto_fault_lk;
+        if (run_multi && multi_fault_lk < min_lk) min_lk = multi_fault_lk;
+        result->confidence = min_lk;
+        break;
+    }
+    case FD_STRATEGY_OR: {
+        /* OR: strongest signal across all active models */
+        float max_lk = 0.0f;
+        if (have_cnn && cnn_fault_lk > max_lk) max_lk = cnn_fault_lk;
+        if (have_proto && proto_fault_lk > max_lk) max_lk = proto_fault_lk;
+        if (run_multi && multi_fault_lk > max_lk) max_lk = multi_fault_lk;
+        result->confidence = max_lk;
+        break;
+    }
+    case FD_STRATEGY_CLASSIFY: {
+        /* CLASSIFY: OR of CNN + Proto (multi is labeling only) */
+        float max_lk = 0.0f;
+        if (have_cnn && cnn_fault_lk > max_lk) max_lk = cnn_fault_lk;
+        if (have_proto && proto_fault_lk > max_lk) max_lk = proto_fault_lk;
+        result->confidence = max_lk;
+        break;
+    }
+    case FD_STRATEGY_MAJORITY: {
+        /* MAJORITY: average of all active models */
+        float sum = 0.0f;
+        int n = 0;
+        if (have_cnn) { sum += cnn_fault_lk; n++; }
+        if (have_proto) { sum += proto_fault_lk; n++; }
+        if (run_multi) { sum += multi_fault_lk; n++; }
+        result->confidence = n > 0 ? sum / n : 0.5f;
+        break;
+    }
+    case FD_STRATEGY_VERIFY: {
+        /* VERIFY: multiclass confirms CNN/Proto. Confidence follows
+         * the decision chain — multi when it ran, CNN/Proto average when not. */
+        if (run_multi)
+            result->confidence = multi_fault_lk;
+        else {
+            float sum = 0.0f;
+            int n = 0;
+            if (have_cnn) { sum += cnn_fault_lk; n++; }
+            if (have_proto) { sum += proto_fault_lk; n++; }
+            result->confidence = n > 0 ? sum / n : 0.5f;
+        }
+        break;
+    }
+    case FD_STRATEGY_CNN:
+        result->confidence = cnn_fault_lk;
+        break;
+    case FD_STRATEGY_PROTONET:
+        result->confidence = proto_fault_lk;
+        break;
+    case FD_STRATEGY_MULTICLASS:
+        result->confidence = multi_fault_lk;
+        break;
     }
 
-    /* Spatial heatmap: run only on faults, when enabled and prototypes loaded */
-    if (result->result == FD_CLASS_FAULT && cfg->heatmap_enabled &&
-        g_fd.prototypes_loaded && spatial_buf) {
+    /* Confidence should reflect how confident the final verdict is:
+     * FAULT → confidence = fault likelihood (higher = more sure it's a fault)
+     * OK    → confidence = 1 - fault likelihood (higher = more sure it's OK) */
+    if (result->result == FD_CLASS_OK)
+        result->confidence = 1.0f - result->confidence;
+
+    /* Spatial heatmap: always run when enabled + protos loaded.
+     * The 448x224 global classifiers (CNN/ProtoNet) use GAP which dilutes fault
+     * signal for small/localized defects.  The spatial heatmap detects per-cell
+     * and can boost the classification when global models miss. */
+    if (cfg->heatmap_enabled &&
+        (g_fd.prototypes_loaded || g_fd.spatial_protos_loaded) && spatial_buf) {
         if (pace_us > 0) usleep(pace_us);
-        int hm_ret = fd_run_heatmap(preprocessed, result, cfg, spatial_buf);
+        /* Resolve Z-dependent mask */
+        pthread_mutex_lock(&g_fd.z_mutex);
+        float cur_z = g_fd.current_z;
+        pthread_mutex_unlock(&g_fd.z_mutex);
+        fd_mask196_t active_mask = fd_get_mask_for_z(cfg, cur_z);
+        int hm_ret = fd_run_heatmap(preprocessed, result, cfg, spatial_buf, active_mask);
         if (hm_ret < 0) {
             fd_log("  Heatmap: skipped (%s)\n",
                    hm_ret == -2 ? "low memory" : "error");
             result->has_heatmap = 0;
+        }
+
+        /* Spatial boost: override OK→FAULT when heatmap shows strong localized
+         * fault signal that the global classifiers missed.  The 448x224 wide FOV
+         * dilutes GAP for sparse defects (spaghetti covering <20% of frame).
+         *
+         * Calibrated thresholds (KS1, Feb 2026):
+         *   Clean bed:       heatmap_max 0.33-0.38, strong_cells=0
+         *   Small spaghetti: heatmap_max 0.36-0.41, strong_cells=0
+         *   Large spaghetti: heatmap_max 0.50-0.59, strong_cells=11-19
+         *   Threshold: max>0.45, cells>=3 — gap: 0.41..0.50 */
+        if (result->result == FD_CLASS_OK && result->has_heatmap &&
+            result->heatmap_max > 0.45f) {
+            int strong_cells = 0, total_active = 0;
+            int mask_on = !fd_mask_is_zero(&active_mask);
+            for (int h = 0; h < result->spatial_h; h++) {
+                for (int w = 0; w < result->spatial_w; w++) {
+                    int idx = h * result->spatial_w + w;
+                    if (mask_on && !fd_mask_test_bit(&active_mask, idx))
+                        continue;
+                    total_active++;
+                    if (result->heatmap[h][w] > 0.3f)
+                        strong_cells++;
+                }
+            }
+            /* Require >=3 strong cells AND either a global model shows some
+             * suspicion (avoids pure-spatial false positives) or overwhelming
+             * spatial evidence (>=8 cells = clear cluster). */
+            int global_hint = 0;
+            if (have_cnn && cnn_fault_lk > 0.10f) global_hint = 1;
+            if (have_proto && proto_fault_lk > 0.55f) global_hint = 1;
+
+            if (strong_cells >= 3 && (global_hint || strong_cells >= 8)) {
+                result->result = FD_CLASS_FAULT;
+                result->confidence = 0.5f + 0.5f * result->heatmap_max;
+                if (result->confidence > 1.0f) result->confidence = 1.0f;
+                fd_log("  Spatial BOOST: OK->FAULT (max=%.2f, %d/%d strong cells)\n",
+                       result->heatmap_max, strong_cells, total_active);
+            }
         }
     }
 
@@ -1169,6 +1828,8 @@ static void *fd_thread_func(void *arg)
     (void)arg;
     fd_log("Detection thread started\n");
 
+    fd_buzzer_init();
+
     uint8_t *preprocessed = (uint8_t *)malloc(FD_MODEL_INPUT_BYTES);
     if (!preprocessed) {
         fd_err("Failed to allocate preprocess buffer\n");
@@ -1176,8 +1837,10 @@ static void *fd_thread_func(void *arg)
         return NULL;
     }
 
-    /* Persistent spatial buffer (~196KB) — allocated once, reused each cycle */
-    float *spatial_buf = (float *)malloc(FD_SPATIAL_TOTAL * sizeof(float));
+    /* Persistent spatial buffer — allocated for max possible size, reused each cycle.
+     * Max: 14x28x1024 = 401408 floats = ~1.5MB (covers 7x14x1024 and 14x28x232) */
+    int spatial_buf_size = FD_SPATIAL_H_MAX * FD_SPATIAL_W_MAX * FD_SPATIAL_EMB_MAX;
+    float *spatial_buf = (float *)malloc(spatial_buf_size * sizeof(float));
     if (!spatial_buf) {
         fd_log("Warning: spatial buffer alloc failed, heatmap disabled\n");
     }
@@ -1254,6 +1917,21 @@ static void *fd_thread_func(void *arg)
         }
         free(jpeg_copy);
 
+        /* Compute center-crop region from decoded image dimensions.
+         * Scale = max(256/h, 512/w) to ensure >= 512x256, then crop 448x224 */
+        if (img.width > 0 && img.height > 0) {
+            float sc_h = 256.0f / (float)img.height;
+            float sc_w = 512.0f / (float)img.width;
+            float sc = sc_h > sc_w ? sc_h : sc_w;
+            float rw = img.width * sc;
+            float rh = img.height * sc;
+            g_fd.crop_w = (float)FD_MODEL_INPUT_WIDTH / rw;
+            g_fd.crop_h = (float)FD_MODEL_INPUT_HEIGHT / rh;
+            g_fd.crop_x = (1.0f - g_fd.crop_w) * 0.5f;
+            g_fd.crop_y = (1.0f - g_fd.crop_h) * 0.5f;
+            g_fd.crop_valid = 1;
+        }
+
         if (pace_us > 0) usleep(pace_us);
 
         /* Fused resize+crop+grayscale (single pass, no intermediate alloc) */
@@ -1277,6 +1955,12 @@ static void *fd_thread_func(void *arg)
             continue;  /* Skip cycle entirely */
         }
 
+        /* Attach center-crop region to result */
+        result.crop_x = g_fd.crop_x;
+        result.crop_y = g_fd.crop_y;
+        result.crop_w = g_fd.crop_w;
+        result.crop_h = g_fd.crop_h;
+
         /* Update state */
         pthread_mutex_lock(&g_fd.state_mutex);
         g_fd.state.status = FD_STATUS_ENABLED;
@@ -1285,6 +1969,10 @@ static void *fd_thread_func(void *arg)
         g_fd.state.cycle_count++;
         g_fd.state.error_msg[0] = '\0';
         pthread_mutex_unlock(&g_fd.state_mutex);
+
+        /* Buzzer alert on fault */
+        if (result.result == FD_CLASS_FAULT && cfg.beep_pattern > 0)
+            fd_play_pattern(cfg.beep_pattern);
 
         /* Dual interval logic */
         if (result.result == FD_CLASS_FAULT) {
@@ -1310,8 +1998,40 @@ static void *fd_thread_func(void *arg)
 
     free(preprocessed);
     free(spatial_buf);
+    fd_buzzer_cleanup();
     fd_log("Detection thread stopped\n");
     return NULL;
+}
+
+/* ============================================================================
+ * Z-dependent mask helpers
+ * ============================================================================ */
+
+/* Binary search: find largest entry where z_mm <= current_z.
+ * Falls back to heatmap_mask when z_mask_count == 0. */
+static fd_mask196_t fd_get_mask_for_z(const fd_config_t *cfg, float z)
+{
+    if (cfg->z_mask_count <= 0)
+        return cfg->heatmap_mask;
+
+    /* Binary search for largest z_mm <= z */
+    int lo = 0, hi = cfg->z_mask_count - 1;
+    int best = -1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        if (cfg->z_masks[mid].z_mm <= z) {
+            best = mid;
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
+    }
+
+    if (best >= 0)
+        return cfg->z_masks[best].mask;
+
+    /* z is below all entries — use first entry */
+    return cfg->z_masks[0].mask;
 }
 
 /* ============================================================================
@@ -1324,6 +2044,7 @@ int fault_detect_init(const char *models_base_dir)
     pthread_mutex_init(&g_fd.config_mutex, NULL);
     pthread_mutex_init(&g_fd.state_mutex, NULL);
     pthread_mutex_init(&g_fd.frame_mutex, NULL);
+    pthread_mutex_init(&g_fd.z_mutex, NULL);
     pthread_cond_init(&g_fd.frame_cond, NULL);
 
     snprintf(g_fd.models_base_dir, sizeof(g_fd.models_base_dir),
@@ -1448,6 +2169,7 @@ void fault_detect_cleanup(void)
     pthread_mutex_destroy(&g_fd.config_mutex);
     pthread_mutex_destroy(&g_fd.state_mutex);
     pthread_mutex_destroy(&g_fd.frame_mutex);
+    pthread_mutex_destroy(&g_fd.z_mutex);
     pthread_cond_destroy(&g_fd.frame_cond);
 
     g_fd.initialized = 0;
@@ -1495,6 +2217,28 @@ void fault_detect_set_config(const fd_config_t *config)
 
     /* Invalidate prototypes cache when model changes */
     g_fd.prototypes_loaded = 0;
+    g_fd.spatial_protos_loaded = 0;
+}
+
+void fault_detect_set_current_z(float z_mm)
+{
+    pthread_mutex_lock(&g_fd.z_mutex);
+    g_fd.current_z = z_mm;
+    pthread_mutex_unlock(&g_fd.z_mutex);
+}
+
+void fault_detect_set_z_masks(const fd_z_mask_entry_t *entries, int count)
+{
+    if (count < 0) count = 0;
+    if (count > FD_Z_MASK_MAX_ENTRIES) count = FD_Z_MASK_MAX_ENTRIES;
+
+    pthread_mutex_lock(&g_fd.config_mutex);
+    if (entries && count > 0)
+        memcpy(g_fd.config.z_masks, entries, count * sizeof(fd_z_mask_entry_t));
+    g_fd.config.z_mask_count = count;
+    pthread_mutex_unlock(&g_fd.config_mutex);
+
+    fd_log("Z-masks: %d entries loaded\n", count);
 }
 
 /* Check if a model file exists in {set_path}/{class_dir}/{filename} */
@@ -1592,6 +2336,8 @@ static void fd_parse_set_metadata(fd_model_set_t *s)
             if (fn) snprintf(s->proto_file, sizeof(s->proto_file), "%s", fn);
             const char *pf = fd_json_str(proto, "prototypes");
             if (pf) snprintf(s->proto_prototypes, sizeof(s->proto_prototypes), "%s", pf);
+            const char *spf = fd_json_str(proto, "spatial_prototypes");
+            if (spf) snprintf(s->proto_spatial_prototypes, sizeof(s->proto_spatial_prototypes), "%s", spf);
         }
         const cJSON *multi = cJSON_GetObjectItemCaseSensitive(models, "multiclass");
         if (multi) {
@@ -1685,6 +2431,33 @@ int fault_detect_installed(void)
 {
     struct stat st;
     return (stat(g_fd.models_base_dir, &st) == 0 && S_ISDIR(st.st_mode)) ? 1 : 0;
+}
+
+void fault_detect_get_spatial_dims(int *h, int *w)
+{
+    if (g_fd.spatial_protos_loaded) {
+        if (h) *h = g_fd.spatial_h;
+        if (w) *w = g_fd.spatial_w;
+    } else {
+        /* Default to 7x7 if spatial prototypes not loaded */
+        if (h) *h = 7;
+        if (w) *w = 7;
+    }
+}
+
+void fault_detect_get_crop(float *x, float *y, float *w, float *h)
+{
+    if (g_fd.crop_valid) {
+        if (x) *x = g_fd.crop_x;
+        if (y) *y = g_fd.crop_y;
+        if (w) *w = g_fd.crop_w;
+        if (h) *h = g_fd.crop_h;
+    } else {
+        if (x) *x = 0;
+        if (y) *y = 0;
+        if (w) *w = 1;
+        if (h) *h = 1;
+    }
 }
 
 /* ============================================================================

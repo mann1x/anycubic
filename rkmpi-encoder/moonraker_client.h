@@ -37,6 +37,10 @@ typedef struct MoonrakerClient {
     pthread_t hyperlapse_thread;    /* For hyperlapse interval timer */
     volatile int hyperlapse_running;
 
+    /* Toolhead position */
+    float position[4];              /* X, Y, Z, E from toolhead.position */
+    volatile int has_position;
+
     /* Config reference (read-only, owned by main) */
     AppConfig *config;
 } MoonrakerClient;
@@ -66,5 +70,26 @@ void moonraker_client_stop(MoonrakerClient *mc);
  * @return 1 if connected, 0 if not
  */
 int moonraker_client_is_connected(const MoonrakerClient *mc);
+
+/*
+ * Send G-code script to printer via Moonraker (fire-and-forget).
+ * Uses the existing WebSocket connection to send printer.gcode.script.
+ *
+ * @param mc     Client state
+ * @param gcode  G-code string (e.g. "G28" or "G1 X110 Y110 F3000")
+ * @return 0 on send success, -1 on failure (not connected, send error)
+ */
+int moonraker_client_send_gcode(MoonrakerClient *mc, const char *gcode);
+
+/*
+ * Get current print state string.
+ * Thread-safe: copies print_state into caller buffer.
+ *
+ * @param mc     Client state
+ * @param buf    Output buffer
+ * @param buflen Buffer size
+ * @return 0 on success
+ */
+int moonraker_client_get_print_state(const MoonrakerClient *mc, char *buf, int buflen);
 
 #endif /* MOONRAKER_CLIENT_H */

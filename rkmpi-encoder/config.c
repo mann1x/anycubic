@@ -160,7 +160,21 @@ void config_set_defaults(AppConfig *cfg) {
     cfg->fault_detect_min_free_mem = 20;
     cfg->fault_detect_pace_ms = 150;
     cfg->heatmap_enabled = 0;
+    cfg->fd_beep_pattern = 0;
     cfg->fd_thresholds_json[0] = '\0';
+
+    /* Fault Detection Setup */
+    cfg->fd_setup_status = FD_SETUP_NONE;
+    cfg->fd_setup_timestamp = 0;
+    memset(cfg->fd_setup_corners, 0, sizeof(cfg->fd_setup_corners));
+    /* All 392 bits set for 14x28 grid */
+    strncpy(cfg->fd_setup_mask_hex,
+        "00000000000000ff:ffffffffffffffff:ffffffffffffffff:ffffffffffffffff:ffffffffffffffff:ffffffffffffffff:ffffffffffffffff",
+        sizeof(cfg->fd_setup_mask_hex) - 1);
+    cfg->fd_bed_size_x = 220;
+    cfg->fd_bed_size_y = 220;
+    cfg->fd_setup_results_json[0] = '\0';
+    cfg->fd_z_masks_json[0] = '\0';
 }
 
 int config_load(AppConfig *cfg, const char *path) {
@@ -317,6 +331,8 @@ int config_load(AppConfig *cfg, const char *path) {
     cfg->fault_detect_pace_ms = clamp_int(
         json_get_int(root, "fault_detect_pace_ms", cfg->fault_detect_pace_ms), 0, 500);
     cfg->heatmap_enabled = json_get_bool(root, "heatmap_enabled", cfg->heatmap_enabled);
+    cfg->fd_beep_pattern = clamp_int(
+        json_get_int(root, "fd_beep_pattern", cfg->fd_beep_pattern), 0, 5);
 
     /* Per-set threshold settings */
     const cJSON *fd_th = cJSON_GetObjectItemCaseSensitive(root, "fd_thresholds");
@@ -325,6 +341,69 @@ int config_load(AppConfig *cfg, const char *path) {
         if (th_str) {
             strncpy(cfg->fd_thresholds_json, th_str, sizeof(cfg->fd_thresholds_json) - 1);
             free(th_str);
+        }
+    }
+
+    /* Fault Detection Setup */
+    cfg->fd_setup_status = clamp_int(
+        json_get_int(root, "fd_setup_status", cfg->fd_setup_status), 0, 2);
+    {
+        const cJSON *ts_item = cJSON_GetObjectItemCaseSensitive(root, "fd_setup_timestamp");
+        if (ts_item && cJSON_IsNumber(ts_item))
+            cfg->fd_setup_timestamp = (int64_t)ts_item->valuedouble;
+    }
+    {
+        const cJSON *corners = cJSON_GetObjectItemCaseSensitive(root, "fd_setup_corners");
+        int ncorners = corners ? cJSON_GetArraySize(corners) : 0;
+        /* Support old 4-point (8 floats) and new 8-point (16 floats) configs */
+        if (corners && cJSON_IsArray(corners) && (ncorners == 8 || ncorners == 16)) {
+            for (int i = 0; i < ncorners; i++) {
+                const cJSON *v = cJSON_GetArrayItem(corners, i);
+                if (v && cJSON_IsNumber(v))
+                    cfg->fd_setup_corners[i] = clamp_float((float)v->valuedouble, 0.0f, 1.0f);
+            }
+        }
+    }
+    {
+        /* Try new hex string first, then fall back to old numeric mask */
+        const char *hex_mask = json_get_str(root, "fd_setup_mask_hex", NULL);
+        if (hex_mask) {
+            strncpy(cfg->fd_setup_mask_hex, hex_mask, sizeof(cfg->fd_setup_mask_hex) - 1);
+        } else {
+            const cJSON *mask_item = cJSON_GetObjectItemCaseSensitive(root, "fd_setup_mask");
+            if (mask_item && cJSON_IsNumber(mask_item)) {
+                /* Convert old uint64_t to hex format */
+                uint64_t old_mask = (uint64_t)mask_item->valuedouble;
+                snprintf(cfg->fd_setup_mask_hex, sizeof(cfg->fd_setup_mask_hex),
+                         "0000000000000000:0000000000000000:0000000000000000:%016llx",
+                         (unsigned long long)old_mask);
+            }
+        }
+    }
+    cfg->fd_bed_size_x = clamp_int(
+        json_get_int(root, "fd_bed_size_x", cfg->fd_bed_size_x), 100, 500);
+    cfg->fd_bed_size_y = clamp_int(
+        json_get_int(root, "fd_bed_size_y", cfg->fd_bed_size_y), 100, 500);
+    {
+        const cJSON *res = cJSON_GetObjectItemCaseSensitive(root, "fd_setup_results");
+        if (res && cJSON_IsObject(res)) {
+            char *res_str = cJSON_PrintUnformatted(res);
+            if (res_str) {
+                strncpy(cfg->fd_setup_results_json, res_str, sizeof(cfg->fd_setup_results_json) - 1);
+                free(res_str);
+            }
+        }
+    }
+
+    /* Z-dependent masks */
+    {
+        const cJSON *zm = cJSON_GetObjectItemCaseSensitive(root, "fd_z_masks");
+        if (zm && cJSON_IsArray(zm)) {
+            char *zm_str = cJSON_PrintUnformatted(zm);
+            if (zm_str) {
+                strncpy(cfg->fd_z_masks_json, zm_str, sizeof(cfg->fd_z_masks_json) - 1);
+                free(zm_str);
+            }
         }
     }
 
@@ -461,6 +540,7 @@ int config_save(const AppConfig *cfg, const char *path) {
     json_set_int(root, "fault_detect_min_free_mem", cfg->fault_detect_min_free_mem);
     json_set_int(root, "fault_detect_pace_ms", cfg->fault_detect_pace_ms);
     json_set_bool(root, "heatmap_enabled", cfg->heatmap_enabled);
+    json_set_int(root, "fd_beep_pattern", cfg->fd_beep_pattern);
 
     /* Per-set threshold settings */
     if (cfg->fd_thresholds_json[0]) {
@@ -469,6 +549,49 @@ int config_save(const AppConfig *cfg, const char *path) {
             cJSON_DeleteItemFromObjectCaseSensitive(root, "fd_thresholds");
             cJSON_AddItemToObject(root, "fd_thresholds", fd_th);
         }
+    }
+
+    /* Fault Detection Setup */
+    json_set_int(root, "fd_setup_status", cfg->fd_setup_status);
+    {
+        /* Store timestamp as JSON number (safe up to 2^53) */
+        cJSON *ts = cJSON_GetObjectItemCaseSensitive(root, "fd_setup_timestamp");
+        if (ts)
+            cJSON_SetNumberValue(ts, (double)cfg->fd_setup_timestamp);
+        else
+            cJSON_AddNumberToObject(root, "fd_setup_timestamp", (double)cfg->fd_setup_timestamp);
+    }
+    {
+        cJSON_DeleteItemFromObjectCaseSensitive(root, "fd_setup_corners");
+        cJSON *arr = cJSON_CreateArray();
+        for (int i = 0; i < 16; i++)
+            cJSON_AddItemToArray(arr, cJSON_CreateNumber(cfg->fd_setup_corners[i]));
+        cJSON_AddItemToObject(root, "fd_setup_corners", arr);
+    }
+    {
+        /* Write hex mask string, remove old numeric key if present */
+        cJSON_DeleteItemFromObjectCaseSensitive(root, "fd_setup_mask");
+        json_set_str(root, "fd_setup_mask_hex", cfg->fd_setup_mask_hex);
+    }
+    json_set_int(root, "fd_bed_size_x", cfg->fd_bed_size_x);
+    json_set_int(root, "fd_bed_size_y", cfg->fd_bed_size_y);
+    if (cfg->fd_setup_results_json[0]) {
+        cJSON *res = cJSON_Parse(cfg->fd_setup_results_json);
+        if (res) {
+            cJSON_DeleteItemFromObjectCaseSensitive(root, "fd_setup_results");
+            cJSON_AddItemToObject(root, "fd_setup_results", res);
+        }
+    }
+
+    /* Z-dependent masks */
+    if (cfg->fd_z_masks_json[0]) {
+        cJSON *zm = cJSON_Parse(cfg->fd_z_masks_json);
+        if (zm) {
+            cJSON_DeleteItemFromObjectCaseSensitive(root, "fd_z_masks");
+            cJSON_AddItemToObject(root, "fd_z_masks", zm);
+        }
+    } else {
+        cJSON_DeleteItemFromObjectCaseSensitive(root, "fd_z_masks");
     }
 
     /* Per-camera settings */

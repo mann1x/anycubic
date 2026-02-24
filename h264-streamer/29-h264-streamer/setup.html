@@ -1,0 +1,2082 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>FD Spatial Calibration</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: sans-serif; background: #1a1a1a; color: #fff; padding: 16px; }
+        .container { max-width: 920px; margin: 0 auto; }
+        h1 { color: #4CAF50; font-size: 18px; margin-bottom: 8px; }
+        .progress-bar { height: 6px; background: #333; border-radius: 3px; margin-bottom: 16px; overflow: hidden; }
+        .progress-fill { height: 100%; background: #4CAF50; transition: width 0.3s; border-radius: 3px; }
+        .camera-wrap { position: relative; background: #000; border-radius: 8px; overflow: hidden; margin-bottom: 12px; }
+        .camera-wrap img { display: block; width: 100%; height: auto; }
+        .camera-wrap canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; }
+        .camera-wrap .click-layer { position: absolute; top: 0; left: 0; width: 100%; height: 100%; cursor: crosshair; }
+        .step-info { background: #2d2d2d; padding: 14px; border-radius: 8px; margin-bottom: 12px; }
+        .step-title { font-size: 15px; color: #4CAF50; font-weight: bold; margin-bottom: 6px; }
+        .step-instructions { color: #ccc; font-size: 13px; line-height: 1.5; overflow: hidden; }
+        .detection-feedback { margin-top: 8px; padding: 8px 12px; border-radius: 4px; font-size: 13px; font-family: monospace; }
+        .feedback-pass { background: #1a3a1a; color: #4CAF50; border: 1px solid #2d7a45; }
+        .feedback-waiting { background: #2d2d2d; color: #888; border: 1px solid #444; }
+        .feedback-fail { background: #3a1a1a; color: #f44; border: 1px solid #7a2d2d; }
+        .feedback-active { background: #3a3a1a; color: #f0ad4e; border: 1px solid #7a6a2d; }
+        .nav-buttons { display: flex; justify-content: space-between; gap: 10px; margin-top: 12px; }
+        button { background: #4CAF50; color: white; border: none; padding: 10px 20px;
+                  border-radius: 4px; cursor: pointer; font-size: 14px; }
+        button:hover { background: #45a049; }
+        button:disabled { background: #444; cursor: not-allowed; opacity: 0.6; }
+        button.secondary { background: #555; }
+        button.secondary:hover { background: #666; }
+        button.danger { background: #f44336; }
+        button.danger:hover { background: #da190b; }
+        .bed-size-input { display: flex; align-items: center; gap: 8px; margin: 8px 0; }
+        .bed-size-input input { width: 60px; padding: 6px; border-radius: 4px; border: 1px solid #555;
+                                 background: #333; color: #fff; font-size: 13px; }
+        .bed-size-input span { color: #888; font-size: 13px; }
+        .summary-table { width: 100%; border-collapse: collapse; font-size: 13px; margin: 10px 0; }
+        .summary-table th { text-align: left; padding: 6px 10px; background: #333; color: #aaa; }
+        .summary-table td { padding: 6px 10px; border-bottom: 1px solid #333; }
+        .summary-table .pass { color: #4CAF50; }
+        .summary-table .fail { color: #f44; }
+        .summary-table .skip { color: #888; }
+        .stats-row { display: flex; gap: 20px; margin: 10px 0; }
+        .stat { text-align: center; }
+        .stat-val { font-size: 22px; font-weight: bold; }
+        .stat-lbl { font-size: 11px; color: #888; }
+        .error-msg { background: #3a1a1a; color: #f44; padding: 10px; border-radius: 4px; margin: 10px 0; font-size: 13px; }
+        .warning-msg { background: #3a3a1a; color: #f0ad4e; padding: 10px; border-radius: 4px; margin: 10px 0; font-size: 13px; }
+        .plate-diagram { float: right; margin: 0 0 6px 10px; position: relative; width: 100px; height: 100px; }
+        .plate-diagram img { width: 100%; height: 100%; border-radius: 4px; opacity: 0.7; }
+        .plate-diagram svg { position: absolute; top: 0; left: 0; width: 100%; height: 100%; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Fault Detection Spatial Calibration</h1>
+        <div class="progress-bar"><div class="progress-fill" id="progress-fill" style="width:0%"></div></div>
+
+        <div class="camera-wrap" id="camera-wrap">
+            <img id="camera-img" src="" alt="Camera">
+            <canvas id="overlay-canvas"></canvas>
+            <div class="click-layer" id="click-layer"></div>
+        </div>
+
+        <div style="display:flex;justify-content:flex-end;margin-bottom:4px;">
+            <button class="secondary" id="btn-mask-toggle" onclick="toggleMask()" style="padding:4px 10px;font-size:11px;">Mask: ON</button>
+        </div>
+
+        <div class="step-info">
+            <div class="step-title" id="step-title">Initializing...</div>
+            <div class="step-instructions" id="step-instructions"></div>
+            <div class="detection-feedback feedback-waiting" id="detection-feedback" style="display:none"></div>
+        </div>
+
+        <div id="bed-size-panel" style="display:none">
+            <div class="bed-size-input">
+                <span>Bed size:</span>
+                <input type="number" id="bed-x" min="100" max="500" value="$fd_bed_size_x">
+                <span>x</span>
+                <input type="number" id="bed-y" min="100" max="500" value="$fd_bed_size_y">
+                <span>mm</span>
+            </div>
+        </div>
+
+        <div id="z-review-panel" style="display:none;background:#2d2d2d;padding:12px;border-radius:8px;margin-bottom:12px;">
+            <div style="display:flex;align-items:center;gap:12px;">
+                <input type="range" id="z-review-slider" min="0" max="250" step="5" value="0"
+                       style="flex:1;accent-color:#4CAF50;"
+                       oninput="activeMaskOverride=getZMaskForHeight(Number(this.value));updateZReviewLabel(Number(this.value));drawOverlay(lastHeatmap);">
+                <span id="z-review-label" style="font-size:13px;color:#ccc;white-space:nowrap;">Z = 0mm</span>
+            </div>
+            <div style="margin-top:6px;display:flex;justify-content:space-between;">
+                <button id="btn-move-z" class="secondary" style="padding:4px 10px;font-size:11px;" onclick="(async()=>{var btn=this;var z=Math.max(2,Number(document.getElementById('z-review-slider').value));btn.textContent='Moving to Z='+z+'...';btn.disabled=true;await sendGcode('G1 Z'+z+' F500');await waitForGcodeComplete(30000);btn.textContent='At Z='+z+'mm';btn.disabled=false;setTimeout(()=>{btn.textContent='Move Bed to Z'},3000)})()">Move Bed to Z</button>
+                <span style="font-size:11px;color:#666;">Drag slider to preview mask at different heights</span>
+            </div>
+        </div>
+
+        <div id="summary-panel" style="display:none"></div>
+
+        <div class="nav-buttons" id="nav-buttons">
+            <button class="secondary" id="btn-back" onclick="prevStep()" disabled>Back</button>
+            <div style="display:flex;gap:8px;">
+                <button class="secondary" id="btn-skip" onclick="skipStep()" style="display:none">Skip</button>
+                <button class="danger" id="btn-fail" onclick="markFailed()" style="display:none">Mark Failed</button>
+                <button class="danger" id="btn-stop" onclick="requestAbort()" style="display:none">Stop</button>
+                <button id="btn-next" onclick="nextStep()">Start</button>
+            </div>
+        </div>
+    </div>
+
+<script>
+// ============================================================
+// Configuration
+// ============================================================
+const STREAMING_PORT = parseInt('$streaming_port') || 8080;
+const CONTROL_PORT = parseInt('$control_port') || 8081;
+const POLL_INTERVAL = 1500;
+const MARGIN_PCT = 0.15;
+const Z_STEP_MM = 5;  // Z-scan step size in mm
+const GRID_H = parseInt('$fd_grid_h') || 14;
+const GRID_W = parseInt('$fd_grid_w') || 14;
+const GRID_TOTAL = GRID_H * GRID_W;
+
+// Hex mask ↔ BigInt conversion for grid masks
+// Format: "w6:w5:...:w0" — 7 colon-separated 16-char hex words (also accepts legacy 4-word)
+function hexMaskToBigInt(hex) {
+    if (!hex || typeof hex !== 'string') return 0n;
+    const parts = hex.split(':');
+    if (parts.length >= 2) {
+        let val = 0n;
+        for (let i = 0; i < parts.length; i++) {
+            val = (val << 64n) | BigInt('0x' + parts[i]);
+        }
+        return val;
+    }
+    // Fallback: try parsing as single number
+    try { return BigInt(hex); } catch(e) { return 0n; }
+}
+
+function bigIntToHexMask(val) {
+    const NWORDS = 7;
+    const mask64 = (1n << 64n) - 1n;
+    const words = [];
+    for (let i = 0; i < NWORDS; i++) {
+        words.push(((val >> BigInt(i * 64)) & mask64).toString(16).padStart(16, '0'));
+    }
+    return words.reverse().join(':');
+}
+
+let crop = {
+    x: parseFloat('$fd_crop_x') || 0,
+    y: parseFloat('$fd_crop_y') || 0,
+    w: parseFloat('$fd_crop_w') || 1,
+    h: parseFloat('$fd_crop_h') || 1
+};
+
+let savedCorners = $fd_setup_corners;
+let savedMask = hexMaskToBigInt('$fd_setup_mask');
+let savedStatus = parseInt('$fd_setup_status') || 0;
+let bedX = parseInt('$fd_bed_size_x') || 220;
+let bedY = parseInt('$fd_bed_size_y') || 220;
+let bedSizeAutoDetected = false;
+let savedZMasks = $fd_z_masks;  // [[z_mm, "hex_mask"], ...]
+let zMasks = savedZMasks || [];  // runtime z-mask table
+let zScanRunning = false;
+let zScanMaxZ = 0;  // max Z reached during scan
+let zRefCells = [];  // 3 reference cell indices for Z-scan
+let zMarkerConsecutive = [0, 0, 0];  // per-corner consecutive detection counts
+let zMarkerDetected = [false, false, false];  // per-corner detection flags
+
+// ============================================================
+// State
+// ============================================================
+let currentStep = -1;  // -1 = pre-start
+let corners = [];      // [{x,y},...] 8 points: TL,TM,TR,MR,BR,BM,BL,ML normalized
+const NUM_CORNERS = 8; // 4 corners + 4 midpoints
+let mask = savedMask;
+let pollTimer = null;
+let setupActive = false;
+let stepResults = {};
+let consecutiveDetections = 0;
+let autoAdvanceTimer = null;
+let spaghettiPhase = '';  // 'place', 'detect', 'result', 'remove'
+let bedClearedForNozzle = false;  // user confirmed bed is clear before G28
+let abortRequested = false;       // stop button pressed during long operations
+let spaghettiTimeout = null;
+let cornerPhase = 'click';  // 'click', 'confirm_mask'
+let maskVisible = true;     // overlay mask on/off toggle
+
+// Load saved corners (16 floats = 8 points, or 8 floats = 4 points for backward compat)
+if (savedCorners && (savedCorners.length === 16 || savedCorners.length === 8)) {
+    let hasCorners = savedCorners.some(v => v > 0.001);
+    if (hasCorners) {
+        corners = [];
+        for (let i = 0; i < savedCorners.length; i += 2) {
+            corners.push({x: savedCorners[i], y: savedCorners[i+1]});
+        }
+    }
+}
+
+// Step definitions
+const POSITIONS = ['center', 'top_left', 'top_right', 'bottom_left', 'bottom_right'];
+const POS_LABELS = { center: 'Center', top_left: 'Top-Left', top_right: 'Top-Right',
+                     bottom_left: 'Bottom-Left', bottom_right: 'Bottom-Right' };
+const SIZES = ['low', 'medium', 'huge'];
+const SIZE_LABELS = { low: 'Small', medium: 'Medium', huge: 'Large' };
+
+const TOTAL_STEPS = 25;  // 0=corners, 1=z_markers, 2=z_scan, 3=z_review, 4-8=nozzle, 9-23=spaghetti, 24=summary
+
+function getPositionGcode(pos) {
+    const bx = bedX, by = bedY;
+    const m = MARGIN_PCT;
+    const map = {
+        center:       { gx: bx/2, gy: by/2 },
+        top_left:     { gx: bx*m, gy: by*(1-m) },
+        top_right:    { gx: bx*(1-m), gy: by*(1-m) },
+        bottom_left:  { gx: bx*m, gy: by*m },
+        bottom_right: { gx: bx*(1-m), gy: by*m }
+    };
+    return map[pos];
+}
+
+function getPositionUV(pos) {
+    const m = MARGIN_PCT;
+    const map = {
+        center:       { u: 0.5, v: 0.5 },
+        top_left:     { u: m, v: m },
+        top_right:    { u: 1-m, v: m },
+        bottom_left:  { u: m, v: 1-m },
+        bottom_right: { u: 1-m, v: 1-m }
+    };
+    return map[pos];
+}
+
+function bedToCamera(u, v) {
+    if (corners.length < NUM_CORNERS) return { x: u, y: v };
+    // Use the 4 actual corners (TL=0, TR=2, BR=4, BL=6) for bilinear interpolation
+    const tl = corners[0], tr = corners[2], br = corners[4], bl = corners[6];
+    const topX = tl.x + u * (tr.x - tl.x);
+    const topY = tl.y + u * (tr.y - tl.y);
+    const botX = bl.x + u * (br.x - bl.x);
+    const botY = bl.y + u * (br.y - bl.y);
+    return { x: topX + v * (botX - topX), y: topY + v * (botY - topY) };
+}
+
+function getStepInfo(step) {
+    if (step === 0) return { type: 'corners', title: 'Define Build Plate Corners' };
+    if (step === 1) return { type: 'z_markers', title: 'Place Z-Scan Markers' };
+    if (step === 2) return { type: 'z_scan', title: 'Auto Z-Scan' };
+    if (step === 3) return { type: 'z_review', title: 'Review Z-Masks' };
+    if (step >= 4 && step <= 8) {
+        const pos = POSITIONS[step - 4];
+        return { type: 'nozzle', pos: pos, title: 'Nozzle Detection: ' + POS_LABELS[pos] };
+    }
+    if (step >= 9 && step <= 23) {
+        const idx = step - 9;
+        const posIdx = Math.floor(idx / 3);
+        const sizeIdx = idx % 3;
+        return { type: 'spaghetti', pos: POSITIONS[posIdx], size: SIZES[sizeIdx],
+                 title: SIZE_LABELS[SIZES[sizeIdx]] + ' Spaghetti: ' + POS_LABELS[POSITIONS[posIdx]] };
+    }
+    if (step === 24) return { type: 'summary', title: 'Calibration Summary' };
+    return { type: 'unknown', title: 'Unknown Step' };
+}
+
+// ============================================================
+// Build Plate Diagram
+// ============================================================
+const PLATE_IMG = 'data:image/jpeg;base64,/9j/4AAQSkZJRgABAQEAYABgAAD/2wBDABALDA4MChAODQ4SERATGCgaGBYWGDEjJR0oOjM9PDkzODdASFxOQERXRTc4UG1RV19iZ2hnPk1xeXBkeFxlZ2P/2wBDARESEhgVGC8aGi9jQjhCY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2P/wAARCACgAKADASIAAhEBAxEB/8QAGwABAQADAQEBAAAAAAAAAAAAAAECBgcFBAP/xABHEAABAgMBCgoFCQgDAAAAAAAAAQIDBBEFBhIhMTNBcnOx0QcUNVFUYXGSk8EVFiJEshMjJDI0RYKRoTZSU1WBg8LSYmPw/8QAFQEBAQAAAAAAAAAAAAAAAAAAAAH/xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIRAxEAPwDc7YjxJayZuNCW9iQ4TnNXmWhy9szMvbFe6ZjK5ERa/KLjqdNt7kKe1D9hy6Hk4vYm1AM2zs2mKajp/cdvM0tKeTFOzHiu3nylKPrS1rRTFPzPiqZpbVqJ94TPiKfAAPbmLqbTjS8OCyMsFGL9dirfO5qqp8yW9ayLgtCY7x5pQPSS6C10+8I35puMvWK1/wCYRf03HllA9RLo7Y6fE/Ju4yS6S2E9+f3W7jyUKB66XTWx013cbuMod1Frte1yzSvRFqrVY2i9WI8cAe/N3W2jGi38B/F25mIiOSn9Uxn4es9sdMXuN3HjlzAev6z2x0xe43cPWa1+mL3G7jyM5QPW9ZrY6YvcbuNmuStiZtJkeFNuR74V6qPpRVRa4Fp2GhG3XBJ87O6LNqgbHbnIk9qH7FOWw8lF0U2odTtrkWe1D9inLIeSi6KbUIMEAIUExAAAKgACkQtQKCFQCoKkKBagmYdYFBCgVDb7gfrT3YzzNPQ3C4H378HmBsls8jTuof8ACpy+XhNdKxnuVyXqZsS/+Wh1G1+R53UP+FTmMql9IR0w40XAlcxB8oGYhQAAAEAFGAZgA/qWpBmAyIABRUgqBki4ARABkbjcB9We7WeZppudwGTntJmxQNjtfkid1D/hU5fLI90lGRHojMFUvaqq5sOY6ha/JE7qH/CpzGURVs6Yo2+xZq81SD40UpAUUVIAAQAC1IABUxjCQAUEKBcwTEQAXOVFMamQFNz4P8lPaTNimlm6cH+RntNmxQNjtfked1D/AIVOXycNjpKO97WOVE9mraqi0x1On2xyPO6h/wAKnL5ZjFkY0R0NFVuBHXtaVQg+UpAUCkqALmIKkAyBCgAECAKlIAKEIAKWuAxRTICm6cH+QntNmxTS8xunB/kJ7TZsUDYra5FntQ/4VOWQIrWyUaGqLV1FRUTFix4TqVt4LEntQ/YpymFkYvY3aQYAgKKAQAAAGwqEKgAAoAZiFABQABSIpQKbrwf5Ce027FNKN14PshPabNige/bvIc/qH7FOVw8hF/DtOqW/yFP6h+w5VDyEXtbtUgwABQAIBcJAAKAAL1gAAUmYIAAAFAKBTdOD7IT2mzYppRuvB9kZ7TZsUD3roVpYE/qHbDljMhE7W+Z1K6RaXPT+pcctb9niaTfMDAAACFAEAL2AAABUBC0AhQAAAAoTEQqAXMbrwfZGe0mbFNKN04PsnP6TNige5dPgucn9Upy9v2d+m3Yp066v9m57V+aHMU+zO002KBgCFAEFQBSAAUAACkzFAAABmwApACFIXMBcxufB8vsz6dbPM0xDcuD739ND/ID3rpoMSYuenYcFiverKo1Ma0VF8jlt9SErL11b6uLqOzEvW8yfkQcZRr1xMcv4VL8nFXFCidxTs1KADjSQI64oEXw13FSVmV92jr/bduOyADjiSc2uKVmPCduMkkJ1cUnMeE7cdhAHH/R89TBJTPgu3F9Gz+aRmfBduOvgo49FkZuAy/jSseGytL58NUT9TLiE50SY6/mnbjrkaDDjwXwozEfDelHNclUVDw3WRaENOLQ4sGYkkX2WRnuR17+65URaon65wOfNk5p7Uc2Wiqi4UVGLhLxKb6NG7im7rYFo1XDKXuJtYr6o3mrTCPQFoX199ErrX7gNI4lN9GjdxRxOa6NG7im7+gLQTE2TTDXBFfuK2w7RY6+RsrVP+5/+oGj8Umejxe4o4rM/wIvcXcby+xbSetVSW7EjvT/ExWw7RwezAwc0w/8A1A1Gz5X6RWZY5rWJfXrmL7XUbVcXBbAnLRYxasVGK3AqYPaP2bY9ptiXyMll9lG0+Wdzr/x6z77GkJqWmo8eaSG2/Y1jWsersSqtcSc4H//Z';
+
+// Build plate corners/positions relative to plate area (as % of plate width/height)
+// Plate orientation: notch at top (back of printer), front at bottom
+// BL = X=0,Y=0 (front-left) = SVG bottom-left
+// 8 points clockwise: TL, TM, TR, MR, BR, BM, BL, ML
+const PLATE_CORNERS = [
+    { pct: [8, 8],   label: 'TL', desc: 'Top-Left' },
+    { pct: [50, 8],  label: 'TM', desc: 'Top-Mid' },
+    { pct: [92, 8],  label: 'TR', desc: 'Top-Right' },
+    { pct: [92, 50], label: 'MR', desc: 'Mid-Right' },
+    { pct: [92, 92], label: 'BR', desc: 'Bot-Right' },
+    { pct: [50, 92], label: 'BM', desc: 'Bot-Mid' },
+    { pct: [8, 92],  label: 'BL', desc: 'Bot-Left' },
+    { pct: [8, 50],  label: 'ML', desc: 'Mid-Left' }
+];
+
+const PLATE_POSITIONS = {
+    center:       { pct: [50, 50] },
+    top_left:     { pct: [15, 15] },
+    top_right:    { pct: [85, 15] },
+    bottom_left:  { pct: [15, 85] },
+    bottom_right: { pct: [85, 85] }
+};
+
+function buildPlateDiagram(step) {
+    const info = getStepInfo(step);
+    const S = 140;  // diagram size px
+
+    let markers = '';
+
+    if (info.type === 'corners') {
+        // Draw outline connecting defined corners
+        if (corners.length >= 2) {
+            let path = 'M';
+            for (let i = 0; i < corners.length && i < NUM_CORNERS; i++) {
+                const cp = PLATE_CORNERS[i];
+                const [px, py] = [cp.pct[0] * S / 100, cp.pct[1] * S / 100];
+                path += (i === 0 ? '' : 'L') + px + ',' + py;
+            }
+            if (corners.length >= NUM_CORNERS) path += 'Z';
+            markers += '<path d="'+path+'" fill="none" stroke="#4CAF50" stroke-width="1" stroke-dasharray="3,2" opacity="0.5"/>';
+        }
+        // Show all 8 points numbered, highlight current one to click
+        PLATE_CORNERS.forEach((cp, i) => {
+            const [cx, cy] = [cp.pct[0] * S / 100, cp.pct[1] * S / 100];
+            const done = i < corners.length;
+            const active = i === corners.length;
+            const color = done ? '#4CAF50' : (active ? '#fff' : '#555');
+            const r = active ? 6 : (done ? 4 : 3);
+            markers += '<circle cx="'+cx+'" cy="'+cy+'" r="'+r+'" fill="'+color+'" opacity="'+(active?1:0.6)+'"/>';
+            if (active) {
+                markers += '<circle cx="'+cx+'" cy="'+cy+'" r="10" fill="none" stroke="'+color+'" stroke-width="1.5" stroke-dasharray="3,2"/>';
+            }
+            // Only show label for active and adjacent points to avoid clutter
+            if (active || done) {
+                const ty = cy < S/2 ? cy + r + 9 : cy - r - 3;
+                markers += '<text x="'+cx+'" y="'+ty+'" fill="'+color+'" font-size="7" font-weight="bold" text-anchor="middle">'+(i+1)+'</text>';
+            }
+        });
+    }
+    else if (info.type === 'nozzle' && info.pos) {
+        const pp = PLATE_POSITIONS[info.pos];
+        if (pp) {
+            const [cx, cy] = [pp.pct[0] * S / 100, pp.pct[1] * S / 100];
+            // Show all positions dimmed
+            for (const [, p] of Object.entries(PLATE_POSITIONS)) {
+                const [px, py] = [p.pct[0]*S/100, p.pct[1]*S/100];
+                markers += '<circle cx="'+px+'" cy="'+py+'" r="3" fill="#555" opacity="0.4"/>';
+            }
+            // Highlight active
+            markers += '<circle cx="'+cx+'" cy="'+cy+'" r="8" fill="#2196F3" opacity="0.7"/>';
+            markers += '<line x1="'+(cx-12)+'" y1="'+cy+'" x2="'+(cx+12)+'" y2="'+cy+'" stroke="#fff" stroke-width="1"/>';
+            markers += '<line x1="'+cx+'" y1="'+(cy-12)+'" x2="'+cx+'" y2="'+(cy+12)+'" stroke="#fff" stroke-width="1"/>';
+        }
+    }
+    else if (info.type === 'z_markers') {
+        const refs = getZRefCorners();
+        // Show all corners dimmed
+        PLATE_CORNERS.forEach((cp, i) => {
+            const [px, py] = [cp.pct[0]*S/100, cp.pct[1]*S/100];
+            markers += '<circle cx="'+px+'" cy="'+py+'" r="3" fill="#555" opacity="0.4"/>';
+        });
+        // Highlight all 3 reference positions
+        refs.forEach((ref, i) => {
+            const pc = PLATE_CORNERS[ref.idx];
+            const [cx, cy] = [pc.pct[0] * S / 100, pc.pct[1] * S / 100];
+            const color = zMarkerDetected[i] ? '#4CAF50' : '#f0ad4e';
+            markers += '<circle cx="'+cx+'" cy="'+cy+'" r="8" fill="'+color+'" opacity="0.7"/>';
+            markers += '<text x="'+cx+'" y="'+(cy+4)+'" fill="#fff" font-size="8" font-weight="bold" text-anchor="middle">'+(i+1)+'</text>';
+        });
+    }
+    else if (info.type === 'spaghetti' && info.pos) {
+        const pp = PLATE_POSITIONS[info.pos];
+        if (pp) {
+            const [cx, cy] = [pp.pct[0] * S / 100, pp.pct[1] * S / 100];
+            // Show all positions dimmed
+            for (const [, p] of Object.entries(PLATE_POSITIONS)) {
+                const [px, py] = [p.pct[0]*S/100, p.pct[1]*S/100];
+                markers += '<circle cx="'+px+'" cy="'+py+'" r="3" fill="#555" opacity="0.4"/>';
+            }
+            // Highlight area
+            const r = info.size === 'huge' ? 18 : (info.size === 'medium' ? 13 : 9);
+            markers += '<circle cx="'+cx+'" cy="'+cy+'" r="'+r+'" fill="#f0ad4e" opacity="0.35" stroke="#f0ad4e" stroke-width="1.5"/>';
+            markers += '<text x="'+cx+'" y="'+(cy+4)+'" fill="#fff" font-size="8" font-weight="bold" text-anchor="middle">'+SIZE_LABELS[info.size]+'</text>';
+        }
+    }
+    else {
+        return '';
+    }
+
+    return '<div class="plate-diagram">' +
+        '<img src="'+PLATE_IMG+'" alt="Build plate">' +
+        '<svg viewBox="0 0 '+S+' '+S+'" xmlns="http://www.w3.org/2000/svg">' +
+        markers + '</svg></div>';
+}
+
+// ============================================================
+// Camera Stream
+// ============================================================
+const camImg = document.getElementById('camera-img');
+let camLoading = false;
+
+function refreshCamera() {
+    if (camLoading) return;
+    camLoading = true;
+    const img = new Image();
+    img.onload = function() {
+        camImg.src = img.src;
+        camLoading = false;
+        // Redraw overlay after each frame (resizeCanvas inside drawOverlay
+        // only updates dimensions when they actually change)
+        drawOverlay(lastHeatmap);
+        setTimeout(refreshCamera, 200);
+    };
+    img.onerror = function() {
+        camLoading = false;
+        setTimeout(refreshCamera, 1000);
+    };
+    img.src = 'http://' + location.hostname + ':' + STREAMING_PORT + '/snapshot?t=' + Date.now();
+}
+
+// ============================================================
+// Canvas Overlay
+// ============================================================
+const canvas = document.getElementById('overlay-canvas');
+const ctx = canvas.getContext('2d');
+
+function resizeCanvas() {
+    const wrap = document.getElementById('camera-wrap');
+    const rect = wrap.getBoundingClientRect();
+    const newW = Math.round(rect.width);
+    const newH = Math.round(rect.height);
+    // Only update dimensions when changed (setting canvas.width clears content)
+    if (canvas.width !== newW || canvas.height !== newH) {
+        canvas.width = newW;
+        canvas.height = newH;
+    }
+}
+
+function drawOverlay(heatmap) {
+    resizeCanvas();
+    const w = canvas.width, h = canvas.height;
+    ctx.clearRect(0, 0, w, h);
+
+    // Draw heatmap grid if available (dynamic rows/cols)
+    const hmRows = heatmap ? heatmap.length : 0;
+    const hmCols = hmRows > 0 ? heatmap[0].length : 0;
+    if (heatmap && hmRows >= 7) {
+        // Heatmap covers the center-crop region, not the full image
+        const cropX = crop.x * w, cropY = crop.y * h;
+        const cropW = crop.w * w, cropH = crop.h * h;
+        for (let r = 0; r < hmRows; r++) {
+            for (let c = 0; c < hmCols; c++) {
+                const cellIdx = r * hmCols + c;
+                const isMasked = maskVisible && isCellMasked(cellIdx, hmCols);
+                const val = heatmap[r][c];
+
+                const x1 = cropX + (c / hmCols) * cropW;
+                const y1 = cropY + (r / hmRows) * cropH;
+                const cw = cropW / hmCols;
+                const ch = cropH / hmRows;
+
+                // Color fill based on value
+                if (isMasked) {
+                    // Masked (excluded) cell: dark overlay + diagonal slash
+                    ctx.fillStyle = 'rgba(0, 0, 0, 0.35)';
+                    ctx.fillRect(x1, y1, cw, ch);
+                    ctx.strokeStyle = 'rgba(255, 80, 80, 0.4)';
+                    ctx.lineWidth = 1;
+                    ctx.beginPath();
+                    ctx.moveTo(x1, y1); ctx.lineTo(x1 + cw, y1 + ch);
+                    ctx.stroke();
+                } else if (val > 0.1) {
+                    const intensity = Math.min(val / 0.5, 1);
+                    ctx.fillStyle = 'rgba(255, 50, 50, ' + (0.15 + intensity * 0.35) + ')';
+                    ctx.fillRect(x1, y1, cw, ch);
+                } else if (val > -0.1) {
+                    ctx.fillStyle = 'rgba(255, 200, 50, 0.15)';
+                    ctx.fillRect(x1, y1, cw, ch);
+                } else {
+                    ctx.fillStyle = 'rgba(50, 200, 50, 0.1)';
+                    ctx.fillRect(x1, y1, cw, ch);
+                }
+
+                // Cell value text (hide on dense grids)
+                if (hmCols <= 7) {
+                    ctx.fillStyle = isMasked ? 'rgba(255,255,255,0.2)' : 'rgba(255,255,255,0.5)';
+                    ctx.font = '10px monospace';
+                    ctx.textAlign = 'center';
+                    ctx.fillText(val.toFixed(2), x1 + cw/2, y1 + ch/2 + 4);
+                }
+            }
+        }
+    }
+
+    // Draw bed outline (8-point polygon)
+    if (corners.length >= NUM_CORNERS) {
+        ctx.strokeStyle = '#4CAF50';
+        ctx.lineWidth = 2;
+        ctx.setLineDash([]);
+        ctx.beginPath();
+        ctx.moveTo(corners[0].x * w, corners[0].y * h);
+        for (let i = 1; i < NUM_CORNERS; i++) {
+            ctx.lineTo(corners[i].x * w, corners[i].y * h);
+        }
+        ctx.closePath();
+        ctx.stroke();
+    }
+
+    // Draw corner/edge dots
+    const cornerLabels = ['TL', 'TM', 'TR', 'MR', 'BR', 'BM', 'BL', 'ML'];
+    corners.forEach((c, i) => {
+        if (i >= NUM_CORNERS) return;
+        const isCorner = (i % 2 === 0);  // TL,TR,BR,BL are corners; TM,MR,BM,ML are midpoints
+        ctx.fillStyle = isCorner ? '#4CAF50' : '#8BC34A';
+        ctx.beginPath();
+        ctx.arc(c.x * w, c.y * h, isCorner ? 5 : 4, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = '#fff';
+        ctx.font = 'bold 9px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText(cornerLabels[i], c.x * w, c.y * h - 8);
+    });
+
+    // Draw expected position marker for spaghetti/nozzle steps
+    const info = currentStep >= 0 ? getStepInfo(currentStep) : null;
+    if (info && (info.type === 'spaghetti' || info.type === 'nozzle') && corners.length === NUM_CORNERS) {
+        const uv = getPositionUV(info.pos);
+        const cam = bedToCamera(uv.u, uv.v);
+
+        // Highlight expected cell area (within crop region)
+        const cellC = Math.floor((cam.x - crop.x) / crop.w * GRID_W);
+        const cellR = Math.floor((cam.y - crop.y) / crop.h * GRID_H);
+        const mCropX = crop.x * w, mCropY = crop.y * h;
+        const mCropW = crop.w * w, mCropH = crop.h * h;
+        for (let dr = -1; dr <= 1; dr++) {
+            for (let dc = -1; dc <= 1; dc++) {
+                const r = cellR + dr, c = cellC + dc;
+                if (r < 0 || r >= GRID_H || c < 0 || c >= GRID_W) continue;
+                const x1 = mCropX + (c / GRID_W) * mCropW;
+                const y1 = mCropY + (r / GRID_H) * mCropH;
+                ctx.strokeStyle = dr === 0 && dc === 0 ? '#fff' : 'rgba(255,255,255,0.4)';
+                ctx.lineWidth = dr === 0 && dc === 0 ? 2 : 1;
+                ctx.setLineDash([4, 4]);
+                ctx.strokeRect(x1 + 1, y1 + 1, mCropW/GRID_W - 2, mCropH/GRID_H - 2);
+            }
+        }
+        ctx.setLineDash([]);
+
+        // Crosshair
+        ctx.strokeStyle = '#fff';
+        ctx.lineWidth = 1;
+        const cx = cam.x * w, cy = cam.y * h;
+        ctx.beginPath();
+        ctx.moveTo(cx - 12, cy); ctx.lineTo(cx + 12, cy);
+        ctx.moveTo(cx, cy - 12); ctx.lineTo(cx, cy + 12);
+        ctx.stroke();
+    }
+}
+
+function toggleMask() {
+    maskVisible = !maskVisible;
+    document.getElementById('btn-mask-toggle').textContent = 'Mask: ' + (maskVisible ? 'ON' : 'OFF');
+    drawOverlay(lastHeatmap);
+}
+
+// Handle mask with BigInt for 196-bit values
+let activeMaskOverride = 0n;  // set by Z-review slider (BigInt)
+
+function isCellMasked(cellIdx, gridW) {
+    const activeMask = activeMaskOverride || mask;
+    if (activeMask === 0n || activeMask === 0) return false;
+    try {
+        const m = typeof activeMask === 'bigint' ? activeMask : BigInt(activeMask);
+        return !(m & (1n << BigInt(cellIdx)));
+    } catch(e) {
+        return false;
+    }
+}
+
+// Point-in-polygon (ray casting) — client-side preview mask computation
+function pointInPolygon(px, py, pts) {
+    let inside = false;
+    for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+        const xi = pts[i].x, yi = pts[i].y;
+        const xj = pts[j].x, yj = pts[j].y;
+        if (((yi > py) !== (yj > py)) && (px < (xj - xi) * (py - yi) / (yj - yi) + xi))
+            inside = !inside;
+    }
+    return inside;
+}
+
+function computePreviewMask() {
+    if (corners.length < NUM_CORNERS) return 0n;
+    let m = 0n;
+    for (let r = 0; r < GRID_H; r++) {
+        for (let c = 0; c < GRID_W; c++) {
+            let inside = 0;
+            for (let sr = 0; sr < 3; sr++) {
+                for (let sc = 0; sc < 3; sc++) {
+                    const sx = crop.x + (c + (sc + 0.5) / 3) / GRID_W * crop.w;
+                    const sy = crop.y + (r + (sr + 0.5) / 3) / GRID_H * crop.h;
+                    if (pointInPolygon(sx, sy, corners)) inside++;
+                }
+            }
+            if (inside >= 3) m |= (1n << BigInt(r * GRID_W + c));
+        }
+    }
+    return m;
+}
+
+// ============================================================
+// Corner Click Handling
+// ============================================================
+const clickLayer = document.getElementById('click-layer');
+clickLayer.addEventListener('click', function(e) {
+    if (currentStep !== 0) return;
+    if (corners.length >= NUM_CORNERS) return;
+
+    const rect = e.target.getBoundingClientRect();
+    const x = (e.clientX - rect.left) / rect.width;
+    const y = (e.clientY - rect.top) / rect.height;
+
+    corners.push({ x: x, y: y });
+    drawOverlay(lastHeatmap);
+    updateCornerInstructions();
+
+    if (corners.length === NUM_CORNERS) {
+        mask = computePreviewMask();  // BigInt
+        document.getElementById('btn-next').disabled = false;
+        document.getElementById('btn-next').textContent = 'Confirm Corners';
+        drawOverlay(lastHeatmap);
+    }
+});
+
+function setInstructions(html) {
+    const diagram = (currentStep >= 0 && currentStep <= 23) ? buildPlateDiagram(currentStep) : '';
+    document.getElementById('step-instructions').innerHTML = diagram + html;
+}
+
+function updateCornerInstructions() {
+    const labels = ['top-left (TL)', 'top-mid (TM)', 'top-right (TR)', 'mid-right (MR)',
+                    'bottom-right (BR)', 'bottom-mid (BM)', 'bottom-left (BL)', 'mid-left (ML)'];
+    if (corners.length >= NUM_CORNERS) {
+        setInstructions('All ' + NUM_CORNERS + ' points defined. Click <strong>Confirm Corners</strong> to continue, or <strong>Reset</strong> to redo.');
+    } else {
+        setInstructions('Click the <strong>' + labels[corners.length] + '</strong> edge of the build plate.<br>' +
+                       'Points defined: ' + corners.length + '/' + NUM_CORNERS);
+    }
+}
+
+// ============================================================
+// API Calls
+// ============================================================
+const BASE = 'http://' + location.hostname + ':' + CONTROL_PORT;
+
+async function apiPost(endpoint, data) {
+    try {
+        const resp = await fetch(BASE + endpoint, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(data)
+        });
+        return await resp.json();
+    } catch(e) {
+        console.error('API error:', endpoint, e);
+        return { status: 'error', message: e.message };
+    }
+}
+
+async function apiGet(endpoint) {
+    try {
+        const resp = await fetch(BASE + endpoint);
+        return await resp.json();
+    } catch(e) {
+        console.error('API error:', endpoint, e);
+        return null;
+    }
+}
+
+async function autoDetectBedSize() {
+    try {
+        const resp = await fetch('http://' + location.hostname + ':7125/printer/objects/query?toolhead=axis_maximum,axis_minimum');
+        const d = await resp.json();
+        const th = d.result?.status?.toolhead;
+        if (!th) return;
+        const axMax = th.axis_maximum || [0,0,0,0];
+        const axMin = th.axis_minimum || [0,0,0,0];
+        const common = [200, 220, 235, 250, 300, 350];
+        for (const [i, label] of [[0,'X'],[1,'Y']]) {
+            const travel = axMax[i] - axMin[i];
+            const bed = common.filter(s => s <= travel).pop() || Math.round(travel);
+            if (i === 0) bedX = bed;
+            else bedY = bed;
+        }
+        bedSizeAutoDetected = true;
+        console.log('Bed size auto-detected:', bedX, 'x', bedY);
+    } catch(e) {
+        console.warn('Bed size auto-detect failed, using defaults:', e);
+    }
+}
+
+async function saveCorners() {
+    const flat = [];
+    corners.forEach(c => { flat.push(c.x); flat.push(c.y); });
+    // Pad to 16 floats if fewer points (backward compat)
+    while (flat.length < 16) flat.push(0);
+    const resp = await apiPost('/api/setup/corners', {
+        corners: flat, bed_size_x: bedX, bed_size_y: bedY
+    });
+    if (resp && resp.mask !== undefined) {
+        mask = typeof resp.mask === 'string' ? hexMaskToBigInt(resp.mask) : BigInt(resp.mask);
+    }
+    return resp;
+}
+
+async function sendGcode(gcode) {
+    return apiPost('/api/setup/gcode', { gcode: gcode });
+}
+
+async function ensureLedOn() {
+    try { await fetch(BASE + '/api/led/on'); } catch(e) {}
+}
+
+async function startSetupMode() {
+    return apiPost('/api/setup/start', {});
+}
+
+async function stopSetupMode() {
+    return apiPost('/api/setup/stop', {});
+}
+
+async function recordVerification(step, data) {
+    return apiPost('/api/setup/verify', { step: step, ...data });
+}
+
+async function completeSetup() {
+    return apiPost('/api/setup/complete', {});
+}
+
+async function resetSetup() {
+    return apiPost('/api/setup/reset', {});
+}
+
+async function initTraining(cleanup) {
+    return apiPost('/api/setup/init_training', { cleanup: !!cleanup });
+}
+
+async function saveTrainingImage(folder) {
+    return apiPost('/api/setup/save_image', { folder: folder });
+}
+
+async function recordZScanEntry(z_mm, mask_val) {
+    const hexMask = typeof mask_val === 'bigint' ? bigIntToHexMask(mask_val) : bigIntToHexMask(BigInt(mask_val));
+    return apiPost('/api/setup/z_scan', { z_mm: z_mm, mask: hexMask });
+}
+
+async function finalizeZMasks() {
+    return apiPost('/api/setup/z_masks_complete', {});
+}
+
+async function resetZMasks() {
+    return apiPost('/api/setup/z_masks_reset', {});
+}
+
+// Auto-detect 3 camera-facing reference points from the 8-point polygon
+function getZRefCorners() {
+    if (corners.length < NUM_CORNERS) return [];
+    // 4 sides of the plate, each with 3 points (corner, midpoint, corner)
+    const sides = [
+        [0, 1, 2],  // top: TL, TM, TR
+        [2, 3, 4],  // right: TR, MR, BR
+        [4, 5, 6],  // bottom: BR, BM, BL
+        [6, 7, 0]   // left: BL, ML, TL
+    ];
+    // Pick the side with highest average camera Y (bottom of frame = facing camera)
+    let bestSide = 0, bestAvgY = -1;
+    for (let s = 0; s < sides.length; s++) {
+        const avgY = sides[s].reduce((sum, idx) => sum + corners[idx].y, 0) / 3;
+        if (avgY > bestAvgY) { bestAvgY = avgY; bestSide = s; }
+    }
+    return sides[bestSide].map(idx => ({ idx, label: PLATE_CORNERS[idx].label, y: corners[idx].y }));
+}
+
+// Get expected heatmap cell for a corner point
+function getCornerCell(cornerIdx) {
+    const c = corners[cornerIdx];
+    const col = Math.floor((c.x - crop.x) / crop.w * GRID_W);
+    const row = Math.floor((c.y - crop.y) / crop.h * GRID_H);
+    return { row: Math.max(0, Math.min(row, GRID_H - 1)), col: Math.max(0, Math.min(col, GRID_W - 1)) };
+}
+
+// Determine expansion direction for Z-scan: from polygon centroid toward camera-facing edge.
+// Returns {dr, dc} — the dominant grid direction to expand the mask.
+function getExpansionDirection() {
+    if (corners.length < NUM_CORNERS) return { dr: 1, dc: 0 };
+    // Centroid of all 8 polygon points in grid coords (within crop region)
+    let allR = 0, allC = 0;
+    for (let i = 0; i < corners.length; i++) {
+        allR += (corners[i].y - crop.y) / crop.h * GRID_H;
+        allC += (corners[i].x - crop.x) / crop.w * GRID_W;
+    }
+    allR /= corners.length;
+    allC /= corners.length;
+    // Centroid of the 3 camera-facing reference points
+    const refs = getZRefCorners();
+    let refR = 0, refC = 0;
+    for (const ref of refs) {
+        refR += (corners[ref.idx].y - crop.y) / crop.h * GRID_H;
+        refC += (corners[ref.idx].x - crop.x) / crop.w * GRID_W;
+    }
+    refR /= refs.length;
+    refC /= refs.length;
+    // Direction from centroid toward camera-facing edge, quantize to dominant axis
+    const deltaR = refR - allR;
+    const deltaC = refC - allC;
+    if (Math.abs(deltaR) >= Math.abs(deltaC)) {
+        return { dr: deltaR > 0 ? 1 : -1, dc: 0 };
+    } else {
+        return { dr: 0, dc: deltaC > 0 ? 1 : -1 };
+    }
+}
+
+// Expand Z-scan mask by one layer in the camera-facing direction.
+// Only cells immediately adjacent to the current mask boundary in the expansion direction
+// are evaluated. A cell is added if it shows activation (spaghetti visible).
+// Top, bottom, and opposite sides are never modified.
+function expandZScanMask(heatmap, currentMask, expansionDir, activationThreshold) {
+    if (!heatmap || heatmap.length !== GRID_H) return currentMask;
+    let newMask = BigInt(currentMask);
+    const cm = BigInt(currentMask);
+    const { dr, dc } = expansionDir;
+    for (let r = 0; r < GRID_H; r++) {
+        for (let c = 0; c < GRID_W; c++) {
+            const bit = 1n << BigInt(r * GRID_W + c);
+            if ((cm & bit) !== 0n) continue;  // already in mask
+            // Check if this cell is adjacent to the mask boundary in the OPPOSITE direction
+            // (i.e., the cell "behind" it in the expansion direction is in the mask)
+            const behindR = r - dr, behindC = c - dc;
+            if (behindR < 0 || behindR >= GRID_H || behindC < 0 || behindC >= GRID_W) continue;
+            const behindBit = 1n << BigInt(behindR * GRID_W + behindC);
+            if ((cm & behindBit) === 0n) continue;  // not adjacent to mask boundary
+            // This cell is just beyond the mask edge in the expansion direction
+            // Add it if it shows spaghetti activation
+            if (heatmap[r][c] > activationThreshold) {
+                newMask |= bit;
+            }
+        }
+    }
+    return newMask;
+}
+
+// Check if reference cells are all below threshold (checks ±1 neighborhood max)
+function refCellsGone(heatmap, refCells, threshold) {
+    if (!heatmap || !refCells.length) return false;
+    for (const rc of refCells) {
+        // Find max activation in ±1 neighborhood
+        let maxVal = -999;
+        for (let dr = -1; dr <= 1; dr++) {
+            for (let dc = -1; dc <= 1; dc++) {
+                const r = rc.row + dr, c = rc.col + dc;
+                if (r >= 0 && r < GRID_H && c >= 0 && c < GRID_W) {
+                    if (heatmap[r][c] > maxVal) maxVal = heatmap[r][c];
+                }
+            }
+        }
+        if (maxVal > threshold) return false;
+    }
+    return true;
+}
+
+// Get the max activation in ±1 neighborhood for each reference cell (for debug feedback)
+function refCellValues(heatmap, refCells) {
+    if (!heatmap || !refCells.length) return [];
+    return refCells.map(rc => {
+        let maxVal = -999;
+        for (let dr = -1; dr <= 1; dr++) {
+            for (let dc = -1; dc <= 1; dc++) {
+                const r = rc.row + dr, c = rc.col + dc;
+                if (r >= 0 && r < GRID_H && c >= 0 && c < GRID_W) {
+                    if (heatmap[r][c] > maxVal) maxVal = heatmap[r][c];
+                }
+            }
+        }
+        return maxVal;
+    });
+}
+
+// Get Z-mask for a given height (binary search, client-side)
+function getZMaskForHeight(z) {
+    if (!zMasks || zMasks.length === 0) return mask;
+    let best = -1;
+    let lo = 0, hi = zMasks.length - 1;
+    while (lo <= hi) {
+        const mid = Math.floor((lo + hi) / 2);
+        if (zMasks[mid][0] <= z) { best = mid; lo = mid + 1; }
+        else hi = mid - 1;
+    }
+    return best >= 0 ? zMasks[best][1] : zMasks[0][1];
+}
+
+// Z-review slider label update
+function updateZReviewLabel(z) {
+    const label = document.getElementById('z-review-label');
+    const zmask = getZMaskForHeight(z);
+    const bm = BigInt(zmask);
+    let active = 0;
+    for (let i = 0; i < GRID_TOTAL; i++) {
+        if (bm & (1n << BigInt(i))) active++;
+    }
+    label.textContent = 'Z = ' + z + 'mm — ' + active + '/' + GRID_TOTAL + ' cells active';
+}
+
+// Abort handler for long-running operations
+function requestAbort() {
+    abortRequested = true;
+    const btnStop = document.getElementById('btn-stop');
+    btnStop.disabled = true;
+    btnStop.textContent = 'Stopping...';
+    const fb = document.getElementById('detection-feedback');
+    fb.textContent = 'Stop requested — finishing current move...';
+    fb.className = 'detection-feedback feedback-active';
+}
+
+// Run the automated Z-scan
+async function runZScan() {
+    zScanRunning = true;
+    abortRequested = false;
+    const btnNext = document.getElementById('btn-next');
+    const btnSkip = document.getElementById('btn-skip');
+    const btnStop = document.getElementById('btn-stop');
+    const fb = document.getElementById('detection-feedback');
+    btnNext.textContent = 'Scanning...';
+    btnNext.disabled = true;
+    btnSkip.style.display = 'none';
+    btnStop.style.display = 'inline-block';
+    btnStop.disabled = false;
+    btnStop.textContent = 'Stop';
+    fb.style.display = 'block';
+    fb.className = 'detection-feedback feedback-waiting';
+
+    // Determine reference cells (from z_markers verification or default from corners)
+    const refs = getZRefCorners();
+    const refCells = [];
+    for (let i = 0; i < refs.length; i++) {
+        if (zRefCells[i]) {
+            refCells.push(zRefCells[i]);
+        } else {
+            refCells.push(getCornerCell(refs[i].idx));
+        }
+    }
+
+    try {
+        // Get bed max Z from Moonraker, cap at reasonable scan limit
+        let maxZ = 250;  // default
+        try {
+            const resp = await fetch('http://' + location.hostname + ':7125/printer/objects/query?toolhead=axis_maximum');
+            const d = await resp.json();
+            const axMax = d.result?.status?.toolhead?.axis_maximum;
+            if (axMax && axMax[2]) maxZ = Math.floor(axMax[2]);
+        } catch(e) {}
+        const SCAN_MAX_Z = Math.min(maxZ, 120);  // never scan beyond 120mm — spaghetti always gone by then
+
+        // Step 1: Go to Z=2 (no G28 — printer already homed in step 0, spaghetti on bed)
+        fb.textContent = 'Moving to Z=2...';
+        await sendGcode('G90\nG1 Z2 F500');
+        await waitForGcodeComplete(30000);
+        await new Promise(r => setTimeout(r, 3000));
+
+        if (abortRequested) throw { aborted: true };
+
+        // Step 2: Record baseline mask at Z=2
+        fb.textContent = 'Recording baseline at Z=2...';
+        await ensureLedOn();
+        let heatmap = null;
+        for (let poll = 0; poll < 3; poll++) {
+            const status = await apiGet('/api/setup/status');
+            if (status && status.heatmap) { heatmap = status.heatmap; lastHeatmap = heatmap; drawOverlay(heatmap); }
+            await new Promise(r => setTimeout(r, 1500));
+        }
+
+        if (abortRequested) throw { aborted: true };
+
+        const baseMask = mask;  // use the polygon-derived mask
+        let accumulatedMask = baseMask;  // grows monotonically toward camera-facing side
+        const expansionDir = getExpansionDirection();
+        await recordZScanEntry(2, baseMask);
+        zMasks.push([2, baseMask]);
+
+        // Step 3: Scan upward
+        // As Z increases, bed lowers and camera sees more of the camera-facing edge.
+        // Only cells adjacent to the mask boundary in the camera direction are evaluated.
+        // Top, opposite-side, and lateral edges never change.
+        // Mask is cumulative: once a cell is added it stays in all subsequent Z levels.
+        // Scan stops when reference spaghetti markers leave the camera view entirely.
+        let consecutiveGone = 0;
+        const STOP_THRESHOLD = 0.05;   // stop when ref neighborhood max drops below this (noise floor)
+        const ACTIVATION_THRESHOLD = 0.0; // add cell when it shows any positive activation
+
+        for (let z = Z_STEP_MM; z <= SCAN_MAX_Z; z += Z_STEP_MM) {
+            if (abortRequested) {
+                zScanMaxZ = z - Z_STEP_MM;
+                break;
+            }
+
+            fb.textContent = 'Z=' + z + 'mm — moving bed...';
+            const dirLabel = expansionDir.dr > 0 ? '+row' : expansionDir.dr < 0 ? '-row' : expansionDir.dc > 0 ? '+col' : '-col';
+            setInstructions(
+                '<strong>Auto Z-Scan in progress</strong><br>' +
+                'Current height: Z=' + z + 'mm<br>' +
+                'Scanned ' + zMasks.length + ' levels. Expand dir: ' + dirLabel + '<br>' +
+                'Reference cells: ' + refCells.map(rc => '['+rc.row+','+rc.col+']').join(', '));
+
+            await sendGcode('G1 Z' + z + ' F500');
+            await waitForGcodeComplete(30000);
+
+            if (abortRequested) {
+                zScanMaxZ = z;
+                break;
+            }
+
+            await new Promise(r => setTimeout(r, 2000));  // settle time
+
+            // Ensure LED stays on at every scan level
+            await ensureLedOn();
+
+            // Poll heatmap 3 times
+            heatmap = null;
+            for (let poll = 0; poll < 3; poll++) {
+                if (abortRequested) break;
+                const status = await apiGet('/api/setup/status');
+                if (status && status.heatmap) { heatmap = status.heatmap; lastHeatmap = heatmap; drawOverlay(heatmap); }
+                await new Promise(r => setTimeout(r, 1500));
+            }
+
+            if (abortRequested) {
+                zScanMaxZ = z;
+                break;
+            }
+
+            if (!heatmap) {
+                fb.textContent = 'Z=' + z + 'mm — no heatmap data, skipping';
+                continue;
+            }
+
+            // Check if all reference cells are gone
+            const refVals = refCellValues(heatmap, refCells);
+            const refValStr = refCells.map((rc, i) => '[' + rc.row + ',' + rc.col + ']=' + refVals[i].toFixed(2)).join('  ');
+
+            if (refCellsGone(heatmap, refCells, STOP_THRESHOLD)) {
+                consecutiveGone++;
+                fb.textContent = 'Z=' + z + 'mm — markers leaving view (' + consecutiveGone + '/2)  Ref: ' + refValStr;
+                fb.className = 'detection-feedback feedback-active';
+                if (consecutiveGone >= 2) {
+                    fb.textContent = 'Z=' + z + 'mm — all markers out of view. Scan complete.';
+                    zScanMaxZ = z;
+                    break;
+                }
+            } else {
+                consecutiveGone = 0;
+                fb.textContent = 'Z=' + z + 'mm — Ref: ' + refValStr;
+                fb.className = 'detection-feedback feedback-waiting';
+            }
+
+            // Expand mask by one layer in the camera-facing direction
+            // Only boundary-adjacent cells showing activation get added; other sides untouched
+            const newMask = expandZScanMask(heatmap, accumulatedMask, expansionDir, ACTIVATION_THRESHOLD);
+            accumulatedMask = newMask;  // carry forward for next Z level
+            activeMaskOverride = newMask;
+            drawOverlay(heatmap);
+            await recordZScanEntry(z, newMask);
+            zMasks.push([z, newMask]);
+
+            // Count active cells for feedback
+            const bm = BigInt(newMask);
+            let activeCells = 0;
+            for (let i = 0; i < GRID_TOTAL; i++) { if (bm & (1n << BigInt(i))) activeCells++; }
+            fb.textContent = 'Z=' + z + 'mm — ' + activeCells + '/' + GRID_TOTAL + ' cells active  Ref: ' + refValStr;
+            zScanMaxZ = z;
+        }
+
+        // Finalize whatever we have
+        if (zMasks.length > 0) {
+            fb.textContent = 'Finalizing Z-masks...';
+            await finalizeZMasks();
+        }
+
+        // Return bed to Z=2
+        fb.textContent = 'Moving bed back to Z=2...';
+        await sendGcode('G1 Z2 F500');
+        await waitForGcodeComplete(30000);
+
+        if (abortRequested) {
+            // Partial scan — discard data and let user retry
+            fb.textContent = 'Z-scan stopped. Partial data discarded — click Start Scan to retry.';
+            fb.className = 'detection-feedback feedback-active';
+            zMasks = [];
+            await resetZMasks();
+            // Do NOT set stepResults — keeps this step "incomplete" for resume
+            btnNext.textContent = 'Start Scan';
+            btnNext.disabled = false;
+            btnNext.onclick = nextStep;
+            btnSkip.style.display = 'inline-block';
+            btnSkip.textContent = 'Skip Z-Scan';
+            btnSkip.onclick = skipStep;
+        } else {
+            fb.textContent = 'Z-scan complete! ' + zMasks.length + ' levels recorded (2 to ' + zScanMaxZ + 'mm).';
+            fb.className = 'detection-feedback feedback-pass';
+            stepResults[currentStep] = { result: 'pass', levels: zMasks.length, max_z: zScanMaxZ };
+            recordVerification(currentStep, stepResults[currentStep]);
+            btnNext.textContent = 'Continue';
+            btnNext.disabled = false;
+            btnNext.onclick = function() { btnNext.onclick = nextStep; goToStep(currentStep + 1); };
+        }
+    } catch(e) {
+        if (e && e.aborted) {
+            // Aborted before scan loop started — return bed to Z=2
+            fb.textContent = 'Stopped. Moving bed back to Z=2...';
+            fb.className = 'detection-feedback feedback-active';
+            await sendGcode('G1 Z2 F500');
+            await waitForGcodeComplete(30000);
+            fb.textContent = 'Z-scan stopped. Click Start Scan to retry.';
+        } else {
+            fb.textContent = 'Z-scan error: ' + e.message;
+            fb.className = 'detection-feedback feedback-fail';
+        }
+        // Allow retry — don't mark step as complete
+        btnNext.textContent = 'Start Scan';
+        btnNext.disabled = false;
+        btnNext.onclick = nextStep;
+        btnSkip.style.display = 'inline-block';
+        btnSkip.textContent = 'Skip Z-Scan';
+        btnSkip.onclick = skipStep;
+    } finally {
+        zScanRunning = false;
+        abortRequested = false;
+        activeMaskOverride = 0;
+        btnStop.style.display = 'none';
+    }
+}
+
+function getStepFolder(step) {
+    const info = getStepInfo(step);
+    if (info.type === 'corners') return 'corners';
+    if (info.type === 'z_markers') return 'z_markers';
+    if (info.type === 'z_scan') return 'z_scan';
+    if (info.type === 'nozzle') return 'nozzle_' + info.pos;
+    if (info.type === 'spaghetti') return 'spaghetti_' + info.pos + '_' + info.size;
+    return null;
+}
+
+async function waitForGcodeComplete(timeoutMs) {
+    if (!timeoutMs) timeoutMs = 60000;
+    const start = Date.now();
+    // Wait a moment for gcode to start executing
+    await new Promise(r => setTimeout(r, 2000));
+    while (Date.now() - start < timeoutMs) {
+        try {
+            const resp = await fetch('http://' + location.hostname + ':7125/printer/objects/query?idle_timeout=state');
+            const d = await resp.json();
+            const state = d.result?.status?.idle_timeout?.state;
+            if (state === 'Ready') return true;
+        } catch(e) {}
+        await new Promise(r => setTimeout(r, 1000));
+    }
+    return false;  // timeout
+}
+
+// ============================================================
+// Polling
+// ============================================================
+let lastHeatmap = null;
+let ledKeepAliveCounter = 0;
+const LED_KEEPALIVE_EVERY = 20;  // re-send LED ON every 20 polls (~30s)
+
+async function pollStatus() {
+    const data = await apiGet('/api/setup/status');
+    if (!data) return;
+
+    lastHeatmap = data.heatmap || null;
+    if (data.crop) crop = data.crop;
+    drawOverlay(lastHeatmap);
+
+    // Periodically ensure LED stays on
+    if (++ledKeepAliveCounter >= LED_KEEPALIVE_EVERY) {
+        ledKeepAliveCounter = 0;
+        ensureLedOn();
+    }
+
+    // Save training images during active detection steps
+    if (currentStep >= 0 && currentStep <= 23 && data.heatmap) {
+        const folder = getStepFolder(currentStep);
+        if (folder) saveTrainingImage(folder);  // fire-and-forget
+    }
+
+    // Check auto-detection for current step
+    if (currentStep >= 1 && currentStep <= 23) {
+        checkAutoDetection(data);
+    }
+}
+
+function startPolling() {
+    if (pollTimer) return;
+    pollTimer = setInterval(pollStatus, POLL_INTERVAL);
+    pollStatus();  // immediate first poll
+}
+
+function stopPolling() {
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+}
+
+// ============================================================
+// Auto-Detection
+// ============================================================
+function checkAutoDetection(data) {
+    const info = getStepInfo(currentStep);
+    if (!info || !data.heatmap || corners.length < NUM_CORNERS) return;
+
+    const fb = document.getElementById('detection-feedback');
+
+    if (info.type === 'nozzle') {
+        // For nozzle steps: check which cells activate (within crop region)
+        const uv = getPositionUV(info.pos);
+        const cam = bedToCamera(uv.u, uv.v);
+        const hmRows = data.heatmap.length;
+        const hmCols = hmRows > 0 ? data.heatmap[0].length : GRID_W;
+        const expR = Math.floor((cam.y - crop.y) / crop.h * hmRows);
+        const expC = Math.floor((cam.x - crop.x) / crop.w * hmCols);
+
+        let maxAct = -999;
+        let actR = -1, actC = -1;
+        for (let dr = -1; dr <= 1; dr++) {
+            for (let dc = -1; dc <= 1; dc++) {
+                const r = expR + dr, c = expC + dc;
+                if (r < 0 || r >= hmRows || c < 0 || c >= hmCols) continue;
+                if (data.heatmap[r][c] > maxAct) {
+                    maxAct = data.heatmap[r][c];
+                    actR = r; actC = c;
+                }
+            }
+        }
+
+        fb.style.display = 'block';
+        fb.textContent = 'Activation: ' + maxAct.toFixed(3) + ' at [' + actR + ',' + actC + '] (expected [' + expR + ',' + expC + '])';
+        fb.className = 'detection-feedback ' + (maxAct > 0 ? 'feedback-active' : 'feedback-waiting');
+
+        if (maxAct > -0.5) {
+            consecutiveDetections++;
+        } else {
+            consecutiveDetections = 0;
+        }
+
+        if (consecutiveDetections >= 3) {
+            fb.textContent += ' — Captured!';
+            fb.className = 'detection-feedback feedback-pass';
+            stepResults[currentStep] = { result: 'pass', activation: maxAct, cell_row: actR, cell_col: actC };
+            recordVerification(currentStep, stepResults[currentStep]);
+            if (!autoAdvanceTimer) {
+                autoAdvanceTimer = setTimeout(() => { autoAdvanceTimer = null; nextStep(); }, 1500);
+            }
+        }
+    }
+    else if (info.type === 'z_markers' && spaghettiPhase === 'detect') {
+        // Z-markers: check ALL 3 reference cells simultaneously
+        const refs = getZRefCorners();
+        fb.style.display = 'block';
+        let statusParts = [];
+        let allDetected = true;
+
+        for (let i = 0; i < refs.length; i++) {
+            if (zMarkerDetected[i]) {
+                statusParts.push('Marker ' + (i+1) + ' (' + refs[i].label + '): \u2713');
+                continue;
+            }
+
+            const cell = getCornerCell(refs[i].idx);
+            const expR = cell.row, expC = cell.col;
+            let maxAct = -999;
+            let actR = -1, actC = -1;
+            // Search ±2 neighborhood (5x5) — perspective distortion at corners can shift cells
+            for (let dr = -2; dr <= 2; dr++) {
+                for (let dc = -2; dc <= 2; dc++) {
+                    const r = expR + dr, c = expC + dc;
+                    if (r < 0 || r >= GRID_H || c < 0 || c >= GRID_W) continue;
+                    if (data.heatmap[r][c] > maxAct) {
+                        maxAct = data.heatmap[r][c];
+                        actR = r; actC = c;
+                    }
+                }
+            }
+
+            if (maxAct > 0.0) {
+                zMarkerConsecutive[i]++;
+            } else {
+                zMarkerConsecutive[i] = 0;
+            }
+
+            if (zMarkerConsecutive[i] >= 2) {
+                zMarkerDetected[i] = true;
+                zRefCells[i] = { row: actR, col: actC };
+                statusParts.push(refs[i].label + ': \u2713 [' + actR + ',' + actC + ']');
+                // Refresh diagram to show green marker
+                drawOverlay(lastHeatmap);
+            } else {
+                allDetected = false;
+                statusParts.push(refs[i].label + ' exp[' + expR + ',' + expC + ']: ' +
+                    (maxAct > -900 ? maxAct.toFixed(2) : 'n/a') +
+                    (maxAct > 0.0 ? ' (' + zMarkerConsecutive[i] + '/2)' : ''));
+            }
+        }
+
+        fb.textContent = statusParts.join(' | ');
+        fb.className = 'detection-feedback ' + (allDetected ? 'feedback-pass' : 'feedback-active');
+
+        if (allDetected) {
+            if (spaghettiTimeout) { clearTimeout(spaghettiTimeout); spaghettiTimeout = null; }
+            spaghettiPhase = 'result';
+            stepResults[currentStep] = { result: 'pass', refCells: zRefCells.slice(0, refs.length) };
+            const cellLabels = refs.map((r, i) => r.label + ' [' + (zRefCells[i]?.row || '?') + ',' + (zRefCells[i]?.col || '?') + ']').join(', ');
+            setInstructions(
+                '<strong>All 3 markers detected!</strong><br>' +
+                'Cells: ' + cellLabels + '<br>' +
+                'Leave spaghetti on the bed for Z-scan.<br>' +
+                'Click <strong>Accept</strong> to continue or <strong>Retry</strong> to re-test.');
+            document.getElementById('btn-next').textContent = 'Accept';
+            document.getElementById('btn-next').disabled = false;
+            document.getElementById('btn-skip').textContent = 'Retry';
+            document.getElementById('btn-skip').onclick = retryZMarkers;
+        }
+    }
+    else if (info.type === 'spaghetti' && spaghettiPhase === 'detect') {
+        const uv = getPositionUV(info.pos);
+        const cam = bedToCamera(uv.u, uv.v);
+        const hmRows2 = data.heatmap.length;
+        const hmCols2 = hmRows2 > 0 ? data.heatmap[0].length : GRID_W;
+        const expR = Math.floor((cam.y - crop.y) / crop.h * hmRows2);
+        const expC = Math.floor((cam.x - crop.x) / crop.w * hmCols2);
+
+        let maxAct = -999;
+        let actR = -1, actC = -1;
+        for (let dr = -1; dr <= 1; dr++) {
+            for (let dc = -1; dc <= 1; dc++) {
+                const r = expR + dr, c = expC + dc;
+                if (r < 0 || r >= hmRows2 || c < 0 || c >= hmCols2) continue;
+                if (data.heatmap[r][c] > maxAct) {
+                    maxAct = data.heatmap[r][c];
+                    actR = r; actC = c;
+                }
+            }
+        }
+
+        fb.style.display = 'block';
+        const sizeLabel = SIZE_LABELS[info.size];
+        fb.textContent = sizeLabel + ' @ ' + POS_LABELS[info.pos] + ': activation=' + maxAct.toFixed(3) +
+                         ' cell=[' + actR + ',' + actC + ']';
+
+        if (maxAct > 0.0) {
+            consecutiveDetections++;
+            fb.className = 'detection-feedback feedback-active';
+            fb.textContent += ' (' + consecutiveDetections + '/2 consecutive)';
+        } else {
+            consecutiveDetections = 0;
+            fb.className = 'detection-feedback feedback-waiting';
+            fb.textContent += ' — waiting for detection...';
+        }
+
+        if (consecutiveDetections >= 2) {
+            if (spaghettiTimeout) { clearTimeout(spaghettiTimeout); spaghettiTimeout = null; }
+            spaghettiPhase = 'result';
+            fb.textContent = 'DETECTED: ' + sizeLabel + ' at ' + POS_LABELS[info.pos] +
+                             ' (activation=' + maxAct.toFixed(3) + ')';
+            fb.className = 'detection-feedback feedback-pass';
+            stepResults[currentStep] = {
+                result: 'pass', position: info.pos, size: info.size,
+                activation: maxAct, cell_row: actR, cell_col: actC
+            };
+            setInstructions(
+                '<strong>Detected!</strong> ' + sizeLabel + ' spaghetti at ' + POS_LABELS[info.pos] + '.<br>' +
+                'Activation: ' + maxAct.toFixed(3) + ' at cell [' + actR + ',' + actC + '].<br>' +
+                'Click <strong>Accept</strong> to continue or <strong>Retry</strong> to re-test.');
+            document.getElementById('btn-next').textContent = 'Accept';
+            document.getElementById('btn-next').disabled = false;
+            document.getElementById('btn-skip').textContent = 'Retry';
+            document.getElementById('btn-skip').onclick = retrySpaghetti;
+        }
+    }
+}
+
+// ============================================================
+// Spaghetti Phase Helpers
+// ============================================================
+function showSpaghettiTimeout() {
+    const stepInfo = getStepInfo(currentStep);
+    if (spaghettiPhase !== 'detect') return;
+    spaghettiPhase = 'result';
+    const fb = document.getElementById('detection-feedback');
+    fb.textContent = 'Timeout: no detection after 30s';
+    fb.className = 'detection-feedback feedback-fail';
+    setInstructions(
+        'No detection found for <strong>' + SIZE_LABELS[stepInfo.size] + '</strong> at <strong>' +
+        POS_LABELS[stepInfo.pos] + '</strong>.<br>' +
+        'You can <strong>Retry</strong>, <strong>Mark as Pass</strong>, or <strong>Mark as Failed</strong>.');
+    document.getElementById('btn-next').textContent = 'Mark Pass';
+    document.getElementById('btn-next').disabled = false;
+    document.getElementById('btn-skip').textContent = 'Retry';
+    document.getElementById('btn-skip').onclick = retrySpaghetti;
+    document.getElementById('btn-fail').style.display = 'inline-block';
+}
+
+function retrySpaghetti() {
+    const stepInfo = getStepInfo(currentStep);
+    spaghettiPhase = 'place';
+    consecutiveDetections = 0;
+    if (spaghettiTimeout) { clearTimeout(spaghettiTimeout); spaghettiTimeout = null; }
+    document.getElementById('btn-next').textContent = 'I Placed It';
+    document.getElementById('btn-next').disabled = false;
+    document.getElementById('btn-skip').textContent = 'Skip';
+    document.getElementById('btn-skip').onclick = skipStep;
+    document.getElementById('btn-fail').style.display = 'none';
+    document.getElementById('detection-feedback').style.display = 'none';
+    setInstructions(
+        'Place <strong>' + SIZE_LABELS[stepInfo.size] + '</strong> spaghetti sample at the <strong>' +
+        POS_LABELS[stepInfo.pos] + '</strong> of the bed.<br>' +
+        'Click <strong>I Placed It</strong> when ready.');
+}
+
+function retryZMarkers() {
+    spaghettiPhase = 'place';
+    consecutiveDetections = 0;
+    zMarkerConsecutive = [0, 0, 0];
+    zMarkerDetected = [false, false, false];
+    zRefCells = [];
+    if (spaghettiTimeout) { clearTimeout(spaghettiTimeout); spaghettiTimeout = null; }
+    const refs = getZRefCorners();
+    const refLabels = refs.map(r => PLATE_CORNERS[r.idx].desc).join(', ');
+    document.getElementById('btn-next').textContent = 'I Placed Them';
+    document.getElementById('btn-next').disabled = false;
+    document.getElementById('btn-skip').textContent = 'Skip';
+    document.getElementById('btn-skip').onclick = skipStep;
+    document.getElementById('btn-fail').style.display = 'none';
+    document.getElementById('detection-feedback').style.display = 'none';
+    setInstructions(
+        'Place <strong>small spaghetti</strong> samples at these 3 positions: <strong>' + refLabels + '</strong>.<br>' +
+        'Click <strong>I Placed Them</strong> when all are on the bed.');
+}
+
+function markFailed() {
+    const stepInfo = getStepInfo(currentStep);
+    if (spaghettiTimeout) { clearTimeout(spaghettiTimeout); spaghettiTimeout = null; }
+    stepResults[currentStep] = { result: 'fail', position: stepInfo.pos, size: stepInfo.size };
+    recordVerification(currentStep, stepResults[currentStep]);
+    spaghettiPhase = 'remove';
+    document.getElementById('detection-feedback').style.display = 'none';
+    document.getElementById('btn-fail').style.display = 'none';
+    setInstructions(
+        '<strong>Remove</strong> the spaghetti from the bed.<br>' +
+        'Click <strong>Removed</strong> when done.');
+    document.getElementById('btn-next').textContent = 'Removed';
+    document.getElementById('btn-next').disabled = false;
+    document.getElementById('btn-skip').style.display = 'none';
+}
+
+// ============================================================
+// Step Navigation
+// ============================================================
+async function goToStep(step) {
+    currentStep = step;
+    consecutiveDetections = 0;
+    if (autoAdvanceTimer) { clearTimeout(autoAdvanceTimer); autoAdvanceTimer = null; }
+
+    const info = getStepInfo(step);
+    const progress = Math.round(((step + 1) / TOTAL_STEPS) * 100);
+    document.getElementById('progress-fill').style.width = progress + '%';
+    document.getElementById('step-title').textContent = 'Step ' + (step + 1) + '/' + TOTAL_STEPS + ': ' + info.title;
+    document.getElementById('detection-feedback').style.display = 'none';
+
+    const btnBack = document.getElementById('btn-back');
+    const btnNext = document.getElementById('btn-next');
+    const btnSkip = document.getElementById('btn-skip');
+    const bedPanel = document.getElementById('bed-size-panel');
+    const summaryPanel = document.getElementById('summary-panel');
+
+    btnBack.disabled = (step <= 0);
+    btnSkip.style.display = 'none';
+    btnSkip.textContent = 'Skip';
+    btnSkip.onclick = skipStep;
+    bedPanel.style.display = 'none';
+    summaryPanel.style.display = 'none';
+    document.getElementById('z-review-panel').style.display = 'none';
+    activeMaskOverride = 0;
+    clickLayer.style.pointerEvents = 'none';
+    document.getElementById('btn-fail').style.display = 'none';
+    document.getElementById('btn-stop').style.display = 'none';
+    if (spaghettiTimeout) { clearTimeout(spaghettiTimeout); spaghettiTimeout = null; }
+
+    if (info.type === 'corners') {
+        cornerPhase = 'click';
+        // Initially disable clicks while homing
+        clickLayer.style.pointerEvents = 'none';
+        btnNext.textContent = 'Waiting...';
+        btnNext.disabled = true;
+
+        // If corners already set (resume), show them
+        if (corners.length >= NUM_CORNERS) {
+            clickLayer.style.pointerEvents = 'auto';
+            btnNext.textContent = 'Confirm Corners';
+            btnNext.disabled = false;
+            updateCornerInstructions();
+            drawOverlay(null);
+        } else {
+            // Home, move bed to Z=2, then park nozzle at purge/throw position
+            setInstructions('Homing printer and parking nozzle...<br>Please wait.');
+            await sendGcode('G28\nG90\nG1 Z2 F500\nTO_THROW_POSITION');
+            const ok = await waitForGcodeComplete(60000);
+            if (!ok) {
+                document.getElementById('step-instructions').innerHTML +=
+                    '<br><span style="color:#f0ad4e">G-code timeout — printer may still be moving. You can start clicking corners.</span>';
+            }
+            // Enable corner clicks
+            clickLayer.style.pointerEvents = 'auto';
+            updateCornerInstructions();
+            drawOverlay(null);
+        }
+    }
+    else if (info.type === 'z_markers') {
+        spaghettiPhase = 'place';
+        zMarkerConsecutive = [0, 0, 0];
+        zMarkerDetected = [false, false, false];
+        zRefCells = [];
+        btnNext.textContent = 'I Placed Them';
+        btnNext.disabled = false;
+        btnSkip.style.display = 'inline-block';
+        btnSkip.textContent = 'Skip';
+        btnSkip.onclick = skipStep;
+
+        await ensureLedOn();
+
+        const refs = getZRefCorners();
+        if (refs.length >= 3) {
+            const refLabels = refs.map(r => PLATE_CORNERS[r.idx].desc).join(', ');
+            setInstructions(
+                'Place <strong>small spaghetti</strong> samples at these 3 positions on the build plate:<br>' +
+                '<strong>' + refLabels + '</strong><br><br>' +
+                'These markers will serve as Z-scan references. They should stay on the bed until the Z-scan completes.<br>' +
+                'Click <strong>I Placed Them</strong> when all 3 are on the bed.');
+        } else {
+            setInstructions('Corner data not available. <strong>Skip</strong> or go back to define corners.');
+        }
+    }
+    else if (info.type === 'z_scan') {
+        btnNext.textContent = 'Start Scan';
+        btnNext.disabled = false;
+        btnSkip.style.display = 'inline-block';
+        btnSkip.textContent = 'Skip Z-Scan';
+        btnSkip.onclick = skipStep;
+
+        await ensureLedOn();
+
+        // Reset Z-masks before scan
+        await resetZMasks();
+        zMasks = [];
+
+        const refLabels = getZRefCorners().map((r, i) => {
+            const cell = zRefCells[i] || getCornerCell(r.idx);
+            return PLATE_CORNERS[r.idx].desc + ' [' + cell.row + ',' + cell.col + ']';
+        }).join(', ');
+
+        setInstructions(
+            'Spaghetti markers are already on the bed from the previous step.<br>' +
+            'Reference positions: ' + refLabels + '<br><br>' +
+            'The scanner will lower the bed in ' + Z_STEP_MM + 'mm steps, computing the visible mask at each height.<br>' +
+            'It stops when all reference markers leave the camera view.<br><br>' +
+            'Click <strong>Start Scan</strong> to begin.');
+    }
+    else if (info.type === 'z_review') {
+        btnNext.textContent = 'Accept';
+        btnNext.disabled = false;
+        btnSkip.style.display = 'inline-block';
+        btnSkip.textContent = 'Skip';
+        btnSkip.onclick = skipStep;
+
+        const zReviewPanel = document.getElementById('z-review-panel');
+        if (zMasks.length > 0) {
+            const minZ = zMasks[0][0];
+            const maxZ = zMasks[zMasks.length - 1][0];
+            zReviewPanel.style.display = 'block';
+            const slider = document.getElementById('z-review-slider');
+            const label = document.getElementById('z-review-label');
+            slider.min = minZ;
+            slider.max = maxZ;
+            slider.step = Z_STEP_MM;
+            slider.value = minZ;
+            activeMaskOverride = getZMaskForHeight(minZ);
+            updateZReviewLabel(minZ);
+            drawOverlay(lastHeatmap);
+
+            setInstructions(
+                'Review the Z-dependent masks. Use the slider to preview the mask at different Z heights.<br>' +
+                'The overlay shows which cells are active at each height.<br>' +
+                'Scanned range: ' + minZ + ' to ' + maxZ + 'mm (' + zMasks.length + ' levels).<br>' +
+                'Click <strong>Accept</strong> to finalize or <strong>Skip</strong> to discard Z-masks.');
+        } else {
+            zReviewPanel.style.display = 'none';
+            setInstructions(
+                'No Z-mask data available (scan was skipped or no data recorded).<br>' +
+                'Click <strong>Accept</strong> to continue with static mask only.');
+        }
+    }
+    else if (info.type === 'nozzle') {
+        btnSkip.style.display = 'inline-block';
+
+        // Ensure LED is on for reliable fault detection
+        await ensureLedOn();
+
+        const pos = info.pos;
+        const gc = getPositionGcode(pos);
+
+        // First nozzle step: wait for user to clear bed before homing
+        if (step === 4 && !bedClearedForNozzle) {
+            btnNext.textContent = 'Bed is Clear';
+            btnNext.disabled = false;
+            setInstructions(
+                '<span style="color:#f44"><strong>Safety:</strong></span> Please <strong>remove all spaghetti and objects</strong> from the build plate.<br><br>' +
+                'The printer will home (G28) next — the nozzle will touch the bed surface.<br>' +
+                'Click <strong>Bed is Clear</strong> when the plate is empty.');
+            return;
+        }
+
+        btnNext.textContent = 'Next';
+        btnNext.disabled = true;
+
+        // Home if first nozzle step (bed already confirmed clear)
+        if (step === 4) {
+            setInstructions('Homing printer...');
+            await sendGcode('G28');
+            await waitForGcodeComplete(30000);
+        }
+        setInstructions('Moving nozzle to <strong>' + POS_LABELS[pos] + '</strong>...');
+        await sendGcode('G1 X' + gc.gx.toFixed(0) + ' Y' + gc.gy.toFixed(0) + ' F3000');
+        await waitForGcodeComplete(15000);
+        setInstructions(
+            'Nozzle at <strong>' + POS_LABELS[pos] + '</strong>. Detecting heatmap signature...<br>' +
+            'Auto-advances after 3 stable readings.');
+    }
+    else if (info.type === 'spaghetti') {
+        spaghettiPhase = 'place';
+        btnNext.textContent = 'I Placed It';
+        btnNext.disabled = false;
+        btnSkip.style.display = 'inline-block';
+        btnSkip.textContent = 'Skip';
+        btnSkip.onclick = skipStep;
+
+        // Ensure LED is on for reliable fault detection
+        await ensureLedOn();
+
+        const pos = info.pos;
+        const size = info.size;
+
+        // If first spaghetti step, move nozzle away
+        if (step === 9) {
+            btnNext.disabled = true;
+            setInstructions('Moving nozzle out of the way...');
+            await sendGcode('TO_THROW_POSITION');
+            await waitForGcodeComplete(20000);
+            btnNext.disabled = false;
+        }
+
+        // Check if previous step was same position (smart transition — spaghetti still on bed)
+        const prevInfo = step > 9 ? getStepInfo(step - 1) : null;
+        const replacing = prevInfo && prevInfo.type === 'spaghetti' && prevInfo.pos === pos;
+        if (replacing) {
+            setInstructions(
+                'Replace with <strong>' + SIZE_LABELS[size] + '</strong> spaghetti at the same position (<strong>' +
+                POS_LABELS[pos] + '</strong>).<br>' +
+                'Click <strong>I Placed It</strong> when ready.');
+        } else {
+            setInstructions(
+                'Place <strong>' + SIZE_LABELS[size] + '</strong> spaghetti sample at the <strong>' +
+                POS_LABELS[pos] + '</strong> of the bed.<br>' +
+                'The expected position is highlighted on the camera view.<br>' +
+                'Click <strong>I Placed It</strong> when ready.');
+        }
+    }
+    else if (info.type === 'summary') {
+        btnNext.textContent = 'Complete';
+        btnNext.disabled = false;
+        btnSkip.style.display = 'none';
+        document.getElementById('step-instructions').textContent = '';
+
+        showSummary();
+    }
+}
+
+function showSummary() {
+    const panel = document.getElementById('summary-panel');
+    panel.style.display = 'block';
+
+    let passed = 0, failed = 0, skipped = 0;
+    let html = '<table class="summary-table"><tr><th>Step</th><th>Description</th><th>Result</th><th>Activation</th></tr>';
+
+    for (let s = 0; s <= 23; s++) {
+        const info = getStepInfo(s);
+        const res = stepResults[s];
+        let resultClass, resultText, activation = '-';
+
+        if (res) {
+            if (res.result === 'pass') { resultClass = 'pass'; resultText = 'Pass'; passed++; }
+            else if (res.result === 'fail') { resultClass = 'fail'; resultText = 'Fail'; failed++; }
+            else { resultClass = 'skip'; resultText = 'Skip'; skipped++; }
+            if (res.activation !== undefined) activation = res.activation.toFixed(3);
+        } else {
+            resultClass = 'skip'; resultText = 'Skip'; skipped++;
+        }
+
+        html += '<tr><td>' + (s + 1) + '</td><td>' + info.title + '</td>' +
+                '<td class="' + resultClass + '">' + resultText + '</td>' +
+                '<td>' + activation + '</td></tr>';
+    }
+    html += '</table>';
+
+    html += '<div class="stats-row">' +
+            '<div class="stat"><div class="stat-val" style="color:#4CAF50">' + passed + '</div><div class="stat-lbl">Passed</div></div>' +
+            '<div class="stat"><div class="stat-val" style="color:#f44">' + failed + '</div><div class="stat-lbl">Failed</div></div>' +
+            '<div class="stat"><div class="stat-val" style="color:#888">' + skipped + '</div><div class="stat-lbl">Skipped</div></div>' +
+            '</div>';
+
+    panel.innerHTML = html;
+}
+
+async function nextStep() {
+    if (currentStep === -1) {
+        // Pre-start: check prerequisites
+        const status = await apiGet('/api/setup/status');
+        if (!status) { alert('Cannot connect to server.'); return; }
+
+        if (!status.moonraker_connected) {
+            if (!confirm('Moonraker is not connected. Nozzle movement steps will be skipped. Continue?'))
+                return;
+        }
+
+        // Check USB drive
+        if (!status.usb_mounted) {
+            alert('USB drive not detected.\n\nPlease plug in a USB pendrive and try again.\nTraining images will be saved to the USB drive.');
+            return;
+        }
+
+        // Check for in-progress setup (resume or restart?)
+        let resuming = false;
+        if (status.status === 1 && status.training_in_progress && status.results) {
+            const choice = confirm(
+                'A previous calibration session was found.\n\n' +
+                'Click OK to RESUME from where you left off.\n' +
+                'Click Cancel to START FRESH (previous data deleted).');
+            if (choice) {
+                // Resume: load saved results and corners
+                resuming = true;
+                stepResults = {};
+                if (status.results) {
+                    for (const [key, val] of Object.entries(status.results)) {
+                        stepResults[parseInt(key)] = val;
+                    }
+                }
+                if (status.has_corners && status.corners && status.corners.length >= 8) {
+                    corners = [];
+                    for (let i = 0; i < status.corners.length; i += 2) {
+                        corners.push({x: status.corners[i], y: status.corners[i+1]});
+                    }
+                    mask = status.mask || 0;
+                }
+            } else {
+                // Restart: clean up new/ folder
+                await initTraining(true);
+                await apiPost('/api/setup/reset', {});
+                corners = [];
+                mask = 0;
+                stepResults = {};
+            }
+        }
+
+        // Initialize training folder (creates dirs if needed, no cleanup)
+        if (!resuming) {
+            await initTraining(false);
+        }
+
+        // Auto-detect bed size from Moonraker
+        await autoDetectBedSize();
+
+        // Start setup mode
+        await startSetupMode();
+        setupActive = true;
+        startPolling();
+
+        // If resuming, find first incomplete step
+        if (resuming) {
+            let resumeStep = 0;
+            // If corners are set, skip step 0
+            if (corners.length >= NUM_CORNERS) resumeStep = 1;
+            // Find first step without a result (treat aborted z-scan as incomplete)
+            for (let s = resumeStep; s <= 23; s++) {
+                if (!stepResults[s] || (stepResults[s].aborted)) { resumeStep = s; break; }
+                if (s === 23) resumeStep = 24;  // all done → summary
+            }
+
+            // Safety: if resuming to a step that needs printer movement, home first
+            if (resumeStep >= 2) {
+                const safetyMsg = resumeStep >= 4
+                    ? 'Please remove all spaghetti and objects from the build plate.\n\nThe printer will home (G28) — the nozzle will touch the bed surface.'
+                    : 'The printer needs to home (G28) to establish position.\n\nIf Z-scan markers are on the bed, they should not interfere with homing at the probe point.';
+                const proceed = confirm('Resuming calibration at step ' + (resumeStep + 1) + '.\n\n' + safetyMsg + '\n\nClick OK to home the printer, or Cancel to abort.');
+                if (!proceed) {
+                    stopPolling();
+                    setupActive = false;
+                    return;
+                }
+                setInstructions('Homing printer and parking nozzle...');
+                await sendGcode('G28\nG90\nG1 Z2 F500\nTO_THROW_POSITION');
+                await waitForGcodeComplete(60000);
+                if (resumeStep >= 4) {
+                    bedClearedForNozzle = true;  // already homed and cleared
+                }
+            }
+
+            goToStep(resumeStep);
+        } else {
+            goToStep(0);
+        }
+        return;
+    }
+
+    if (currentStep === 0) {
+        if (cornerPhase === 'click') {
+            if (corners.length < NUM_CORNERS) return;
+            await saveCorners();
+            cornerPhase = 'confirm_mask';
+            drawOverlay(lastHeatmap);
+            clickLayer.style.pointerEvents = 'none';
+            setInstructions(
+                'Mask computed from your corners. <strong>Green cells</strong> are inside the build plate (active). ' +
+                '<strong>Gray cells</strong> are outside (excluded from detection).<br><br>' +
+                'Verify the mask looks correct on the camera overlay.<br>' +
+                'Click <strong>Accept</strong> to continue or <strong>Redo Corners</strong> to redraw.');
+            document.getElementById('btn-next').textContent = 'Accept';
+            document.getElementById('btn-next').disabled = false;
+            return;
+        }
+        // confirm_mask phase: accept and continue
+        stepResults[0] = { result: 'pass' };
+        recordVerification(0, stepResults[0]);
+        cornerPhase = 'click';
+        goToStep(1);
+        return;
+    }
+
+    if (currentStep === 24) {
+        // Complete
+        await completeSetup();
+        stopPolling();
+        setupActive = false;
+        alert('Calibration complete! You can close this window.');
+        window.close();
+        return;
+    }
+
+    // Nozzle step 4: bed-clear confirmation → re-enter goToStep to home + move
+    const stepInfo = getStepInfo(currentStep);
+    if (stepInfo.type === 'nozzle' && currentStep === 4 && !bedClearedForNozzle) {
+        bedClearedForNozzle = true;
+        goToStep(4);  // re-enter with bedClearedForNozzle=true → homes and moves nozzle
+        return;
+    }
+
+    // Z-markers phase handling
+    if (stepInfo.type === 'z_markers') {
+        if (spaghettiPhase === 'place') {
+            spaghettiPhase = 'detect';
+            consecutiveDetections = 0;
+            zMarkerConsecutive = [0, 0, 0];
+            zMarkerDetected = [false, false, false];
+            document.getElementById('btn-next').textContent = 'Detecting...';
+            document.getElementById('btn-next').disabled = true;
+            document.getElementById('detection-feedback').style.display = 'block';
+            document.getElementById('detection-feedback').className = 'detection-feedback feedback-waiting';
+            document.getElementById('detection-feedback').textContent = 'Monitoring heatmap for all 3 markers...';
+            const refs = getZRefCorners();
+            const refLabels = refs.map(r => PLATE_CORNERS[r.idx].desc).join(', ');
+            setInstructions(
+                'Monitoring for spaghetti markers at <strong>' + refLabels + '</strong>...<br>' +
+                'Waiting for 2 consecutive positive detections per marker.');
+            if (spaghettiTimeout) clearTimeout(spaghettiTimeout);
+            spaghettiTimeout = setTimeout(() => {
+                if (spaghettiPhase !== 'detect') return;
+                spaghettiPhase = 'result';
+                const fb = document.getElementById('detection-feedback');
+                const detected = zMarkerDetected.filter(d => d).length;
+                fb.textContent = 'Timeout: detected ' + detected + '/3 markers after 45s';
+                fb.className = 'detection-feedback ' + (detected > 0 ? 'feedback-active' : 'feedback-fail');
+                if (detected > 0) {
+                    // Partial detection — allow accepting what we have
+                    stepResults[currentStep] = { result: 'pass', refCells: zRefCells.slice(0, 3), partial: true };
+                    setInstructions(
+                        'Detected ' + detected + '/3 markers. You can <strong>Accept</strong> partial results or <strong>Retry</strong>.<br>' +
+                        'Partial detection may reduce Z-scan accuracy.');
+                    document.getElementById('btn-next').textContent = 'Accept';
+                } else {
+                    setInstructions(
+                        'No markers detected.<br>' +
+                        'You can <strong>Retry</strong> or <strong>Skip</strong>.');
+                    document.getElementById('btn-next').textContent = 'Skip';
+                }
+                document.getElementById('btn-next').disabled = false;
+                document.getElementById('btn-skip').textContent = 'Retry';
+                document.getElementById('btn-skip').onclick = retryZMarkers;
+            }, 45000);
+            return;
+        }
+        if (spaghettiPhase === 'result') {
+            // Accept — NO remove phase, spaghetti stays for Z-scan
+            if (!stepResults[currentStep]) {
+                stepResults[currentStep] = { result: 'pass', refCells: zRefCells.slice(0, 3) };
+            }
+            recordVerification(currentStep, stepResults[currentStep]);
+            document.getElementById('detection-feedback').style.display = 'none';
+            goToStep(currentStep + 1);
+            return;
+        }
+    }
+
+    // Z-scan handling
+    if (stepInfo.type === 'z_scan') {
+        if (!zScanRunning) {
+            runZScan();  // async, runs in background
+        }
+        return;
+    }
+
+    // Z-review handling
+    if (stepInfo.type === 'z_review') {
+        // Accept: clear override and continue
+        activeMaskOverride = 0;
+        document.getElementById('z-review-panel').style.display = 'none';
+        goToStep(currentStep + 1);
+        return;
+    }
+
+    // Spaghetti phase handling
+    if (stepInfo.type === 'spaghetti') {
+        if (spaghettiPhase === 'place') {
+            // Start detecting
+            spaghettiPhase = 'detect';
+            consecutiveDetections = 0;
+            document.getElementById('btn-next').textContent = 'Detecting...';
+            document.getElementById('btn-next').disabled = true;
+            document.getElementById('detection-feedback').style.display = 'block';
+            document.getElementById('detection-feedback').className = 'detection-feedback feedback-waiting';
+            document.getElementById('detection-feedback').textContent = 'Monitoring heatmap...';
+            setInstructions(
+                'Monitoring for <strong>' + SIZE_LABELS[stepInfo.size] + '</strong> spaghetti at <strong>' +
+                POS_LABELS[stepInfo.pos] + '</strong>...<br>' +
+                'Waiting for 2 consecutive positive detections.');
+            // Set 30s timeout
+            if (spaghettiTimeout) clearTimeout(spaghettiTimeout);
+            spaghettiTimeout = setTimeout(showSpaghettiTimeout, 30000);
+            return;
+        }
+        if (spaghettiPhase === 'result') {
+            // Accept result → smart remove transitions
+            if (!stepResults[currentStep]) {
+                stepResults[currentStep] = { result: 'pass', position: stepInfo.pos, size: stepInfo.size };
+            }
+            recordVerification(currentStep, stepResults[currentStep]);
+            document.getElementById('detection-feedback').style.display = 'none';
+            document.getElementById('btn-fail').style.display = 'none';
+
+            // Check what the next step needs
+            const nextStepInfo = getStepInfo(currentStep + 1);
+            if (nextStepInfo.type === 'spaghetti' && nextStepInfo.pos === stepInfo.pos) {
+                // Same position, different size → skip remove, go directly to next step
+                goToStep(currentStep + 1);
+                return;
+            } else if (nextStepInfo.type === 'spaghetti') {
+                // Different position → ask to move spaghetti
+                spaghettiPhase = 'remove';
+                setInstructions(
+                    '<strong>Move</strong> the spaghetti from <strong>' + POS_LABELS[stepInfo.pos] +
+                    '</strong> to <strong>' + POS_LABELS[nextStepInfo.pos] + '</strong>.<br>' +
+                    'Click <strong>Moved</strong> when done.');
+                document.getElementById('btn-next').textContent = 'Moved';
+                document.getElementById('btn-next').disabled = false;
+                document.getElementById('btn-skip').style.display = 'none';
+                return;
+            } else {
+                // Next step is summary or other → remove spaghetti
+                spaghettiPhase = 'remove';
+                setInstructions(
+                    '<strong>Remove</strong> the spaghetti from the bed.<br>' +
+                    'Click <strong>Removed</strong> when done.');
+                document.getElementById('btn-next').textContent = 'Removed';
+                document.getElementById('btn-next').disabled = false;
+                document.getElementById('btn-skip').style.display = 'none';
+                return;
+            }
+        }
+        if (spaghettiPhase === 'remove') {
+            goToStep(currentStep + 1);
+            return;
+        }
+    }
+
+    // Default: go to next step
+    goToStep(currentStep + 1);
+}
+
+function prevStep() {
+    if (currentStep <= 0) return;
+
+    if (currentStep === 0) {
+        // Reset corners
+        corners = [];
+        drawOverlay(null);
+        updateCornerInstructions();
+        document.getElementById('btn-next').disabled = true;
+        return;
+    }
+
+    goToStep(currentStep - 1);
+}
+
+function skipStep() {
+    if (spaghettiTimeout) { clearTimeout(spaghettiTimeout); spaghettiTimeout = null; }
+    stepResults[currentStep] = { result: 'skip' };
+    recordVerification(currentStep, stepResults[currentStep]);
+    goToStep(currentStep + 1);
+}
+
+// ============================================================
+// Corner Reset
+// ============================================================
+function resetCorners() {
+    corners = [];
+    cornerPhase = 'click';
+    mask = 0;
+    drawOverlay(null);
+    if (currentStep === 0) {
+        clickLayer.style.pointerEvents = 'auto';
+        updateCornerInstructions();
+        document.getElementById('btn-next').disabled = true;
+        document.getElementById('btn-next').textContent = 'Waiting...';
+    }
+}
+
+// Add reset button for corners step
+const navDiv = document.getElementById('nav-buttons');
+const resetBtn = document.createElement('button');
+resetBtn.className = 'danger';
+resetBtn.textContent = 'Reset Corners';
+resetBtn.id = 'btn-reset-corners';
+resetBtn.style.display = 'none';
+resetBtn.onclick = resetCorners;
+navDiv.insertBefore(resetBtn, navDiv.children[1]);
+
+// Show/hide reset button based on step
+const origGoToStep = goToStep;
+goToStep = async function(step) {
+    await origGoToStep(step);
+    document.getElementById('btn-reset-corners').style.display = step === 0 ? 'inline-block' : 'none';
+};
+
+// ============================================================
+// Initialize
+// ============================================================
+window.addEventListener('beforeunload', function() {
+    if (setupActive) {
+        navigator.sendBeacon(BASE + '/api/setup/stop', '{}');
+    }
+});
+
+document.getElementById('step-title').textContent = 'Ready to Start';
+document.getElementById('step-instructions').innerHTML =
+    'This wizard will guide you through spatial calibration for fault detection.<br><br>' +
+    '<strong>Prerequisites:</strong><br>' +
+    '- Printer must be in standby (not printing)<br>' +
+    '- Moonraker must be connected (for nozzle movement)<br>' +
+    '- USB pendrive must be plugged in (training images saved to USB)<br>' +
+    '- Have spaghetti samples ready (small/medium/large bundles)<br><br>' +
+    'Click <strong>Start</strong> to begin.';
+document.getElementById('btn-next').textContent = 'Start';
+document.getElementById('btn-next').disabled = false;
+
+refreshCamera();
+</script>
+</body>
+</html>

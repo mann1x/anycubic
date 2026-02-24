@@ -1949,6 +1949,9 @@ static void on_config_changed(AppConfig *cfg) {
         fd_cfg.min_free_mem_mb = cfg->fault_detect_min_free_mem;
         fd_cfg.pace_ms = cfg->fault_detect_pace_ms;
         fd_cfg.heatmap_enabled = cfg->heatmap_enabled;
+        fd_cfg.beep_pattern = cfg->fd_beep_pattern;
+        fd_cfg.setup_mode = 0;  /* only set via API, not from config */
+        fd_mask_from_hex(cfg->fd_setup_mask_hex, &fd_cfg.heatmap_mask);
         apply_fd_thresholds(&fd_cfg, cfg);
         apply_fd_file_overrides(&fd_cfg);
         fault_detect_set_config(&fd_cfg);
@@ -2302,9 +2305,38 @@ int main(int argc, char *argv[]) {
             fd_cfg.min_free_mem_mb = app_config.fault_detect_min_free_mem;
             fd_cfg.pace_ms = app_config.fault_detect_pace_ms;
             fd_cfg.heatmap_enabled = app_config.heatmap_enabled;
+            fd_cfg.beep_pattern = app_config.fd_beep_pattern;
+            fd_cfg.setup_mode = 0;  /* only set via API, not from config */
+            fd_mask_from_hex(app_config.fd_setup_mask_hex, &fd_cfg.heatmap_mask);
             apply_fd_thresholds(&fd_cfg, &app_config);
             apply_fd_file_overrides(&fd_cfg);
             fault_detect_set_config(&fd_cfg);
+
+            /* Load Z-dependent masks from config */
+            if (app_config.fd_z_masks_json[0]) {
+                cJSON *zm_arr = cJSON_Parse(app_config.fd_z_masks_json);
+                if (zm_arr && cJSON_IsArray(zm_arr)) {
+                    int n = cJSON_GetArraySize(zm_arr);
+                    if (n > FD_Z_MASK_MAX_ENTRIES) n = FD_Z_MASK_MAX_ENTRIES;
+                    fd_z_mask_entry_t entries[FD_Z_MASK_MAX_ENTRIES];
+                    int count = 0;
+                    for (int i = 0; i < n; i++) {
+                        cJSON *pair = cJSON_GetArrayItem(zm_arr, i);
+                        if (cJSON_IsArray(pair) && cJSON_GetArraySize(pair) >= 2) {
+                            entries[count].z_mm = (float)cJSON_GetArrayItem(pair, 0)->valuedouble;
+                            cJSON *mask_item = cJSON_GetArrayItem(pair, 1);
+                            if (cJSON_IsString(mask_item) && mask_item->valuestring)
+                                fd_mask_from_hex(mask_item->valuestring, &entries[count].mask);
+                            else
+                                entries[count].mask = fd_mask_from_u64((uint64_t)mask_item->valuedouble);
+                            count++;
+                        }
+                    }
+                    if (count > 0)
+                        fault_detect_set_z_masks(entries, count);
+                }
+                if (zm_arr) cJSON_Delete(zm_arr);
+            }
 
             if (app_config.fault_detect_enabled && fault_detect_npu_available()) {
                 if (fault_detect_start() < 0) {

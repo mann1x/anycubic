@@ -805,6 +805,10 @@
                 <span class="label">Confidence:</span>
                 <span class="value" id="fd-confidence">-</span>
             </div>
+            <div class="row" id="fd-models-row" style="display:none">
+                <span class="label">Models:</span>
+                <span class="value" id="fd-models" style="font-size:11px;font-family:monospace;white-space:pre;line-height:1.6;">-</span>
+            </div>
             <div class="row" id="fd-timing-row" style="display:none">
                 <span class="label">Inference:</span>
                 <span class="value" id="fd-timing">-</span>
@@ -885,9 +889,38 @@
                                     <input type="checkbox" id="fd_heatmap" $heatmap_checked>
                                     <span class="slider"></span>
                                 </label>
-                                <span style="font-size:11px;color:#888;margin-left:8px;">7x7 spatial localization on faults</span>
+                                <span style="font-size:11px;color:#888;margin-left:8px;">Spatial localization on faults</span>
                             </div>
                         </div>
+                    </div>
+
+                    <div class="setting">
+                        <div class="setting-row">
+                            <span class="label">Fault Alert:</span>
+                            <div class="control">
+                                <select id="fd_beep_pattern" style="padding:8px;border-radius:4px;border:1px solid #555;background:#333;color:#fff;">
+                                    <option value="0">None</option>
+                                    <option value="1">Short beep</option>
+                                    <option value="2">2 short beeps</option>
+                                    <option value="3">3 short beeps</option>
+                                    <option value="4">2 short + 1 long</option>
+                                    <option value="5">SOS</option>
+                                </select>
+                                <span style="font-size:11px;color:#888;margin-left:8px;">Buzzer pattern on fault (15s cooldown)</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="setting">
+                        <div class="setting-row">
+                            <span class="label">Spatial Calibration:</span>
+                            <div class="control" style="display:flex;align-items:center;gap:10px;">
+                                <span id="fd-setup-badge" style="font-size:12px;padding:3px 8px;border-radius:3px;"></span>
+                                <button type="button" onclick="window.open('/setup','fd_setup','width=960,height=750')"
+                                        class="secondary" style="padding:6px 14px;font-size:13px;">Setup</button>
+                            </div>
+                        </div>
+                        <span id="fd-setup-last" class="setting-note"></span>
                     </div>
 
                     <div class="setting">
@@ -2457,15 +2490,35 @@ if(flvjs.isSupported()){
 
             row.style.display = '';
             const ctx = canvas.getContext('2d');
-            const cellW = canvas.width / 7;
-            const cellH = canvas.height / 7;
             const grid = heatmap.grid;
+            const rows = grid.length;
+            const cols = rows > 0 ? grid[0].length : 0;
+            // Resize canvas to match grid (1 pixel per cell minimum 140px)
+            const canvasSize = Math.max(140, rows * 14);
+            if (canvas.width !== canvasSize || canvas.height !== canvasSize) {
+                canvas.width = canvasSize;
+                canvas.height = canvasSize;
+            }
+            const cellW = canvas.width / cols;
+            const cellH = canvas.height / rows;
 
-            for (let h = 0; h < 7; h++) {
-                for (let w = 0; w < 7; w++) {
+            // Auto-normalize: find actual data range for contrast
+            let vmin = Infinity, vmax = -Infinity;
+            for (let h = 0; h < rows; h++) {
+                for (let w = 0; w < cols; w++) {
                     const v = grid[h][w];
-                    // Map margin: <0 = green (OK), 0 = yellow, >0 = red (fault)
-                    const t = Math.max(0, Math.min(1, (v + 0.5) / 1.5));
+                    if (v < vmin) vmin = v;
+                    if (v > vmax) vmax = v;
+                }
+            }
+            // Symmetric range around 0, minimum 0.001 to avoid division by zero
+            const absMax = Math.max(Math.abs(vmin), Math.abs(vmax), 0.001);
+
+            for (let h = 0; h < rows; h++) {
+                for (let w = 0; w < cols; w++) {
+                    const v = grid[h][w];
+                    // Normalize to [-1,1] using actual range, then to [0,1]
+                    const t = Math.max(0, Math.min(1, (v / absMax + 1) / 2));
                     let r, g, b;
                     if (t < 0.5) {
                         // green to yellow
@@ -2493,8 +2546,9 @@ if(flvjs.isSupported()){
             }
 
             if (info) {
-                info.textContent = 'max=' + heatmap.max.toFixed(2) +
-                    ' at [' + heatmap.max_row + ',' + heatmap.max_col + ']';
+                info.textContent = 'max=' + heatmap.max.toFixed(3) +
+                    ' at [' + heatmap.max_row + ',' + heatmap.max_col + ']' +
+                    ' range=[' + vmin.toFixed(3) + ',' + vmax.toFixed(3) + ']';
             }
         }
 
@@ -2551,6 +2605,24 @@ if(flvjs.isSupported()){
                     confEl.textContent = (fd.confidence * 100).toFixed(1) + '%';
                 }
 
+                // Per-model detail
+                const modelsRow = document.getElementById('fd-models-row');
+                const modelsEl = document.getElementById('fd-models');
+                if (fd.models && Object.keys(fd.models).length > 1) {
+                    const names = { cnn: 'CNN', proto: 'Proto', multi: 'Multi' };
+                    const lines = [];
+                    for (const [key, m] of Object.entries(fd.models)) {
+                        const name = names[key] || key;
+                        const rawPct = (m.raw * 100).toFixed(1);
+                        const lkPct = (m.fault_lk * 100).toFixed(1);
+                        lines.push(name + ': ' + rawPct + '% raw, ' + lkPct + '% norm (' + m.ms + 'ms)');
+                    }
+                    modelsRow.style.display = '';
+                    modelsEl.textContent = lines.join('\n');
+                } else if (modelsRow) {
+                    modelsRow.style.display = 'none';
+                }
+
                 // Fault class
                 if (fd.detection === 'fault' && fd.fault_class && fd.fault_class !== '-') {
                     classRow.style.display = '';
@@ -2579,6 +2651,8 @@ if(flvjs.isSupported()){
                 confRow.style.display = 'none';
                 timingRow.style.display = 'none';
                 classRow.style.display = 'none';
+                const mdRow = document.getElementById('fd-models-row');
+                if (mdRow) mdRow.style.display = 'none';
                 const hmRow = document.getElementById('fd-heatmap-row');
                 if (hmRow) hmRow.style.display = 'none';
             }
@@ -2766,6 +2840,7 @@ if(flvjs.isSupported()){
                 multi_enabled: !!(set && set.has_multiclass),
                 strategy: document.getElementById('fd_strategy').value,
                 heatmap_enabled: document.getElementById('fd_heatmap').checked,
+                beep_pattern: parseInt(document.getElementById('fd_beep_pattern').value) || 0,
                 interval: parseInt(document.getElementById('fd_interval').value) || 5,
                 verify_interval: parseInt(document.getElementById('fd_verify_interval').value) || 2
             };
@@ -2830,8 +2905,41 @@ if(flvjs.isSupported()){
                 const sel = document.getElementById('fd_strategy');
                 if (sel) sel.value = strat;
             }
+            // Set beep pattern from template
+            const bp = '$fd_beep_pattern';
+            if (bp && bp !== '$' + 'fd_beep_pattern') {
+                const bpSel = document.getElementById('fd_beep_pattern');
+                if (bpSel) bpSel.value = bp;
+            }
             // Load model sets
             loadFdSets();
+
+            // Setup wizard badge
+            (function() {
+                const st = parseInt('$fd_setup_status') || 0;
+                const ts = parseInt('$fd_setup_timestamp') || 0;
+                const badge = document.getElementById('fd-setup-badge');
+                const last = document.getElementById('fd-setup-last');
+                if (badge) {
+                    if (st === 2) {
+                        badge.textContent = 'Calibrated';
+                        badge.style.background = '#1a5c2e';
+                        badge.style.color = '#4CAF50';
+                    } else if (st === 1) {
+                        badge.textContent = 'In Progress';
+                        badge.style.background = '#5c4a1a';
+                        badge.style.color = '#f0ad4e';
+                    } else {
+                        badge.textContent = 'Not Configured';
+                        badge.style.background = '#444';
+                        badge.style.color = '#999';
+                    }
+                }
+                if (last && ts > 0) {
+                    const d = new Date(ts * 1000);
+                    last.textContent = 'Last calibrated: ' + d.toLocaleDateString() + ' ' + d.toLocaleTimeString();
+                }
+            })();
         })();
     </script>
 </body>

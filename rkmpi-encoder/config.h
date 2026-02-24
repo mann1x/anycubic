@@ -120,11 +120,27 @@ typedef struct {
     int fault_detect_min_free_mem;
     int fault_detect_pace_ms;
     int heatmap_enabled;                /* Spatial heatmap on fault detection */
+    int fd_beep_pattern;                /* Buzzer alert on fault: 0=none, 1-5=patterns */
     char fd_thresholds_json[2048];      /* Per-set threshold config JSON */
+
+    /* Fault Detection Setup Wizard */
+    int fd_setup_status;                /* 0=NONE, 1=INPROGRESS, 2=OK */
+    int64_t fd_setup_timestamp;         /* Unix epoch when last completed */
+    float fd_setup_corners[16];         /* Normalized [0..1]: 8 points x2 coords, clockwise: TL,TM,TR,MR,BR,BM,BL,ML */
+    char fd_setup_mask_hex[128];        /* 392-bit hex mask: "w6:w5:...:w0", 1=active, 0=masked */
+    int fd_bed_size_x;                  /* Bed width mm (default 220) */
+    int fd_bed_size_y;                  /* Bed depth mm (default 220) */
+    char fd_setup_results_json[2048];   /* Per-step verification results JSON */
+    char fd_z_masks_json[4096];         /* JSON: [[z_mm, mask], ...] for Z-dependent masks */
 
     /* Runtime: config file path (not persisted) */
     char config_file[256];
 } AppConfig;
+
+/* Fault Detection Setup status values */
+#define FD_SETUP_NONE       0
+#define FD_SETUP_INPROGRESS 1
+#define FD_SETUP_OK         2
 
 /* Set all config fields to sensible defaults */
 void config_set_defaults(AppConfig *cfg);

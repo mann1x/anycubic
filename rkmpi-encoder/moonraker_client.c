@@ -8,6 +8,7 @@
 #define _GNU_SOURCE
 #include "moonraker_client.h"
 #include "timelapse.h"
+#include "fault_detect.h"
 #include "cJSON.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -408,7 +409,8 @@ static int subscribe_print_stats(MoonrakerClient *mc) {
     const char *params =
         "{\"objects\":{"
             "\"print_stats\":[\"state\",\"filename\",\"info\"],"
-            "\"virtual_sdcard\":[\"current_layer\",\"total_layer\"]"
+            "\"virtual_sdcard\":[\"current_layer\",\"total_layer\"],"
+            "\"toolhead\":[\"position\"]"
         "}}";
     return send_jsonrpc(mc, "printer.objects.subscribe", params);
 }
@@ -718,6 +720,18 @@ static void handle_status_update(MoonrakerClient *mc, cJSON *params_obj) {
         }
     }
 
+    /* Extract toolhead position for Z-dependent FD mask */
+    cJSON *th = cJSON_GetObjectItemCaseSensitive(params_obj, "toolhead");
+    if (th) {
+        cJSON *pos = cJSON_GetObjectItemCaseSensitive(th, "position");
+        if (cJSON_IsArray(pos) && cJSON_GetArraySize(pos) >= 3) {
+            for (int i = 0; i < 4 && i < cJSON_GetArraySize(pos); i++)
+                mc->position[i] = (float)cJSON_GetArrayItem(pos, i)->valuedouble;
+            mc->has_position = 1;
+            fault_detect_set_current_z(mc->position[2]);
+        }
+    }
+
     /* Extract and process layer info */
     int layer = -1, total = -1;
     extract_layers(params_obj, &layer, &total);
@@ -958,4 +972,37 @@ void moonraker_client_stop(MoonrakerClient *mc) {
 
 int moonraker_client_is_connected(const MoonrakerClient *mc) {
     return mc->connected;
+}
+
+int moonraker_client_send_gcode(MoonrakerClient *mc, const char *gcode) {
+    if (!mc || !mc->connected || mc->fd < 0 || !gcode)
+        return -1;
+
+    /* JSON-escape the gcode (newlines → \n, quotes → \") */
+    char escaped[1024];
+    int ei = 0;
+    for (int i = 0; gcode[i] && ei < (int)sizeof(escaped) - 2; i++) {
+        if (gcode[i] == '\n')      { escaped[ei++] = '\\'; escaped[ei++] = 'n'; }
+        else if (gcode[i] == '"')  { escaped[ei++] = '\\'; escaped[ei++] = '"'; }
+        else if (gcode[i] == '\\') { escaped[ei++] = '\\'; escaped[ei++] = '\\'; }
+        else                         escaped[ei++] = gcode[i];
+    }
+    escaped[ei] = '\0';
+
+    char params[1280];
+    int plen = snprintf(params, sizeof(params), "{\"script\":\"%s\"}", escaped);
+    if (plen >= (int)sizeof(params))
+        return -1;
+
+    mr_log("Sending G-code: %s\n", gcode);
+    return send_jsonrpc(mc, "printer.gcode.script", params);
+}
+
+int moonraker_client_get_print_state(const MoonrakerClient *mc, char *buf, int buflen) {
+    if (!mc || !buf || buflen <= 0)
+        return -1;
+
+    strncpy(buf, mc->print_state, buflen - 1);
+    buf[buflen - 1] = '\0';
+    return 0;
 }

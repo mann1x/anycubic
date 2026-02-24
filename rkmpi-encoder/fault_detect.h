@@ -14,15 +14,127 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <string.h>
+#include <stdio.h>
 
-/* Model input dimensions */
-#define FD_MODEL_INPUT_SIZE  224
-#define FD_MODEL_INPUT_BYTES (FD_MODEL_INPUT_SIZE * FD_MODEL_INPUT_SIZE * 3)
+/* Model input dimensions (448x224 = 2:1 aspect for 16:9 cameras) */
+#define FD_MODEL_INPUT_WIDTH  448
+#define FD_MODEL_INPUT_HEIGHT 224
+#define FD_MODEL_INPUT_BYTES (FD_MODEL_INPUT_WIDTH * FD_MODEL_INPUT_HEIGHT * 3)
 
-/* Spatial heatmap grid dimensions */
-#define FD_SPATIAL_H     7
-#define FD_SPATIAL_W     7
-#define FD_SPATIAL_TOTAL (FD_SPATIAL_H * FD_SPATIAL_W * 1024)  /* 50176 floats */
+/* Spatial heatmap grid max dimensions (actual read from model/prototypes) */
+#define FD_SPATIAL_H_MAX     14
+#define FD_SPATIAL_W_MAX     28
+#define FD_SPATIAL_EMB_MAX   1024  /* max embedding dim (old=1024, new=232) */
+
+/* ============================================================================
+ * 392-bit mask type for 14x28 grid (7 x uint64_t = 448 bits)
+ * ============================================================================ */
+
+#define FD_MASK_WORDS 7   /* 7 x 64 = 448 bits >= 14*28 = 392 */
+
+typedef struct {
+    uint64_t w[FD_MASK_WORDS]; /* w[0]=bits 0-63, ... w[6]=bits 384-447 */
+} fd_mask196_t;
+
+static inline void fd_mask_clear(fd_mask196_t *m) {
+    for (int i = 0; i < FD_MASK_WORDS; i++) m->w[i] = 0;
+}
+
+static inline void fd_mask_set_bit(fd_mask196_t *m, int bit) {
+    if (bit >= 0 && bit < FD_MASK_WORDS * 64)
+        m->w[bit / 64] |= (1ULL << (bit % 64));
+}
+
+static inline int fd_mask_test_bit(const fd_mask196_t *m, int bit) {
+    if (bit < 0 || bit >= FD_MASK_WORDS * 64) return 0;
+    return (m->w[bit / 64] & (1ULL << (bit % 64))) != 0;
+}
+
+static inline int fd_mask_is_zero(const fd_mask196_t *m) {
+    uint64_t v = 0;
+    for (int i = 0; i < FD_MASK_WORDS; i++) v |= m->w[i];
+    return v == 0;
+}
+
+/* Set all bits [0..n-1] */
+static inline fd_mask196_t fd_mask_all_ones(int n) {
+    fd_mask196_t m;
+    fd_mask_clear(&m);
+    for (int i = 0; i < FD_MASK_WORDS; i++) {
+        if (n >= 64) {
+            m.w[i] = ~0ULL;
+            n -= 64;
+        } else if (n > 0) {
+            m.w[i] = (1ULL << n) - 1;
+            n = 0;
+        }
+    }
+    return m;
+}
+
+/* Convert from legacy uint64_t (49-bit) */
+static inline fd_mask196_t fd_mask_from_u64(uint64_t v) {
+    fd_mask196_t m;
+    fd_mask_clear(&m);
+    m.w[0] = v;
+    return m;
+}
+
+/* Convert to uint64_t (lossy — only lower 64 bits) */
+static inline uint64_t fd_mask_to_u64(const fd_mask196_t *m) {
+    return m->w[0];
+}
+
+/* Serialize to hex: "w6:w5:...:w0" (118 chars + null) */
+static inline void fd_mask_to_hex(const fd_mask196_t *m, char *buf, size_t buf_size) {
+    if (buf_size < 120) { if (buf_size > 0) buf[0] = '\0'; return; }
+    snprintf(buf, buf_size,
+             "%016llx:%016llx:%016llx:%016llx:%016llx:%016llx:%016llx",
+             (unsigned long long)m->w[6], (unsigned long long)m->w[5],
+             (unsigned long long)m->w[4], (unsigned long long)m->w[3],
+             (unsigned long long)m->w[2], (unsigned long long)m->w[1],
+             (unsigned long long)m->w[0]);
+}
+
+/* Parse hex "w6:w5:...:w0" → mask. Returns 0=ok, -1=error.
+ * Also accepts legacy 4-word "w3:w2:w1:w0" and single hex formats. */
+static inline int fd_mask_from_hex(const char *hex, fd_mask196_t *m) {
+    fd_mask_clear(m);
+    if (!hex || !hex[0]) return -1;
+    /* Try 7-word colon-separated format */
+    if (sscanf(hex, "%llx:%llx:%llx:%llx:%llx:%llx:%llx",
+               (unsigned long long *)&m->w[6], (unsigned long long *)&m->w[5],
+               (unsigned long long *)&m->w[4], (unsigned long long *)&m->w[3],
+               (unsigned long long *)&m->w[2], (unsigned long long *)&m->w[1],
+               (unsigned long long *)&m->w[0]) == 7)
+        return 0;
+    /* Fallback: legacy 4-word format */
+    if (sscanf(hex, "%llx:%llx:%llx:%llx",
+               (unsigned long long *)&m->w[3], (unsigned long long *)&m->w[2],
+               (unsigned long long *)&m->w[1], (unsigned long long *)&m->w[0]) == 4)
+        return 0;
+    /* Fallback: single hex number (legacy uint64_t) */
+    unsigned long long v = 0;
+    if (sscanf(hex, "%llx", &v) == 1) {
+        m->w[0] = v;
+        return 0;
+    }
+    return -1;
+}
+
+/* Population count */
+static inline int fd_mask_popcount(const fd_mask196_t *m) {
+    int count = 0;
+    for (int i = 0; i < FD_MASK_WORDS; i++) {
+        uint64_t v = m->w[i];
+        while (v) { count++; v &= v - 1; }
+    }
+    return count;
+}
+
+/* Z-dependent mask table limits */
+#define FD_Z_MASK_MAX_ENTRIES 48
 
 /* Model set limits */
 #define FD_MAX_SETS        4    /* Max model sets to scan */
@@ -74,7 +186,8 @@ typedef enum {
     FD_MODEL_CNN = 0,
     FD_MODEL_PROTONET,
     FD_MODEL_MULTICLASS,
-    FD_MODEL_SPATIAL       /* spatial encoder (protonet without GAP) */
+    FD_MODEL_SPATIAL,      /* spatial encoder (protonet without GAP) */
+    FD_MODEL_SPATIAL_COARSE /* coarse spatial encoder (7x7x1024 for multi-scale) */
 } fd_model_class_t;
 
 /* Threshold profile — one profile covers ALL model types in the set */
@@ -103,10 +216,17 @@ typedef struct {
     char cnn_file[64];                     /* model filename override */
     char proto_file[64];                   /* encoder filename override */
     char proto_prototypes[64];             /* prototypes filename override */
+    char proto_spatial_prototypes[64];     /* spatial prototypes filename override */
     char multi_file[64];                   /* multiclass filename override */
     fd_threshold_profile_t profiles[FD_MAX_PROFILES];
     int num_profiles;
 } fd_model_set_t;
+
+/* Z-dependent mask entry */
+typedef struct {
+    float z_mm;        /* Z height in mm */
+    fd_mask196_t mask; /* grid mask at this Z height */
+} fd_z_mask_entry_t;
 
 /* Active threshold config (runtime) */
 typedef struct {
@@ -130,13 +250,27 @@ typedef struct {
     float proto_ms;
     float multi_ms;
     int agreement;          /* Number of models agreeing */
+    /* Per-model confidence detail */
+    int cnn_ran;             /* 1 if CNN ran this cycle */
+    int proto_ran;           /* 1 if ProtoNet ran this cycle */
+    int multi_ran;           /* 1 if Multiclass ran this cycle */
+    float cnn_raw;           /* CNN raw: softmax fail prob [0,1] */
+    float proto_raw;         /* ProtoNet raw: cosine margin (~[-1,1]) */
+    float multi_raw;         /* Multiclass raw: 1-p(success) [0,1] */
+    float cnn_fault_lk;     /* CNN normalized fault likelihood [0,1] */
+    float proto_fault_lk;   /* ProtoNet normalized fault likelihood [0,1] */
+    float multi_fault_lk;   /* Multiclass normalized fault likelihood [0,1] */
     /* Spatial heatmap */
     int has_heatmap;
-    float heatmap[FD_SPATIAL_H][FD_SPATIAL_W]; /* cosine margin per location */
+    int spatial_h;           /* actual grid rows (7 or 14) */
+    int spatial_w;           /* actual grid cols (7 or 14) */
+    float heatmap[FD_SPATIAL_H_MAX][FD_SPATIAL_W_MAX]; /* cosine margin per location */
     float heatmap_max;       /* max fault margin in grid */
     int heatmap_max_h;       /* row index of max */
     int heatmap_max_w;       /* col index of max */
     float spatial_ms;        /* spatial inference time */
+    /* Center-crop region in normalized [0,1] coords */
+    float crop_x, crop_y, crop_w, crop_h;
 } fd_result_t;
 
 /* Detection state (thread-safe snapshot) */
@@ -162,6 +296,11 @@ typedef struct {
     int pace_ms;                /* Inter-step pause ms to reduce CPU spikes (0=off) */
     fd_active_thresholds_t thresholds; /* Active thresholds (profile or custom) */
     int heatmap_enabled;        /* 0=off, 1=on (spatial heatmap on faults) */
+    int beep_pattern;           /* Buzzer alert: 0=none, 1-5=patterns */
+    int setup_mode;             /* 1 = force heatmap every cycle (for calibration wizard) */
+    fd_mask196_t heatmap_mask;  /* grid mask: 1=active cell, 0=excluded from confidence */
+    fd_z_mask_entry_t z_masks[FD_Z_MASK_MAX_ENTRIES];
+    int z_mask_count;           /* 0 = disabled, use static heatmap_mask */
     /* File overrides from metadata.json (populated by scan) */
     char cnn_file[64];
     char proto_file[64];
@@ -210,11 +349,25 @@ int fault_detect_npu_available(void);
 /* Check if fault detection is installed (models directory exists). */
 int fault_detect_installed(void);
 
+/* Set current Z height (called from Moonraker position updates). */
+void fault_detect_set_current_z(float z_mm);
+
+/* Set Z-dependent mask table. entries must be sorted by z_mm ascending.
+ * Pass NULL/0 to clear. Copies entries into internal storage. */
+void fault_detect_set_z_masks(const fd_z_mask_entry_t *entries, int count);
+
 /* Strategy name helpers */
 const char *fd_strategy_name(fd_strategy_t strategy);
 fd_strategy_t fd_strategy_from_name(const char *name);
 
 /* Fault class name helper */
 const char *fd_fault_class_name(int fault_class);
+
+/* Get current spatial grid dimensions (0,0 if not loaded yet) */
+void fault_detect_get_spatial_dims(int *h, int *w);
+
+/* Get center-crop region in normalized [0,1] coords.
+ * Returns {0,0,1,1} if not yet computed (no image decoded). */
+void fault_detect_get_crop(float *x, float *y, float *w, float *h);
 
 #endif /* FAULT_DETECT_H */

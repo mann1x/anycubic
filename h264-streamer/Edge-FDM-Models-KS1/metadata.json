@@ -1,18 +1,23 @@
 {
     "name": "Edge FDM Models KS1",
-    "description": "BigEdge FDM fault detection models calibrated for Kobra S1",
+    "description": "BigEdge FDM fault detection models calibrated for Kobra S1 (color input, Feb 2026)",
+    "input": "448x224 RGB color, ImageNet normalization",
     "models": {
         "cnn": {
-            "display_name": "MobileNetV2 Sweep LS 0.05",
+            "display_name": "MobileNetV2 Color LS 0.05",
             "file": "model.rknn"
         },
         "protonet": {
-            "display_name": "ProtoNet Sweep Temp 0.05",
+            "display_name": "ProtoNet Color SupCon Temp 0.05",
             "file": "encoder.rknn",
-            "prototypes": "prototypes.bin"
+            "prototypes": "prototypes.bin",
+            "spatial": "spatial_encoder.rknn",
+            "spatial_prototypes": "spatial_prototypes.bin",
+            "spatial_coarse": "spatial_encoder_coarse.rknn",
+            "spatial_coarse_prototypes": "spatial_prototypes_coarse.bin"
         },
         "multiclass": {
-            "display_name": "Multiclass CNN v1",
+            "display_name": "Multiclass Color SupCon 7-class",
             "file": "multiclass.rknn"
         }
     },
@@ -21,7 +26,7 @@
             "description": "Kobra S1 calibrated (Feb 2026)",
             "cnn_threshold": 0.60,
             "cnn_dynamic_threshold": 0.55,
-            "proto_threshold": 0.65,
+            "proto_threshold": 0.58,
             "proto_dynamic_trigger": 0.70,
             "multi_threshold": 0.81
         }

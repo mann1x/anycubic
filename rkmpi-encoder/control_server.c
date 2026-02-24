@@ -15,6 +15,7 @@
 #include "lan_mode.h"
 #include "touch_inject.h"
 #include "fault_detect.h"
+#include "frame_buffer.h"
 #include "cJSON.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -485,6 +486,16 @@ static void serve_control_page(ControlServer *srv, int fd) {
     snprintf(mcfps_str, sizeof(mcfps_str), "%d", hw_max_fps);
     snprintf(log_max_size_str, sizeof(log_max_size_str), "%d", cfg->log_max_size);
 
+    /* Fault detection strings */
+    char fd_bp_str[4];
+    snprintf(fd_bp_str, sizeof(fd_bp_str), "%d", cfg->fd_beep_pattern);
+
+    /* Setup wizard strings */
+    char fd_setup_status_str[4], fd_setup_ts_str[24];
+    snprintf(fd_setup_status_str, sizeof(fd_setup_status_str), "%d", cfg->fd_setup_status);
+    snprintf(fd_setup_ts_str, sizeof(fd_setup_ts_str), "%lld",
+             (long long)cfg->fd_setup_timestamp);
+
     /* Timelapse strings */
     char tl_hi_str[12], tl_ofps_str[12], tl_tl_str[12];
     char tl_vfmin_str[12], tl_vfmax_str[12], tl_crf_str[12];
@@ -603,6 +614,9 @@ static void serve_control_page(ControlServer *srv, int fd) {
         { "fd_strategy", cfg->fault_detect_strategy },
         { "fd_model_set", cfg->fault_detect_model_set },
         { "heatmap_checked", cfg->heatmap_enabled ? checked : empty },
+        { "fd_beep_pattern", fd_bp_str },
+        { "fd_setup_status", fd_setup_status_str },
+        { "fd_setup_timestamp", fd_setup_ts_str },
     };
     int nvars = sizeof(vars) / sizeof(vars[0]);
 
@@ -806,13 +820,47 @@ static void serve_api_stats(ControlServer *srv, int fd) {
         cJSON_AddBoolToObject(fd_obj, "npu_available",
             fault_detect_npu_available());
 
+        /* Per-model confidence detail */
+        {
+            #define R2(v) (((int)((v) * 100 + 0.5f)) / 100.0)
+            cJSON *models = cJSON_CreateObject();
+            fd_result_t *lr = &fd_state.last_result;
+            if (lr->cnn_ran) {
+                cJSON *m = cJSON_CreateObject();
+                cJSON_AddNumberToObject(m, "raw", R2(lr->cnn_raw));
+                cJSON_AddNumberToObject(m, "fault_lk", R2(lr->cnn_fault_lk));
+                cJSON_AddNumberToObject(m, "ms", (int)(lr->cnn_ms + 0.5f));
+                cJSON_AddItemToObject(models, "cnn", m);
+            }
+            if (lr->proto_ran) {
+                cJSON *m = cJSON_CreateObject();
+                cJSON_AddNumberToObject(m, "raw", R2(lr->proto_raw));
+                cJSON_AddNumberToObject(m, "fault_lk", R2(lr->proto_fault_lk));
+                cJSON_AddNumberToObject(m, "ms", (int)(lr->proto_ms + 0.5f));
+                cJSON_AddItemToObject(models, "proto", m);
+            }
+            if (lr->multi_ran) {
+                cJSON *m = cJSON_CreateObject();
+                cJSON_AddNumberToObject(m, "raw", R2(lr->multi_raw));
+                cJSON_AddNumberToObject(m, "fault_lk", R2(lr->multi_fault_lk));
+                cJSON_AddNumberToObject(m, "ms", (int)(lr->multi_ms + 0.5f));
+                cJSON_AddItemToObject(models, "multi", m);
+            }
+            cJSON_AddItemToObject(fd_obj, "models", models);
+            #undef R2
+        }
+
         /* Spatial heatmap data */
         {
             cJSON *hm = cJSON_CreateObject();
             cJSON_AddBoolToObject(hm, "enabled",
                 srv->config->heatmap_enabled ? 1 : 0);
             if (fd_state.last_result.has_heatmap) {
+                int hm_h = fd_state.last_result.spatial_h > 0 ? fd_state.last_result.spatial_h : 7;
+                int hm_w = fd_state.last_result.spatial_w > 0 ? fd_state.last_result.spatial_w : 7;
                 cJSON_AddBoolToObject(hm, "has_data", 1);
+                cJSON_AddNumberToObject(hm, "rows", hm_h);
+                cJSON_AddNumberToObject(hm, "cols", hm_w);
                 cJSON_AddNumberToObject(hm, "max",
                     ((int)(fd_state.last_result.heatmap_max * 100 + 0.5f)) / 100.0);
                 cJSON_AddNumberToObject(hm, "max_row",
@@ -820,9 +868,9 @@ static void serve_api_stats(ControlServer *srv, int fd) {
                 cJSON_AddNumberToObject(hm, "max_col",
                     fd_state.last_result.heatmap_max_w);
                 cJSON *grid = cJSON_CreateArray();
-                for (int h = 0; h < FD_SPATIAL_H; h++) {
+                for (int h = 0; h < hm_h; h++) {
                     cJSON *row = cJSON_CreateArray();
-                    for (int w = 0; w < FD_SPATIAL_W; w++) {
+                    for (int w = 0; w < hm_w; w++) {
                         float v = fd_state.last_result.heatmap[h][w];
                         cJSON_AddItemToArray(row,
                             cJSON_CreateNumber(
@@ -833,6 +881,21 @@ static void serve_api_stats(ControlServer *srv, int fd) {
                 cJSON_AddItemToObject(hm, "grid", grid);
             } else {
                 cJSON_AddBoolToObject(hm, "has_data", 0);
+            }
+            /* Center-crop region */
+            {
+                float cx, cy, cw, ch;
+                fault_detect_get_crop(&cx, &cy, &cw, &ch);
+                cJSON *crop_obj = cJSON_CreateObject();
+                cJSON_AddNumberToObject(crop_obj, "x",
+                    ((int)(cx * 10000 + 0.5)) / 10000.0);
+                cJSON_AddNumberToObject(crop_obj, "y",
+                    ((int)(cy * 10000 + 0.5)) / 10000.0);
+                cJSON_AddNumberToObject(crop_obj, "w",
+                    ((int)(cw * 10000 + 0.5)) / 10000.0);
+                cJSON_AddNumberToObject(crop_obj, "h",
+                    ((int)(ch * 10000 + 0.5)) / 10000.0);
+                cJSON_AddItemToObject(hm, "crop", crop_obj);
             }
             cJSON_AddItemToObject(fd_obj, "heatmap", hm);
         }
@@ -988,6 +1051,12 @@ static void handle_fault_detect_settings(ControlServer *srv, int fd,
     item = cJSON_GetObjectItemCaseSensitive(root, "heatmap_enabled");
     if (item) cfg->heatmap_enabled = cJSON_IsTrue(item) ? 1 : 0;
 
+    item = cJSON_GetObjectItemCaseSensitive(root, "beep_pattern");
+    if (item && cJSON_IsNumber(item)) {
+        int v = item->valueint;
+        if (v >= 0 && v <= 5) cfg->fd_beep_pattern = v;
+    }
+
     item = cJSON_GetObjectItemCaseSensitive(root, "strategy");
     if (item && cJSON_IsString(item) && item->valuestring)
         safe_strcpy(cfg->fault_detect_strategy,
@@ -1092,6 +1161,761 @@ static void handle_fault_detect_settings(ControlServer *srv, int fd,
 
     send_http_response(fd, 200, "application/json",
                       "{\"status\":\"ok\"}", 15, NULL);
+}
+
+/* ============================================================================
+ * Setup Wizard API Endpoints
+ * ============================================================================ */
+
+/* Point-in-polygon test using cross-product winding (convex polygon assumed).
+ * pts: array of x,y pairs (n points = 2*n floats), ordered clockwise or CCW. */
+static int point_in_polygon(float px, float py, const float *pts, int n) {
+    int sign = 0;
+    for (int i = 0; i < n; i++) {
+        int j = (i + 1) % n;
+        float ex = pts[j*2] - pts[i*2];
+        float ey = pts[j*2+1] - pts[i*2+1];
+        float dx = px - pts[i*2];
+        float dy = py - pts[i*2+1];
+        float cross = ex * dy - ey * dx;
+        if (cross > 0) {
+            if (sign < 0) return 0;
+            sign = 1;
+        } else if (cross < 0) {
+            if (sign > 0) return 0;
+            sign = -1;
+        }
+    }
+    return 1;
+}
+
+/* Compute mask from corner points for a given grid size.
+ * Points ordered clockwise: TL,TM,TR,MR,BR,BM,BL,ML (8-point) or TL,TR,BR,BL (4-point).
+ * Uses 3x3 sub-sampling per cell: if >= 3/9 (33%) of samples are inside, cell is active. */
+static fd_mask196_t compute_mask_from_corners(const float *corners, int npts,
+                                               int grid_h, int grid_w) {
+    fd_mask196_t mask;
+    fd_mask_clear(&mask);
+    /* Grid cells map to the center-crop region, not the full image */
+    float cx, cy, cw, ch;
+    fault_detect_get_crop(&cx, &cy, &cw, &ch);
+    for (int r = 0; r < grid_h; r++) {
+        for (int c = 0; c < grid_w; c++) {
+            int inside = 0;
+            /* 3x3 sub-sample grid within each cell */
+            for (int sr = 0; sr < 3; sr++) {
+                for (int sc = 0; sc < 3; sc++) {
+                    float sx = cx + (c + (sc + 0.5f) / 3.0f) / (float)grid_w * cw;
+                    float sy = cy + (r + (sr + 0.5f) / 3.0f) / (float)grid_h * ch;
+                    if (point_in_polygon(sx, sy, corners, npts))
+                        inside++;
+                }
+            }
+            /* Include cell if >= 33% of samples are inside the plate */
+            if (inside >= 3)
+                fd_mask_set_bit(&mask, r * grid_w + c);
+        }
+    }
+    return mask;
+}
+
+/* GET /setup - Serve wizard page */
+static void serve_setup_page(ControlServer *srv, int fd) {
+    char *tmpl = load_template(srv->template_dir, "setup.html");
+    if (!tmpl) {
+        send_http_response(fd, 500, "text/plain",
+                          "Template not found", 18, NULL);
+        return;
+    }
+
+    AppConfig *cfg = srv->config;
+
+    char sp_str[12], cp_str[12], status_str[4];
+    char bed_x_str[8], bed_y_str[8];
+    char grid_h_str[4], grid_w_str[4];
+    snprintf(sp_str, sizeof(sp_str), "%d", cfg->streaming_port);
+    snprintf(cp_str, sizeof(cp_str), "%d", cfg->control_port);
+    snprintf(status_str, sizeof(status_str), "%d", cfg->fd_setup_status);
+    snprintf(bed_x_str, sizeof(bed_x_str), "%d", cfg->fd_bed_size_x);
+    snprintf(bed_y_str, sizeof(bed_y_str), "%d", cfg->fd_bed_size_y);
+    int gh, gw;
+    fault_detect_get_spatial_dims(&gh, &gw);
+    snprintf(grid_h_str, sizeof(grid_h_str), "%d", gh);
+    snprintf(grid_w_str, sizeof(grid_w_str), "%d", gw);
+
+    /* Build corners JSON array string (16 floats for 8 points) */
+    char corners_str[512];
+    int cpos = 0;
+    cpos += snprintf(corners_str + cpos, sizeof(corners_str) - cpos, "[");
+    for (int i = 0; i < 16; i++) {
+        if (i > 0) cpos += snprintf(corners_str + cpos, sizeof(corners_str) - cpos, ",");
+        cpos += snprintf(corners_str + cpos, sizeof(corners_str) - cpos, "%.4f", cfg->fd_setup_corners[i]);
+    }
+    snprintf(corners_str + cpos, sizeof(corners_str) - cpos, "]");
+
+    /* Z-masks JSON string for template (or empty array) */
+    const char *z_masks_str = cfg->fd_z_masks_json[0] ? cfg->fd_z_masks_json : "[]";
+
+    /* Center-crop region for heatmap alignment */
+    float crop_fx, crop_fy, crop_fw, crop_fh;
+    fault_detect_get_crop(&crop_fx, &crop_fy, &crop_fw, &crop_fh);
+    char crop_x_str[12], crop_y_str[12], crop_w_str[12], crop_h_str[12];
+    snprintf(crop_x_str, sizeof(crop_x_str), "%.4f", crop_fx);
+    snprintf(crop_y_str, sizeof(crop_y_str), "%.4f", crop_fy);
+    snprintf(crop_w_str, sizeof(crop_w_str), "%.4f", crop_fw);
+    snprintf(crop_h_str, sizeof(crop_h_str), "%.4f", crop_fh);
+
+    TemplateVar vars[] = {
+        { "streaming_port", sp_str },
+        { "control_port", cp_str },
+        { "fd_setup_status", status_str },
+        { "fd_setup_corners", corners_str },
+        { "fd_setup_mask", cfg->fd_setup_mask_hex },
+        { "fd_bed_size_x", bed_x_str },
+        { "fd_bed_size_y", bed_y_str },
+        { "fd_z_masks", z_masks_str },
+        { "fd_grid_h", grid_h_str },
+        { "fd_grid_w", grid_w_str },
+        { "fd_crop_x", crop_x_str },
+        { "fd_crop_y", crop_y_str },
+        { "fd_crop_w", crop_w_str },
+        { "fd_crop_h", crop_h_str },
+    };
+    int nvars = sizeof(vars) / sizeof(vars[0]);
+
+    char *html = template_substitute(tmpl, vars, nvars);
+    free(tmpl);
+
+    if (html) {
+        send_http_response(fd, 200, "text/html; charset=utf-8", html, strlen(html),
+                          "Cache-Control: no-cache\r\n");
+        free(html);
+    } else {
+        send_http_response(fd, 500, "text/plain", "Template error", 14, NULL);
+    }
+}
+
+/* GET /api/setup/status - Current setup state + live heatmap */
+static void serve_setup_status(ControlServer *srv, int fd) {
+    AppConfig *cfg = srv->config;
+    cJSON *root = cJSON_CreateObject();
+
+    cJSON_AddNumberToObject(root, "status", cfg->fd_setup_status);
+    cJSON_AddNumberToObject(root, "timestamp", (double)cfg->fd_setup_timestamp);
+
+    /* Corners array (16 floats for 8 points) */
+    cJSON *corners = cJSON_CreateArray();
+    for (int i = 0; i < 16; i++)
+        cJSON_AddItemToArray(corners, cJSON_CreateNumber(cfg->fd_setup_corners[i]));
+    cJSON_AddItemToObject(root, "corners", corners);
+
+    cJSON_AddStringToObject(root, "mask", cfg->fd_setup_mask_hex);
+    {
+        int gh, gw;
+        fault_detect_get_spatial_dims(&gh, &gw);
+        cJSON_AddNumberToObject(root, "grid_h", gh);
+        cJSON_AddNumberToObject(root, "grid_w", gw);
+    }
+
+    /* Check if corners are defined (any non-zero) */
+    int has_corners = 0;
+    for (int i = 0; i < 16; i++) {
+        if (cfg->fd_setup_corners[i] > 0.001f) { has_corners = 1; break; }
+    }
+    cJSON_AddBoolToObject(root, "has_corners", has_corners);
+
+    cJSON_AddNumberToObject(root, "bed_size_x", cfg->fd_bed_size_x);
+    cJSON_AddNumberToObject(root, "bed_size_y", cfg->fd_bed_size_y);
+
+    /* Moonraker state */
+    if (g_moonraker_client) {
+        cJSON_AddBoolToObject(root, "moonraker_connected",
+                               moonraker_client_is_connected(g_moonraker_client));
+        cJSON_AddStringToObject(root, "print_state",
+                                 g_moonraker_client->print_state);
+        /* Toolhead position */
+        if (g_moonraker_client->has_position) {
+            cJSON *pos = cJSON_CreateArray();
+            for (int i = 0; i < 4; i++)
+                cJSON_AddItemToArray(pos, cJSON_CreateNumber(g_moonraker_client->position[i]));
+            cJSON_AddItemToObject(root, "toolhead_position", pos);
+        }
+    } else {
+        cJSON_AddBoolToObject(root, "moonraker_connected", 0);
+        cJSON_AddStringToObject(root, "print_state", "unknown");
+    }
+
+    /* Z-dependent masks */
+    cJSON_AddBoolToObject(root, "has_z_masks", cfg->fd_z_masks_json[0] != '\0');
+    if (cfg->fd_z_masks_json[0]) {
+        cJSON *zm = cJSON_Parse(cfg->fd_z_masks_json);
+        if (zm) cJSON_AddItemToObject(root, "z_masks", zm);
+    }
+
+    /* FD state */
+    cJSON_AddBoolToObject(root, "fd_enabled", cfg->fault_detect_enabled);
+    cJSON_AddBoolToObject(root, "heatmap_enabled", cfg->heatmap_enabled);
+
+    fd_state_t fd_state = fault_detect_get_state();
+    const char *fd_status_str;
+    switch (fd_state.status) {
+    case FD_STATUS_ENABLED:  fd_status_str = "enabled"; break;
+    case FD_STATUS_ACTIVE:   fd_status_str = "active"; break;
+    case FD_STATUS_DISABLED: fd_status_str = "disabled"; break;
+    case FD_STATUS_ERROR:    fd_status_str = "error"; break;
+    case FD_STATUS_NO_NPU:   fd_status_str = "no_npu"; break;
+    case FD_STATUS_MEM_LOW:  fd_status_str = "mem_low"; break;
+    default:                 fd_status_str = "unknown"; break;
+    }
+    cJSON_AddStringToObject(root, "fd_status", fd_status_str);
+
+    /* Live heatmap data */
+    if (fd_state.last_result.has_heatmap) {
+        int hm_h = fd_state.last_result.spatial_h > 0 ? fd_state.last_result.spatial_h : 7;
+        int hm_w = fd_state.last_result.spatial_w > 0 ? fd_state.last_result.spatial_w : 7;
+        cJSON *hm = cJSON_CreateArray();
+        for (int r = 0; r < hm_h; r++) {
+            cJSON *row = cJSON_CreateArray();
+            for (int c = 0; c < hm_w; c++)
+                cJSON_AddItemToArray(row,
+                    cJSON_CreateNumber(round2(fd_state.last_result.heatmap[r][c])));
+            cJSON_AddItemToArray(hm, row);
+        }
+        cJSON_AddItemToObject(root, "heatmap", hm);
+    }
+
+    /* Center-crop region for heatmap alignment */
+    {
+        float cx, cy, cw, ch;
+        fault_detect_get_crop(&cx, &cy, &cw, &ch);
+        cJSON *crop_obj = cJSON_CreateObject();
+        cJSON_AddNumberToObject(crop_obj, "x", ((int)(cx * 10000 + 0.5)) / 10000.0);
+        cJSON_AddNumberToObject(crop_obj, "y", ((int)(cy * 10000 + 0.5)) / 10000.0);
+        cJSON_AddNumberToObject(crop_obj, "w", ((int)(cw * 10000 + 0.5)) / 10000.0);
+        cJSON_AddNumberToObject(crop_obj, "h", ((int)(ch * 10000 + 0.5)) / 10000.0);
+        cJSON_AddItemToObject(root, "crop", crop_obj);
+    }
+
+    /* Results JSON if present */
+    if (cfg->fd_setup_results_json[0]) {
+        cJSON *res = cJSON_Parse(cfg->fd_setup_results_json);
+        if (res)
+            cJSON_AddItemToObject(root, "results", res);
+    }
+
+    /* USB drive status for training data */
+    {
+        struct stat usb_stat;
+        int usb_ok = (stat("/mnt/udisk", &usb_stat) == 0 && S_ISDIR(usb_stat.st_mode));
+        if (usb_ok) {
+            struct statvfs usb_vfs;
+            if (statvfs("/mnt/udisk", &usb_vfs) == 0) {
+                uint64_t total = (uint64_t)usb_vfs.f_blocks * usb_vfs.f_frsize;
+                if (total > 0) {
+                    uint64_t avail = (uint64_t)usb_vfs.f_bavail * usb_vfs.f_frsize;
+                    cJSON_AddNumberToObject(root, "usb_free_mb",
+                                            (double)avail / (1024 * 1024));
+                } else {
+                    usb_ok = 0;
+                }
+            } else {
+                usb_ok = 0;
+            }
+        }
+        cJSON_AddBoolToObject(root, "usb_mounted", usb_ok);
+
+        /* Check if training new/ folder exists (in-progress data) */
+        struct stat new_stat;
+        int has_new = (stat("/mnt/udisk/fault_detect/training_data/new", &new_stat) == 0
+                       && S_ISDIR(new_stat.st_mode));
+        cJSON_AddBoolToObject(root, "training_in_progress", has_new);
+    }
+
+    send_json_response(fd, 200, root);
+    cJSON_Delete(root);
+}
+
+/* POST /api/setup/ handler dispatcher */
+static void handle_setup_post(ControlServer *srv, int fd,
+                               const char *action, const char *body) {
+    AppConfig *cfg = srv->config;
+
+    if (strcmp(action, "corners") == 0) {
+        /* POST /api/setup/corners - Save corners + auto-compute mask */
+        cJSON *root = cJSON_Parse(body);
+        if (!root) {
+            send_json_error(fd, 400, "invalid JSON");
+            return;
+        }
+
+        cJSON *corners = cJSON_GetObjectItemCaseSensitive(root, "corners");
+        int ncorners = corners ? cJSON_GetArraySize(corners) : 0;
+        if (!corners || !cJSON_IsArray(corners) || (ncorners != 8 && ncorners != 16)) {
+            cJSON_Delete(root);
+            send_json_error(fd, 400, "corners must be array of 8 or 16 floats");
+            return;
+        }
+
+        memset(cfg->fd_setup_corners, 0, sizeof(cfg->fd_setup_corners));
+        for (int i = 0; i < ncorners; i++) {
+            cJSON *v = cJSON_GetArrayItem(corners, i);
+            if (!v || !cJSON_IsNumber(v)) {
+                cJSON_Delete(root);
+                send_json_error(fd, 400, "corners values must be numbers");
+                return;
+            }
+            float f = (float)v->valuedouble;
+            if (f < 0.0f) f = 0.0f;
+            if (f > 1.0f) f = 1.0f;
+            cfg->fd_setup_corners[i] = f;
+        }
+
+        /* Bed size (optional) */
+        cJSON *bx = cJSON_GetObjectItemCaseSensitive(root, "bed_size_x");
+        cJSON *by = cJSON_GetObjectItemCaseSensitive(root, "bed_size_y");
+        if (bx && cJSON_IsNumber(bx)) {
+            int v = bx->valueint;
+            if (v >= 100 && v <= 500) cfg->fd_bed_size_x = v;
+        }
+        if (by && cJSON_IsNumber(by)) {
+            int v = by->valueint;
+            if (v >= 100 && v <= 500) cfg->fd_bed_size_y = v;
+        }
+
+        cJSON_Delete(root);
+
+        /* Auto-compute mask (8 points if 16 floats, 4 points if 8 floats) */
+        int npts = (ncorners == 16) ? 8 : 4;
+        int gh, gw;
+        fault_detect_get_spatial_dims(&gh, &gw);
+        fd_mask196_t computed_mask = compute_mask_from_corners(
+            cfg->fd_setup_corners, npts, gh, gw);
+        fd_mask_to_hex(&computed_mask, cfg->fd_setup_mask_hex,
+                       sizeof(cfg->fd_setup_mask_hex));
+        cfg->fd_setup_status = FD_SETUP_INPROGRESS;
+
+        /* Propagate mask to FD config */
+        fd_config_t fd_cfg = fault_detect_get_config();
+        fd_cfg.heatmap_mask = computed_mask;
+        fault_detect_set_config(&fd_cfg);
+
+        config_save(cfg, cfg->config_file);
+
+        /* Return computed mask as hex string */
+        cJSON *resp = cJSON_CreateObject();
+        cJSON_AddStringToObject(resp, "status", "ok");
+        cJSON_AddStringToObject(resp, "mask", cfg->fd_setup_mask_hex);
+        send_json_response(fd, 200, resp);
+        cJSON_Delete(resp);
+    }
+    else if (strcmp(action, "gcode") == 0) {
+        /* POST /api/setup/gcode - Send G-code via Moonraker */
+        cJSON *root = cJSON_Parse(body);
+        if (!root) {
+            send_json_error(fd, 400, "invalid JSON");
+            return;
+        }
+
+        cJSON *gc = cJSON_GetObjectItemCaseSensitive(root, "gcode");
+        if (!gc || !cJSON_IsString(gc) || !gc->valuestring) {
+            cJSON_Delete(root);
+            send_json_error(fd, 400, "gcode field required");
+            return;
+        }
+
+        int ret = -1;
+        if (g_moonraker_client)
+            ret = moonraker_client_send_gcode(g_moonraker_client, gc->valuestring);
+
+        cJSON_Delete(root);
+
+        cJSON *resp = cJSON_CreateObject();
+        if (ret == 0) {
+            cJSON_AddStringToObject(resp, "status", "ok");
+        } else {
+            cJSON_AddStringToObject(resp, "status", "error");
+            cJSON_AddStringToObject(resp, "message", "not connected");
+        }
+        send_json_response(fd, ret == 0 ? 200 : 503, resp);
+        cJSON_Delete(resp);
+    }
+    else if (strcmp(action, "start") == 0) {
+        /* POST /api/setup/start - Enable setup mode */
+        fd_config_t fd_cfg = fault_detect_get_config();
+        fd_cfg.setup_mode = 1;
+        fd_cfg.heatmap_enabled = 1;
+        fd_cfg.enabled = 1;
+        fault_detect_set_config(&fd_cfg);
+
+        /* Also enable in app config if not already */
+        if (!cfg->fault_detect_enabled) {
+            cfg->fault_detect_enabled = 1;
+            cfg->heatmap_enabled = 1;
+        }
+        if (!cfg->heatmap_enabled)
+            cfg->heatmap_enabled = 1;
+
+        /* Start FD thread if not running */
+        if (fault_detect_npu_available())
+            fault_detect_start();
+
+        /* Turn LED on — FD needs good lighting for reliable detection */
+        mqtt_send_led(1, 100);
+
+        send_http_response(fd, 200, "application/json",
+                          "{\"status\":\"ok\"}", 15, NULL);
+    }
+    else if (strcmp(action, "stop") == 0) {
+        /* POST /api/setup/stop - Disable setup mode */
+        fd_config_t fd_cfg = fault_detect_get_config();
+        fd_cfg.setup_mode = 0;
+        fault_detect_set_config(&fd_cfg);
+
+        send_http_response(fd, 200, "application/json",
+                          "{\"status\":\"ok\"}", 15, NULL);
+    }
+    else if (strcmp(action, "verify") == 0) {
+        /* POST /api/setup/verify - Record a verification step result */
+        cJSON *root = cJSON_Parse(body);
+        if (!root) {
+            send_json_error(fd, 400, "invalid JSON");
+            return;
+        }
+
+        /* Parse existing results or create new */
+        cJSON *results = NULL;
+        if (cfg->fd_setup_results_json[0])
+            results = cJSON_Parse(cfg->fd_setup_results_json);
+        if (!results)
+            results = cJSON_CreateObject();
+
+        /* Build step key from step number */
+        cJSON *step_item = cJSON_GetObjectItemCaseSensitive(root, "step");
+        int step = step_item && cJSON_IsNumber(step_item) ? step_item->valueint : -1;
+        char step_key[16];
+        snprintf(step_key, sizeof(step_key), "%d", step);
+
+        /* Store the entire body as the step result */
+        cJSON *step_copy = cJSON_Duplicate(root, 1);
+        cJSON_DeleteItemFromObjectCaseSensitive(results, step_key);
+        cJSON_AddItemToObject(results, step_key, step_copy);
+
+        /* Serialize back */
+        char *res_str = cJSON_PrintUnformatted(results);
+        if (res_str) {
+            safe_strcpy(cfg->fd_setup_results_json,
+                        sizeof(cfg->fd_setup_results_json), res_str);
+            free(res_str);
+        }
+        cJSON_Delete(results);
+        cJSON_Delete(root);
+
+        send_http_response(fd, 200, "application/json",
+                          "{\"status\":\"ok\"}", 15, NULL);
+    }
+    else if (strcmp(action, "complete") == 0) {
+        /* POST /api/setup/complete - Mark calibration done */
+        cfg->fd_setup_status = FD_SETUP_OK;
+        cfg->fd_setup_timestamp = (int64_t)time(NULL);
+
+        /* Disable setup mode */
+        fd_config_t fd_cfg = fault_detect_get_config();
+        fd_cfg.setup_mode = 0;
+        fault_detect_set_config(&fd_cfg);
+
+        config_save(cfg, cfg->config_file);
+
+        /* Finalize training data: remove old current/, rename new/ → current/ */
+        struct stat st;
+        if (stat("/mnt/udisk/fault_detect/training_data/new", &st) == 0) {
+            system("rm -rf /mnt/udisk/fault_detect/training_data/current");
+            rename("/mnt/udisk/fault_detect/training_data/new",
+                   "/mnt/udisk/fault_detect/training_data/current");
+        }
+
+        send_http_response(fd, 200, "application/json",
+                          "{\"status\":\"ok\"}", 15, NULL);
+    }
+    else if (strcmp(action, "reset") == 0) {
+        /* POST /api/setup/reset - Clear all setup data */
+        cfg->fd_setup_status = FD_SETUP_NONE;
+        cfg->fd_setup_timestamp = 0;
+        memset(cfg->fd_setup_corners, 0, sizeof(cfg->fd_setup_corners));
+        /* All 196 bits active */
+        strncpy(cfg->fd_setup_mask_hex,
+            "000000000000000f:ffffffffffffffff:ffffffffffffffff:ffffffffffffffff",
+            sizeof(cfg->fd_setup_mask_hex) - 1);
+        cfg->fd_setup_results_json[0] = '\0';
+        cfg->fd_z_masks_json[0] = '\0';
+
+        /* Propagate to FD config */
+        fd_config_t fd_cfg = fault_detect_get_config();
+        fd_mask_from_hex(cfg->fd_setup_mask_hex, &fd_cfg.heatmap_mask);
+        fd_cfg.setup_mode = 0;
+        fault_detect_set_config(&fd_cfg);
+        fault_detect_set_z_masks(NULL, 0);
+
+        config_save(cfg, cfg->config_file);
+
+        send_http_response(fd, 200, "application/json",
+                          "{\"status\":\"ok\"}", 15, NULL);
+    }
+    else if (strcmp(action, "save_image") == 0) {
+        /* POST /api/setup/save_image - Save current JPEG frame to USB training folder */
+        cJSON *root = cJSON_Parse(body);
+        if (!root) {
+            send_json_error(fd, 400, "invalid JSON");
+            return;
+        }
+
+        cJSON *folder_item = cJSON_GetObjectItemCaseSensitive(root, "folder");
+        if (!folder_item || !cJSON_IsString(folder_item) || !folder_item->valuestring) {
+            cJSON_Delete(root);
+            send_json_error(fd, 400, "folder field required");
+            return;
+        }
+
+        /* Sanitize folder name (no slashes or dots) */
+        const char *folder = folder_item->valuestring;
+        if (strstr(folder, "..") || strchr(folder, '/') || strlen(folder) > 64) {
+            cJSON_Delete(root);
+            send_json_error(fd, 400, "invalid folder name");
+            return;
+        }
+
+        /* Build path: /mnt/udisk/fault_detect/training_data/new/<folder>/ */
+        char dir_path[512];
+        snprintf(dir_path, sizeof(dir_path),
+                 "/mnt/udisk/fault_detect/training_data/new/%s", folder);
+
+        /* Ensure directory exists */
+        mkdir(dir_path, 0755);
+
+        /* Copy current JPEG frame */
+        uint8_t *jpeg_buf = malloc(FRAME_BUFFER_MAX_JPEG);
+        if (!jpeg_buf) {
+            cJSON_Delete(root);
+            send_json_error(fd, 500, "out of memory");
+            return;
+        }
+
+        size_t jpeg_size = frame_buffer_copy(&g_jpeg_buffer, jpeg_buf,
+                                              FRAME_BUFFER_MAX_JPEG, NULL, NULL, NULL);
+        if (jpeg_size == 0) {
+            free(jpeg_buf);
+            cJSON_Delete(root);
+            send_json_error(fd, 503, "no frame available");
+            return;
+        }
+
+        /* Generate filename with timestamp */
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        char filepath[600];
+        snprintf(filepath, sizeof(filepath), "%s/%ld_%03ld.jpg",
+                 dir_path, (long)ts.tv_sec, ts.tv_nsec / 1000000);
+
+        /* Write JPEG to file */
+        FILE *fp = fopen(filepath, "wb");
+        int ok = 0;
+        if (fp) {
+            ok = (fwrite(jpeg_buf, 1, jpeg_size, fp) == jpeg_size);
+            fclose(fp);
+        }
+        free(jpeg_buf);
+        cJSON_Delete(root);
+
+        cJSON *resp = cJSON_CreateObject();
+        if (ok) {
+            cJSON_AddStringToObject(resp, "status", "ok");
+            cJSON_AddStringToObject(resp, "path", filepath);
+            cJSON_AddNumberToObject(resp, "size", (double)jpeg_size);
+        } else {
+            cJSON_AddStringToObject(resp, "status", "error");
+            cJSON_AddStringToObject(resp, "message", "write failed");
+        }
+        send_json_response(fd, ok ? 200 : 500, resp);
+        cJSON_Delete(resp);
+    }
+    else if (strcmp(action, "init_training") == 0) {
+        /* POST /api/setup/init_training - Create training folder structure on USB */
+        cJSON *root = cJSON_Parse(body);
+        int do_cleanup = 0;
+        if (root) {
+            cJSON *cleanup = cJSON_GetObjectItemCaseSensitive(root, "cleanup");
+            if (cleanup && cJSON_IsTrue(cleanup)) do_cleanup = 1;
+            cJSON_Delete(root);
+        }
+
+        /* Check USB mounted */
+        struct stat usb_stat;
+        int usb_mounted = (stat("/mnt/udisk", &usb_stat) == 0 && S_ISDIR(usb_stat.st_mode));
+        if (usb_mounted) {
+            struct statvfs usb_vfs;
+            if (statvfs("/mnt/udisk", &usb_vfs) == 0) {
+                uint64_t total = (uint64_t)usb_vfs.f_blocks * usb_vfs.f_frsize;
+                if (total == 0) usb_mounted = 0;
+            } else {
+                usb_mounted = 0;
+            }
+        }
+
+        if (!usb_mounted) {
+            send_json_error(fd, 503, "USB drive not mounted");
+            return;
+        }
+
+        /* If cleanup requested, remove new/ folder contents */
+        if (do_cleanup) {
+            /* rm -rf /mnt/udisk/fault_detect/training_data/new/ contents */
+            char cmd[256];
+            snprintf(cmd, sizeof(cmd),
+                     "rm -rf /mnt/udisk/fault_detect/training_data/new/*");
+            system(cmd);
+        }
+
+        /* Create folder hierarchy */
+        mkdir("/mnt/udisk/fault_detect", 0755);
+        mkdir("/mnt/udisk/fault_detect/training_data", 0755);
+        mkdir("/mnt/udisk/fault_detect/training_data/new", 0755);
+
+        send_http_response(fd, 200, "application/json",
+                          "{\"status\":\"ok\"}", 15, NULL);
+    }
+    else if (strcmp(action, "z_scan") == 0) {
+        /* POST /api/setup/z_scan - Record mask at a Z height */
+        cJSON *root = cJSON_Parse(body);
+        if (!root) {
+            send_json_error(fd, 400, "invalid JSON");
+            return;
+        }
+
+        cJSON *z_item = cJSON_GetObjectItemCaseSensitive(root, "z_mm");
+        cJSON *m_item = cJSON_GetObjectItemCaseSensitive(root, "mask");
+        if (!z_item || !cJSON_IsNumber(z_item) || !m_item) {
+            cJSON_Delete(root);
+            send_json_error(fd, 400, "z_mm and mask fields required");
+            return;
+        }
+
+        float z_mm = (float)z_item->valuedouble;
+        /* Accept mask as hex string or number (backward compat) */
+        char mask_hex[128];
+        if (cJSON_IsString(m_item) && m_item->valuestring) {
+            safe_strcpy(mask_hex, sizeof(mask_hex), m_item->valuestring);
+        } else if (cJSON_IsNumber(m_item)) {
+            fd_mask196_t tmp = fd_mask_from_u64((uint64_t)m_item->valuedouble);
+            fd_mask_to_hex(&tmp, mask_hex, sizeof(mask_hex));
+        } else {
+            cJSON_Delete(root);
+            send_json_error(fd, 400, "mask must be hex string or number");
+            return;
+        }
+        cJSON_Delete(root);
+
+        /* Parse existing z_masks array or create new */
+        cJSON *zm_arr = NULL;
+        if (cfg->fd_z_masks_json[0])
+            zm_arr = cJSON_Parse(cfg->fd_z_masks_json);
+        if (!zm_arr || !cJSON_IsArray(zm_arr)) {
+            if (zm_arr) cJSON_Delete(zm_arr);
+            zm_arr = cJSON_CreateArray();
+        }
+
+        /* Insert in sorted order by z_mm */
+        int inserted = 0;
+        int n = cJSON_GetArraySize(zm_arr);
+        for (int i = 0; i < n; i++) {
+            cJSON *pair = cJSON_GetArrayItem(zm_arr, i);
+            if (cJSON_IsArray(pair) && cJSON_GetArraySize(pair) >= 1) {
+                float existing_z = (float)cJSON_GetArrayItem(pair, 0)->valuedouble;
+                if (fabsf(existing_z - z_mm) < 0.01f) {
+                    cJSON *new_pair = cJSON_CreateArray();
+                    cJSON_AddItemToArray(new_pair, cJSON_CreateNumber(z_mm));
+                    cJSON_AddItemToArray(new_pair, cJSON_CreateString(mask_hex));
+                    cJSON_ReplaceItemInArray(zm_arr, i, new_pair);
+                    inserted = 1;
+                    break;
+                }
+                if (existing_z > z_mm) {
+                    cJSON *new_pair = cJSON_CreateArray();
+                    cJSON_AddItemToArray(new_pair, cJSON_CreateNumber(z_mm));
+                    cJSON_AddItemToArray(new_pair, cJSON_CreateString(mask_hex));
+                    cJSON_InsertItemInArray(zm_arr, i, new_pair);
+                    inserted = 1;
+                    break;
+                }
+            }
+        }
+        if (!inserted) {
+            cJSON *new_pair = cJSON_CreateArray();
+            cJSON_AddItemToArray(new_pair, cJSON_CreateNumber(z_mm));
+            cJSON_AddItemToArray(new_pair, cJSON_CreateString(mask_hex));
+            cJSON_AddItemToArray(zm_arr, new_pair);
+        }
+
+        /* Serialize back */
+        char *zm_str = cJSON_PrintUnformatted(zm_arr);
+        if (zm_str) {
+            safe_strcpy(cfg->fd_z_masks_json, sizeof(cfg->fd_z_masks_json), zm_str);
+            free(zm_str);
+        }
+        cJSON_Delete(zm_arr);
+
+        cJSON *resp = cJSON_CreateObject();
+        cJSON_AddStringToObject(resp, "status", "ok");
+        cJSON_AddNumberToObject(resp, "z_mm", z_mm);
+        cJSON_AddStringToObject(resp, "mask", mask_hex);
+        send_json_response(fd, 200, resp);
+        cJSON_Delete(resp);
+    }
+    else if (strcmp(action, "z_masks_complete") == 0) {
+        /* POST /api/setup/z_masks_complete - Finalize Z-scan, load into FD */
+        if (cfg->fd_z_masks_json[0]) {
+            cJSON *zm_arr = cJSON_Parse(cfg->fd_z_masks_json);
+            if (zm_arr && cJSON_IsArray(zm_arr)) {
+                int n = cJSON_GetArraySize(zm_arr);
+                if (n > FD_Z_MASK_MAX_ENTRIES) n = FD_Z_MASK_MAX_ENTRIES;
+                fd_z_mask_entry_t entries[FD_Z_MASK_MAX_ENTRIES];
+                int count = 0;
+                for (int i = 0; i < n; i++) {
+                    cJSON *pair = cJSON_GetArrayItem(zm_arr, i);
+                    if (cJSON_IsArray(pair) && cJSON_GetArraySize(pair) >= 2) {
+                        entries[count].z_mm = (float)cJSON_GetArrayItem(pair, 0)->valuedouble;
+                        cJSON *mask_item = cJSON_GetArrayItem(pair, 1);
+                        if (cJSON_IsString(mask_item) && mask_item->valuestring)
+                            fd_mask_from_hex(mask_item->valuestring, &entries[count].mask);
+                        else
+                            entries[count].mask = fd_mask_from_u64((uint64_t)mask_item->valuedouble);
+                        count++;
+                    }
+                }
+                fault_detect_set_z_masks(entries, count);
+                cJSON_Delete(zm_arr);
+            } else {
+                if (zm_arr) cJSON_Delete(zm_arr);
+            }
+        }
+
+        config_save(cfg, cfg->config_file);
+
+        cJSON *resp = cJSON_CreateObject();
+        cJSON_AddStringToObject(resp, "status", "ok");
+        send_json_response(fd, 200, resp);
+        cJSON_Delete(resp);
+    }
+    else if (strcmp(action, "z_masks_reset") == 0) {
+        /* POST /api/setup/z_masks_reset - Clear Z-mask table */
+        cfg->fd_z_masks_json[0] = '\0';
+        fault_detect_set_z_masks(NULL, 0);
+        config_save(cfg, cfg->config_file);
+
+        send_http_response(fd, 200, "application/json",
+                          "{\"status\":\"ok\"}", 15, NULL);
+    }
+    else {
+        send_404(fd);
+    }
 }
 
 /* GET /api/camera/controls - Camera control ranges and values */
@@ -2986,6 +3810,16 @@ static void handle_client(ControlServer *srv, int client_fd,
     }
     else if (is_post && strcmp(path, "/api/fault_detect/settings") == 0) {
         handle_fault_detect_settings(srv, client_fd, post_body ? post_body : "");
+    }
+    /* Setup wizard routes */
+    else if (is_get && strcmp(path, "/setup") == 0) {
+        serve_setup_page(srv, client_fd);
+    }
+    else if (is_get && strcmp(path, "/api/setup/status") == 0) {
+        serve_setup_status(srv, client_fd);
+    }
+    else if (is_post && strncmp(path, "/api/setup/", 11) == 0) {
+        handle_setup_post(srv, client_fd, path + 11, post_body ? post_body : "");
     }
     /* Streaming redirects */
     else if (is_get && strcmp(path, "/stream") == 0) {
