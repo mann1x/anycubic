@@ -459,23 +459,16 @@ fail:
     return ret;
 }
 
-/* Retry model init once after a short delay (CMA alloc can be transient).
- * No compact_memory or drop_caches — those destabilize the system.
- * Returns 0=ok, -1=generic error, -2=memory/CMA failure */
 static int fd_model_init_retry(fd_rknn_model_t *m, const char *model_path)
 {
     int ret = fd_model_init(m, model_path);
-    if (ret == 0)
-        return 0;
-
+    if (ret == 0) return 0;
     fd_log("Retrying model init after 200ms...\n");
     usleep(200000);
     ret = fd_model_init(m, model_path);
-    if (ret == 0)
-        return 0;
-
+    if (ret == 0) return 0;
     fd_err("Model init failed after retry: %s\n", model_path);
-    return ret;  /* preserve -2 for CMA failures */
+    return ret;
 }
 
 static int fd_model_run(fd_rknn_model_t *m, const uint8_t *input_data,
@@ -984,7 +977,6 @@ static void fd_get_thresholds(const fd_config_t *cfg, int strategy,
 static int fd_run_cnn(const uint8_t *input, fd_result_t *r, float threshold,
                        const fd_config_t *cfg)
 {
-    fd_rknn_model_t model;
     char path[512];
 
     if (fd_resolve_model_path(FD_MODEL_CNN, cfg->model_set,
@@ -993,6 +985,7 @@ static int fd_run_cnn(const uint8_t *input, fd_result_t *r, float threshold,
         return -1;
     }
 
+    fd_rknn_model_t model;
     int init_ret = fd_model_init_retry(&model, path);
     if (init_ret < 0)
         return init_ret;
@@ -1049,7 +1042,6 @@ static int fd_run_cnn(const uint8_t *input, fd_result_t *r, float threshold,
 static int fd_run_protonet(const uint8_t *input, fd_result_t *r,
                             float proto_threshold, const fd_config_t *cfg)
 {
-    fd_rknn_model_t model;
     char path[512];
 
     if (fd_resolve_model_path(FD_MODEL_PROTONET, cfg->model_set,
@@ -1069,6 +1061,7 @@ static int fd_run_protonet(const uint8_t *input, fd_result_t *r,
             return -1;
     }
 
+    fd_rknn_model_t model;
     int init_ret = fd_model_init_retry(&model, path);
     if (init_ret < 0)
         return init_ret;
@@ -1107,7 +1100,6 @@ static int fd_run_protonet(const uint8_t *input, fd_result_t *r,
 static int fd_run_multiclass(const uint8_t *input, fd_result_t *r,
                               float multi_threshold, const fd_config_t *cfg)
 {
-    fd_rknn_model_t model;
     char path[512];
 
     if (fd_resolve_model_path(FD_MODEL_MULTICLASS, cfg->model_set,
@@ -1116,6 +1108,7 @@ static int fd_run_multiclass(const uint8_t *input, fd_result_t *r,
         return -1;
     }
 
+    fd_rknn_model_t model;
     int init_ret = fd_model_init_retry(&model, path);
     if (init_ret < 0)
         return init_ret;
@@ -1202,9 +1195,10 @@ static float fd_compute_heatmap(const float *features, int sp_h, int sp_w,
  * Output is converted from RKNN NC1HWC2 format to NHWC for correct per-cell
  * channel ordering (required for heatmap cosine similarity computation).
  * Returns 0=ok, -1=error, timing stored in *ms_out. */
-static int fd_run_spatial_encoder(const char *model_path, const uint8_t *input,
-                                   float *spatial_buf, int sp_h, int sp_w,
-                                   int emb_dim, float *ms_out)
+static int fd_run_spatial_encoder(const char *model_path,
+                                   const uint8_t *input, float *spatial_buf,
+                                   int sp_h, int sp_w, int emb_dim,
+                                   float *ms_out)
 {
     fd_rknn_model_t model;
     int init_ret = fd_model_init_retry(&model, model_path);
@@ -1223,6 +1217,7 @@ static int fd_run_spatial_encoder(const char *model_path, const uint8_t *input,
     int n = fd_model_get_output_nhwc(&model, 0, spatial_buf,
                                       sp_h, sp_w, emb_dim);
     double t1 = fd_get_time_ms();
+
     fd_model_release(&model);
 
     if (ms_out) *ms_out = (float)(t1 - t0);
@@ -1385,6 +1380,7 @@ static int fd_run_heatmap(const uint8_t *input, fd_result_t *r,
 
     if (have_coarse && g_fd.spatial_coarse_loaded) {
         model_path = coarse_path;
+
         sp_h = g_fd.spatial_coarse_h;
         sp_w = g_fd.spatial_coarse_w;
         emb_dim = g_fd.spatial_coarse_emb_dim;
@@ -1392,6 +1388,7 @@ static int fd_run_heatmap(const uint8_t *input, fd_result_t *r,
         proto_norms = g_fd.spatial_coarse_proto_norms;
     } else if (have_fine && g_fd.spatial_protos_loaded) {
         model_path = fine_path;
+
         sp_h = g_fd.spatial_h;
         sp_w = g_fd.spatial_w;
         emb_dim = g_fd.spatial_emb_dim;
@@ -1400,6 +1397,7 @@ static int fd_run_heatmap(const uint8_t *input, fd_result_t *r,
     } else if (have_fine && g_fd.prototypes_loaded) {
         /* Fallback: fine encoder with classification prototypes */
         model_path = fine_path;
+
         sp_h = 7;
         sp_w = 7;
         emb_dim = EMB_DIM;
@@ -2235,7 +2233,7 @@ void fault_detect_set_config(const fd_config_t *config)
     g_fd.config = *config;
     pthread_mutex_unlock(&g_fd.config_mutex);
 
-    /* Invalidate prototypes cache and EMA state when model changes */
+    /* Invalidate prototypes cache, model cache, and EMA state when config changes */
     g_fd.prototypes_loaded = 0;
     g_fd.spatial_protos_loaded = 0;
     g_fd.cnn_ema_init = 0;
