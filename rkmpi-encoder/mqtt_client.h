@@ -54,6 +54,9 @@ typedef struct {
     uint64_t msgid_cleanup_time;
     /* Keepalive tracking */
     uint64_t last_activity;         /* Last packet send/recv time (ms) */
+    /* LED status (updated by light topic responses) */
+    volatile int led_status;        /* -1=unknown, 0=off, 1=on */
+    volatile int led_brightness;    /* 0-100, valid when led_status >= 0 */
 } MQTTClient;
 
 /* Global MQTT client instance */
@@ -71,5 +74,9 @@ int mqtt_is_streaming_paused(void);
 /* Send LED on/off command via MQTT light topic.
  * Returns 0 on success, -1 if not connected/MQTT disabled. */
 int mqtt_send_led(int on, int brightness);
+
+/* Query LED status via MQTT. Sends query and waits up to timeout_ms for response.
+ * Returns: 1=on, 0=off, -1=unknown/timeout/error. */
+int mqtt_query_led(int timeout_ms);
 
 #endif /* MQTT_CLIENT_H */

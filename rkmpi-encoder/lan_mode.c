@@ -128,8 +128,9 @@ int lan_mode_query(void) {
     int result = -1;
     const cJSON *res = cJSON_GetObjectItemCaseSensitive(root, "result");
     if (res) {
-        /* Try different response formats */
-        const cJSON *mode = cJSON_GetObjectItemCaseSensitive(res, "lan_print_mode");
+        /* Try different response formats (gkapi returns {"open":0|1}) */
+        const cJSON *mode = cJSON_GetObjectItemCaseSensitive(res, "open");
+        if (!mode) mode = cJSON_GetObjectItemCaseSensitive(res, "lan_print_mode");
         if (!mode) mode = cJSON_GetObjectItemCaseSensitive(res, "lanPrintMode");
         if (!mode) mode = cJSON_GetObjectItemCaseSensitive(res, "mode");
 

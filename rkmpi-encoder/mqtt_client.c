@@ -429,6 +429,32 @@ static int mqtt_handle_packet(MQTTClient *client, uint8_t *data, size_t len) {
             cJSON_Delete(msg);
         }
     }
+    /* Handle light responses (LED status) */
+    else if (strstr(topic, "/light")) {
+        cJSON *msg = cJSON_Parse(payload);
+        if (msg) {
+            /* Parse: {"data":{"lights":[{"type":2,"status":0|1,"brightness":0-100}]}} */
+            cJSON *data = cJSON_GetObjectItem(msg, "data");
+            cJSON *lights = data ? cJSON_GetObjectItem(data, "lights") : NULL;
+            if (lights && cJSON_IsArray(lights)) {
+                int size = cJSON_GetArraySize(lights);
+                for (int i = 0; i < size; i++) {
+                    cJSON *light = cJSON_GetArrayItem(lights, i);
+                    cJSON *type_j = cJSON_GetObjectItem(light, "type");
+                    if (type_j && type_j->valueint == 2) {
+                        cJSON *status_j = cJSON_GetObjectItem(light, "status");
+                        cJSON *bright_j = cJSON_GetObjectItem(light, "brightness");
+                        if (status_j) {
+                            client->led_status = status_j->valueint ? 1 : 0;
+                            client->led_brightness = bright_j ? bright_j->valueint : 0;
+                        }
+                        break;
+                    }
+                }
+            }
+            cJSON_Delete(msg);
+        }
+    }
     /* Handle spurious stopCapture reports */
     else if (strstr(topic, "/video/report")) {
         cJSON *msg = cJSON_Parse(payload);
@@ -578,13 +604,21 @@ static void mqtt_subscribe_topics(MQTTClient *client) {
     len = mqtt_build_subscribe(buf, sizeof(buf), topic, 3);
     if (len > 0) mqtt_ssl_send(client, buf, len);
 
+    /* Light topic (for LED status queries) */
+    snprintf(topic, sizeof(topic),
+             "anycubic/anycubicCloud/v1/web/printer/%s/%s/light",
+             client->config.model_id, client->creds.device_id);
+    len = mqtt_build_subscribe(buf, sizeof(buf), topic, 4);
+    if (len > 0) mqtt_ssl_send(client, buf, len);
+
     /* Read SUBACK responses */
     uint8_t suback[8];
     mqtt_ssl_recv(client, suback, sizeof(suback), 2);
     mqtt_ssl_recv(client, suback, sizeof(suback), 2);
     mqtt_ssl_recv(client, suback, sizeof(suback), 2);
+    mqtt_ssl_recv(client, suback, sizeof(suback), 2);
 
-    mqtt_log("Subscribed to video topics (model=%s)\n", client->config.model_id);
+    mqtt_log("Subscribed to video + light topics (model=%s)\n", client->config.model_id);
 }
 
 /* Disconnect from broker */
@@ -794,6 +828,51 @@ int mqtt_send_led(int on, int brightness) {
     return ret;
 }
 
+int mqtt_query_led(int timeout_ms) {
+    MQTTClient *client = &g_mqtt_client;
+
+    if (!client->connected || !client->ssl)
+        return -1;
+
+    /* Mark status unknown before query */
+    client->led_status = -1;
+
+    /* Build light topic */
+    char topic[256];
+    snprintf(topic, sizeof(topic),
+             "anycubic/anycubicCloud/v1/web/printer/%s/%s/light",
+             client->config.model_id, client->creds.device_id);
+
+    /* Build query payload (matching ACProxyCam format) */
+    char payload[512];
+    snprintf(payload, sizeof(payload),
+             "{\"type\":\"light\",\"action\":\"query\",\"timestamp\":%llu,"
+             "\"msgid\":\"%08x%08x\","
+             "\"data\":{\"type\":2}}",
+             (unsigned long long)get_time_ms(),
+             (unsigned)rand(), (unsigned)rand());
+
+    uint8_t buf[1024];
+    size_t len = mqtt_build_publish(buf, sizeof(buf), topic, payload, 0, 0);
+    if (len == 0) return -1;
+
+    pthread_mutex_lock(&client->mutex);
+    int ret = mqtt_ssl_send(client, buf, len);
+    if (ret == 0) client->last_activity = get_time_ms();
+    pthread_mutex_unlock(&client->mutex);
+
+    if (ret != 0) return -1;
+
+    /* Poll for response — the MQTT recv thread will update led_status */
+    int elapsed = 0;
+    while (elapsed < timeout_ms && client->led_status == -1) {
+        usleep(50000);  /* 50ms */
+        elapsed += 50;
+    }
+
+    return client->led_status;
+}
+
 #else /* !TLS_AVAILABLE */
 
 /* Stub implementations when TLS is not available */
@@ -814,6 +893,11 @@ int mqtt_is_streaming_paused(void) {
 
 int mqtt_send_led(int on, int brightness) {
     (void)on; (void)brightness;
+    return -1;
+}
+
+int mqtt_query_led(int timeout_ms) {
+    (void)timeout_ms;
     return -1;
 }
 

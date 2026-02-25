@@ -260,6 +260,9 @@ typedef struct {
     float cnn_fault_lk;     /* CNN normalized fault likelihood [0,1] */
     float proto_fault_lk;   /* ProtoNet normalized fault likelihood [0,1] */
     float multi_fault_lk;   /* Multiclass normalized fault likelihood [0,1] */
+    int cnn_vote;            /* 1=fault, 0=ok */
+    int proto_vote;          /* 1=fault, 0=ok */
+    int multi_vote;          /* 1=fault, 0=ok */
     /* Spatial heatmap */
     int has_heatmap;
     int spatial_h;           /* actual grid rows (7 or 14) */
@@ -348,6 +351,9 @@ int fault_detect_npu_available(void);
 
 /* Check if fault detection is installed (models directory exists). */
 int fault_detect_installed(void);
+
+/* Check if the FD thread is waiting for a frame (non-blocking). */
+int fault_detect_needs_frame(void);
 
 /* Set current Z height (called from Moonraker position updates). */
 void fault_detect_set_current_z(float z_mm);

@@ -815,9 +815,9 @@
             </div>
             <div class="row" id="fd-heatmap-row" style="display:none">
                 <span class="label">Heatmap:</span>
-                <div class="value" style="display:flex;align-items:center;gap:10px;">
-                    <canvas id="fd-heatmap-canvas" width="140" height="140" style="border:1px solid #555;border-radius:4px;image-rendering:pixelated;"></canvas>
+                <div class="value" style="display:flex;flex-direction:column;gap:4px;">
                     <span id="fd-heatmap-info" style="font-size:11px;color:#ccc;"></span>
+                    <canvas id="fd-heatmap-canvas" width="140" height="140" style="border:1px solid #555;border-radius:4px;image-rendering:pixelated;"></canvas>
                 </div>
             </div>
         </div>
@@ -2615,10 +2615,12 @@ if(flvjs.isSupported()){
                         const name = names[key] || key;
                         const rawPct = (m.raw * 100).toFixed(1);
                         const lkPct = (m.fault_lk * 100).toFixed(1);
-                        lines.push(name + ': ' + rawPct + '% raw, ' + lkPct + '% norm (' + m.ms + 'ms)');
+                        const vote = m.vote === 'fault' ? 'KO' : 'OK';
+                        const voteColor = m.vote === 'fault' ? '#f55' : '#5f5';
+                        lines.push(name + ': ' + rawPct + '% raw, ' + lkPct + '% norm (' + m.ms + 'ms) <span style="color:' + voteColor + ';font-weight:bold">(' + vote + ')</span>');
                     }
                     modelsRow.style.display = '';
-                    modelsEl.textContent = lines.join('\n');
+                    modelsEl.innerHTML = lines.join('\n');
                 } else if (modelsRow) {
                     modelsRow.style.display = 'none';
                 }

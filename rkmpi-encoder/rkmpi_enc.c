@@ -1971,6 +1971,34 @@ static void on_config_changed(AppConfig *cfg) {
     }
 }
 
+/* Background thread to enable LAN mode with retries.
+ * gkapi (port 18086) may need 15-25s after boot to become ready. */
+static void *lan_mode_retry_thread(void *arg) {
+    (void)arg;
+    for (int attempt = 0; attempt < 15; attempt++) {
+        if (attempt > 0)
+            sleep(3);
+        int status = lan_mode_query();
+        if (status == 1) {
+            log_info("LAN mode: already enabled\n");
+            return NULL;
+        }
+        if (status == 0) {
+            log_info("LAN mode: enabling...\n");
+            if (lan_mode_enable() == 0) {
+                log_info("LAN mode: enabled successfully\n");
+                return NULL;
+            }
+            log_error("LAN mode: enable failed, retrying...\n");
+        }
+        /* status == -1: gkapi not ready */
+        if (attempt < 14)
+            log_info("LAN mode: gkapi not ready, retry %d/15...\n", attempt + 1);
+    }
+    log_error("LAN mode: could not be enabled after 15 attempts (~45s)\n");
+    return NULL;
+}
+
 int main(int argc, char *argv[]) {
     EncoderConfig cfg = {
         .width = DEFAULT_WIDTH,
@@ -2261,19 +2289,14 @@ int main(int argc, char *argv[]) {
             display_set_fps(app_config.display_fps);
         }
 
-        /* Enable LAN mode if configured */
+        /* Enable LAN mode in background thread — gkapi may need 15-25s
+         * after boot to become ready on port 18086. */
         if (app_config.autolanmode) {
-            int lan_status = lan_mode_query();
-            if (lan_status == 0) {
-                log_info("Primary: enabling LAN mode...\n");
-                if (lan_mode_enable() == 0) {
-                    log_info("Primary: LAN mode enabled\n");
-                } else {
-                    log_error("Primary: failed to enable LAN mode\n");
-                }
-            } else if (lan_status == 1) {
-                log_info("Primary: LAN mode already enabled\n");
-            }
+            pthread_t lan_thread;
+            if (pthread_create(&lan_thread, NULL, lan_mode_retry_thread, NULL) == 0)
+                pthread_detach(lan_thread);
+            else
+                log_error("Primary: failed to create LAN mode thread\n");
         }
 
         /* Start control server */
@@ -2758,9 +2781,10 @@ int main(int argc, char *argv[]) {
             int flv_clients = cfg.server_mode ? flv_server_client_count() : 0;
             int total_clients = mjpeg_clients + flv_clients;
 
-            /* Idle mode - no clients, sleep longer (unless snapshot or timelapse pending) */
+            /* Idle mode - no clients, sleep longer (unless snapshot, timelapse, or FD pending) */
             if (cfg.server_mode && !cfg.mjpeg_stdout && total_clients == 0 &&
-                !check_snapshot_pending() && !timelapse_is_active()) {
+                !check_snapshot_pending() && !timelapse_is_active() &&
+                !fault_detect_needs_frame()) {
                 /* Still check control files periodically in idle mode */
                 read_cmd_file();  /* One-shot commands */
                 read_ctrl_file();
@@ -2874,7 +2898,8 @@ int main(int argc, char *argv[]) {
             int flv_clients = cfg.server_mode ? flv_server_client_count() : 0;
             int total_clients = mjpeg_clients + flv_clients;
 
-            if (cfg.server_mode && total_clients == 0 && !check_snapshot_pending() && !timelapse_is_active()) {
+            if (cfg.server_mode && total_clients == 0 && !check_snapshot_pending() &&
+                !timelapse_is_active() && !fault_detect_needs_frame()) {
                 /* Idle mode - no clients, requeue and sleep */
                 /* Still check control files periodically in idle mode */
                 read_cmd_file();  /* One-shot commands */
@@ -3111,7 +3136,8 @@ skip_jpeg_output:
             TIMING_START(frame_buffer);
             if (cfg.server_mode && frame_buffers_initialized &&
                 captured_count >= CAMERA_WARMUP_FRAMES &&
-                (mjpeg_clients > 0 || check_snapshot_pending() || timelapse_is_active())) {
+                (mjpeg_clients > 0 || check_snapshot_pending() || timelapse_is_active() ||
+                 fault_detect_needs_frame())) {
                 frame_buffer_write(&g_jpeg_buffer, jpeg_data, jpeg_len,
                                    get_timestamp_us(), 0);
                 clear_snapshot_pending();  /* Clear snapshot request after writing frame */

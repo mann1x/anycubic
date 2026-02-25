@@ -5,10 +5,12 @@
     "calibration": "RGB (matching on-device TJPF_RGB input)",
     "models": {
         "cnn": {
-            "display_name": "MobileNetV2 Color LS 0.05",
+            "display_name": "MobileNetV2 SupCon T=0.05 MMSE",
             "onnx": "model.onnx",
             "rknn": "model.rknn",
-            "source": "candidate_models/results/mobilenetv2-448x224-color/"
+            "training": "SupCon 2-stage (temp=0.05, 100+100 epochs)",
+            "quantization": "MMSE (handles SupCon weight outliers)",
+            "source": "candidate_models/results/supcon-temp005-stage2/"
         },
         "protonet": {
             "display_name": "ProtoNet Color SupCon Temp 0.05",

@@ -830,6 +830,7 @@ static void serve_api_stats(ControlServer *srv, int fd) {
                 cJSON_AddNumberToObject(m, "raw", R2(lr->cnn_raw));
                 cJSON_AddNumberToObject(m, "fault_lk", R2(lr->cnn_fault_lk));
                 cJSON_AddNumberToObject(m, "ms", (int)(lr->cnn_ms + 0.5f));
+                cJSON_AddStringToObject(m, "vote", lr->cnn_vote ? "fault" : "ok");
                 cJSON_AddItemToObject(models, "cnn", m);
             }
             if (lr->proto_ran) {
@@ -837,6 +838,7 @@ static void serve_api_stats(ControlServer *srv, int fd) {
                 cJSON_AddNumberToObject(m, "raw", R2(lr->proto_raw));
                 cJSON_AddNumberToObject(m, "fault_lk", R2(lr->proto_fault_lk));
                 cJSON_AddNumberToObject(m, "ms", (int)(lr->proto_ms + 0.5f));
+                cJSON_AddStringToObject(m, "vote", lr->proto_vote ? "fault" : "ok");
                 cJSON_AddItemToObject(models, "proto", m);
             }
             if (lr->multi_ran) {
@@ -844,6 +846,7 @@ static void serve_api_stats(ControlServer *srv, int fd) {
                 cJSON_AddNumberToObject(m, "raw", R2(lr->multi_raw));
                 cJSON_AddNumberToObject(m, "fault_lk", R2(lr->multi_fault_lk));
                 cJSON_AddNumberToObject(m, "ms", (int)(lr->multi_ms + 0.5f));
+                cJSON_AddStringToObject(m, "vote", lr->multi_vote ? "fault" : "ok");
                 cJSON_AddItemToObject(models, "multi", m);
             }
             cJSON_AddItemToObject(fd_obj, "models", models);

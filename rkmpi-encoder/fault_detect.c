@@ -14,6 +14,7 @@
 #pragma GCC diagnostic ignored "-Wformat-truncation"
 
 #include "fault_detect.h"
+#include "mqtt_client.h"
 #include "cJSON.h"
 #include "rknn/rknn_api.h"
 #include <turbojpeg.h>
@@ -231,6 +232,10 @@ static struct {
     /* CNN logit EMA for temporal smoothing */
     float cnn_ema_logits[2];
     int cnn_ema_init;
+
+    /* Multiclass logit EMA for temporal smoothing */
+    float multi_ema_logits[FD_MCLASS_COUNT];
+    int multi_ema_init;
 
     /* Initialized flag */
     int initialized;
@@ -1027,6 +1032,9 @@ static int fd_run_cnn(const uint8_t *input, fd_result_t *r, float threshold,
 
     fd_softmax(logits, 2);
 
+    /* Model class ordering: [failure, success] — logits[0] is fault probability.
+     * PyTorch ImageFolder alphabetical sort: failure=0, success=1.
+     * RKNN preserves this ordering (verified via ONNX + RKNN simulator). */
     int cnn_class = logits[0] > threshold ? FD_CLASS_FAULT : FD_CLASS_OK;
     float cnn_conf = logits[0] > logits[1] ? logits[0] : logits[1];
 
@@ -1127,6 +1135,24 @@ static int fd_run_multiclass(const uint8_t *input, fd_result_t *r,
     r->multi_ms = (float)(t1 - t0);
 
     fd_model_release(&model);
+
+    /* EMA smoothing on logits — same approach as CNN EMA.
+     * Multiclass scores swing ~15% between frames on static scenes.
+     * Alpha=0.3 smooths this to ~3-5% effective variance. */
+    {
+        const float alpha = 0.3f;
+        if (!g_fd.multi_ema_init) {
+            for (int i = 0; i < FD_MCLASS_COUNT; i++)
+                g_fd.multi_ema_logits[i] = logits[i];
+            g_fd.multi_ema_init = 1;
+        } else {
+            for (int i = 0; i < FD_MCLASS_COUNT; i++)
+                g_fd.multi_ema_logits[i] = alpha * logits[i] +
+                                            (1.0f - alpha) * g_fd.multi_ema_logits[i];
+        }
+        for (int i = 0; i < FD_MCLASS_COUNT; i++)
+            logits[i] = g_fd.multi_ema_logits[i];
+    }
 
     fd_softmax(logits, FD_MCLASS_COUNT);
 
@@ -1584,14 +1610,17 @@ static int fd_run_detection(const uint8_t *preprocessed, fd_result_t *result,
     if (have_cnn) {
         votes[0] = cnn_class; n_models++;
         if (cnn_class == FD_CLASS_FAULT) n_fault++;
+        result->cnn_vote = (cnn_class == FD_CLASS_FAULT) ? 1 : 0;
     }
     if (have_proto) {
         votes[1] = proto_class; n_models++;
         if (proto_class == FD_CLASS_FAULT) n_fault++;
+        result->proto_vote = (proto_class == FD_CLASS_FAULT) ? 1 : 0;
     }
     if (run_multi) {
         votes[2] = multi_class; n_models++;
         if (multi_class == FD_CLASS_FAULT) n_fault++;
+        result->multi_vote = (multi_class == FD_CLASS_FAULT) ? 1 : 0;
     }
 
     switch (cfg->strategy) {
@@ -1784,13 +1813,26 @@ static int fd_run_detection(const uint8_t *preprocessed, fd_result_t *result,
          * fault signal that the global classifiers missed.  The 448x224 wide FOV
          * dilutes GAP for sparse defects (spaghetti covering <20% of frame).
          *
-         * Calibrated thresholds (KS1, Feb 2026):
-         *   Clean bed:       heatmap_max 0.33-0.38, strong_cells=0
-         *   Small spaghetti: heatmap_max 0.36-0.41, strong_cells=0
-         *   Large spaghetti: heatmap_max 0.50-0.59, strong_cells=11-19
-         *   Threshold: max>0.45, cells>=3 — gap: 0.41..0.50 */
+         * Calibrated thresholds (KS1, Feb 2026, full 14x28 grid):
+         *   Clean bed:       heatmap_max 0.55-0.63, strong_cells=93-117/392
+         *   Spaghetti:       heatmap_max 0.55-0.61, strong_cells=TBD
+         * NOTE: heatmap max overlaps between clean bed and spaghetti on KS1
+         * camera. Spatial boost MUST be gated on CNN to avoid false positives.
+         * CNN is the most reliable discriminator (fail=0.03 clean, 0.80+ fault).
+         *
+         * Previous calibration (broken 49-cell mask, rows 0-1 only):
+         *   Clean bed: max 0.33-0.38, cells=0
+         *   Spaghetti: max 0.50-0.59, cells=11-19 */
         if (result->result == FD_CLASS_OK && result->has_heatmap &&
             result->heatmap_max > 0.45f) {
+            /* Gate on CNN: never boost when CNN is very confident OK.
+             * CNN fail=0.03 on clean bed vs 0.80+ on spaghetti — most
+             * reliable model. Spatial boost should only assist when CNN
+             * is borderline, not override CNN's strong OK signal. */
+            int cnn_supports = !have_cnn || cnn_fault_lk > 0.20f;
+            if (!cnn_supports)
+                goto skip_boost;
+
             int strong_cells = 0, total_active = 0;
             int mask_on = !fd_mask_is_zero(&active_mask);
             for (int h = 0; h < result->spatial_h; h++) {
@@ -1803,20 +1845,22 @@ static int fd_run_detection(const uint8_t *preprocessed, fd_result_t *result,
                         strong_cells++;
                 }
             }
-            /* Require >=3 strong cells AND either a global model shows some
-             * suspicion (avoids pure-spatial false positives) or overwhelming
-             * spatial evidence (>=8 cells = clear cluster). */
+            /* Require >=3 strong cells AND a global model shows suspicion.
+             * Removed the "overwhelming evidence" path (strong_cells>=8)
+             * because the full 14x28 grid produces 93+ strong cells on
+             * clean bed — no separation from fault. */
             int global_hint = 0;
-            if (have_cnn && cnn_fault_lk > 0.10f) global_hint = 1;
-            if (have_proto && proto_fault_lk > 0.55f) global_hint = 1;
+            if (have_cnn && cnn_fault_lk > 0.30f) global_hint = 1;
+            if (have_proto && proto_fault_lk > 0.85f) global_hint = 1;
 
-            if (strong_cells >= 3 && (global_hint || strong_cells >= 8)) {
+            if (strong_cells >= 3 && global_hint) {
                 result->result = FD_CLASS_FAULT;
                 result->confidence = 0.5f + 0.5f * result->heatmap_max;
                 if (result->confidence > 1.0f) result->confidence = 1.0f;
                 fd_log("  Spatial BOOST: OK->FAULT (max=%.2f, %d/%d strong cells)\n",
                        result->heatmap_max, strong_cells, total_active);
             }
+        skip_boost: ;
         }
     }
 
@@ -1865,6 +1909,7 @@ static void *fd_thread_func(void *arg)
 
     int consecutive_ok = 0;
     int use_verify_interval = 0;
+    uint64_t last_led_check = 0;
 
     while (!g_fd.thread_stop) {
         /* Get current config */
@@ -1893,6 +1938,23 @@ static void *fd_thread_func(void *arg)
             fd_log("Skipping cycle: %d MB available < %d MB threshold\n",
                    avail_mb, cfg.min_free_mem_mb);
             continue;
+        }
+
+        /* LED keepalive — query every 60s, send ON, wait 3s if it was off */
+        {
+            struct timeval tv_now;
+            gettimeofday(&tv_now, NULL);
+            uint64_t now_ms = (uint64_t)tv_now.tv_sec * 1000 + tv_now.tv_usec / 1000;
+            if (now_ms - last_led_check >= 60000) {
+                last_led_check = now_ms;
+                int led = mqtt_query_led(1000);
+                mqtt_send_led(1, 100);
+                if (led == 0) {
+                    fd_log("LED was off, turning on and waiting 3s for exposure\n");
+                    for (int i = 0; i < 30 && !g_fd.thread_stop; i++)
+                        usleep(100000);  /* 3s in 100ms chunks */
+                }
+            }
         }
 
         /* Request frame from main capture loop */
@@ -2193,6 +2255,11 @@ void fault_detect_cleanup(void)
     g_fd.initialized = 0;
 }
 
+int fault_detect_needs_frame(void)
+{
+    return g_fd.initialized && g_fd.need_frame;
+}
+
 void fault_detect_feed_jpeg(const uint8_t *data, size_t size)
 {
     /* Quick volatile check — no lock needed */
@@ -2237,6 +2304,7 @@ void fault_detect_set_config(const fd_config_t *config)
     g_fd.prototypes_loaded = 0;
     g_fd.spatial_protos_loaded = 0;
     g_fd.cnn_ema_init = 0;
+    g_fd.multi_ema_init = 0;
 }
 
 void fault_detect_set_current_z(float z_mm)
