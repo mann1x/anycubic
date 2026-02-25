@@ -22,6 +22,7 @@
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <sys/uio.h>
+#include <poll.h>
 #include <time.h>
 
 /* Global server instances */
@@ -37,6 +38,9 @@ static pthread_mutex_t g_flv_proxy_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* FLV proxy FPS tracking */
 static volatile float g_flv_proxy_fps = 0.0f;
+
+/* FLV proxy active client count (incremented on handoff, decremented when proxy thread ends) */
+static volatile int g_flv_proxy_client_count = 0;
 
 /* Forward declarations for FLV proxy */
 typedef struct {
@@ -368,15 +372,21 @@ static RequestType parse_http_request(const char *buf, size_t len, int port) {
 /* Send HTTP response */
 static int http_send(int fd, const void *data, size_t len) {
     size_t sent = 0;
+    int eagain_retries = 0;
     while (sent < len) {
         ssize_t n = send(fd, (const char *)data + sent, len - sent, MSG_NOSIGNAL);
         if (n < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                /* On blocking sockets with SO_SNDTIMEO, EAGAIN means timeout
+                 * (dead peer). Limit retries to avoid infinite loop. */
+                if (++eagain_retries > 3)
+                    return -1;
                 usleep(1000);
                 continue;
             }
             return -1;
         }
+        eagain_retries = 0;
         sent += n;
     }
     return 0;
@@ -722,6 +732,7 @@ static void http_handle_client_read(HttpServer *srv, HttpClient *client) {
                 http_send_mjpeg_headers(client->fd);
                 client->state = CLIENT_STATE_STREAMING;
                 client->header_sent = 1;
+                client->last_send_time = get_time_us();
                 /* Skip stale frame in buffer - wait for next fresh frame */
                 client->last_frame_seq = frame_buffer_get_sequence(&g_jpeg_buffer);
                 log_info("HTTP[%d]: MJPEG stream started\n", srv->port);
@@ -736,6 +747,7 @@ static void http_handle_client_read(HttpServer *srv, HttpClient *client) {
                 http_send_mjpeg_headers(client->fd);
                 client->state = CLIENT_STATE_STREAMING;
                 client->header_sent = 1;
+                client->last_send_time = get_time_us();
                 /* Skip stale frame in buffer - wait for next fresh frame */
                 client->last_frame_seq = frame_buffer_get_sequence(&g_display_buffer);
                 display_client_connect();
@@ -768,6 +780,7 @@ static void http_handle_client_read(HttpServer *srv, HttpClient *client) {
                             /* fd ownership transferred to proxy thread */
                             client->fd = -1;
                             client->state = CLIENT_STATE_CLOSING;
+                            __sync_add_and_fetch(&g_flv_proxy_client_count, 1);
                             log_info("HTTP[%d]: FLV proxy started\n", srv->port);
                         } else {
                             free(pa);
@@ -790,6 +803,7 @@ static void http_handle_client_read(HttpServer *srv, HttpClient *client) {
                 http_send_flv_headers(client->fd);
                 client->state = CLIENT_STATE_STREAMING;
                 client->header_sent = 1;
+                client->last_send_time = get_time_us();
                 /* Set to 0 so FLV thread knows to send FLV header/metadata
                  * The FLV thread will then set it to current seq after sending headers */
                 client->last_frame_seq = 0;
@@ -867,9 +881,38 @@ static void mjpeg_check_connections(HttpServer *srv) {
     }
 }
 
-/* Switch streaming client to blocking mode with send timeout.
+/* Check if a streaming client has disconnected.
+ * Uses poll() with POLLRDHUP for reliable detection of remote close,
+ * plus recv(MSG_PEEK) to confirm FIN. Returns 1 if disconnected. */
+static int client_disconnected(int fd) {
+    struct pollfd pfd = { .fd = fd, .events = POLLIN | POLLRDHUP };
+    int ret = poll(&pfd, 1, 0);  /* non-blocking */
+    if (ret <= 0) return 0;       /* no events or error — assume alive */
+
+    /* POLLHUP/POLLERR/POLLNVAL = definitely dead */
+    if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))
+        return 1;
+
+    /* POLLRDHUP = remote shut down writing (FIN received) */
+    if (pfd.revents & POLLRDHUP)
+        return 1;
+
+    /* POLLIN on a streaming socket = unexpected data or FIN */
+    if (pfd.revents & POLLIN) {
+        char peek;
+        ssize_t r = recv(fd, &peek, 1, MSG_PEEK | MSG_DONTWAIT);
+        if (r == 0) return 1;      /* FIN */
+        if (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
+            return 1;              /* Error */
+    }
+
+    return 0;
+}
+
+/* Switch streaming client to blocking mode with send timeout and TCP keepalive.
  * Disable TCP_NODELAY (enable Nagle) for streaming — with TCP_CORK
- * per frame, the kernel batches segments optimally. */
+ * per frame, the kernel batches segments optimally.
+ * TCP keepalive detects dead connections within ~21 seconds (10+3*3+idle). */
 static void make_streaming_socket(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags >= 0)
@@ -877,6 +920,17 @@ static void make_streaming_socket(int fd) {
 
     struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    /* TCP keepalive: detect dead peers aggressively
+     * Start probing after 10s idle, probe every 3s, fail after 3 probes = ~19s */
+    int on = 1;
+    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof(on));
+    int idle = 10;
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+    int intvl = 3;
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+    int cnt = 3;
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
 
     /* Disable TCP_NODELAY for streaming (was set in accept for request parsing).
      * With TCP_CORK per frame, this lets the kernel batch optimally. */
@@ -911,13 +965,16 @@ static void *mjpeg_server_thread(void *arg) {
         for (int i = 0; i < HTTP_MAX_CLIENTS; i++) {
             HttpClient *client = &srv->clients[i];
 
-            if (client->fd > 0 && client->state == CLIENT_STATE_CLOSING) {
+            /* Clean up closing clients (includes proxy-handed-off fd=-1 slots) */
+            if (client->state == CLIENT_STATE_CLOSING) {
                 http_close_client(srv, i);
                 continue;
             }
 
+            if (client->fd <= 0) continue;
+
             /* Close idle connections */
-            if (client->fd > 0 && client->state == CLIENT_STATE_IDLE) {
+            if (client->state == CLIENT_STATE_IDLE) {
                 uint64_t idle_time = (now - client->connect_time) / 1000000;
                 if (idle_time >= HTTP_IDLE_TIMEOUT_SEC) {
                     log_info("HTTP[%d]: Closing idle connection (slot %d, %llu sec)\n",
@@ -927,7 +984,25 @@ static void *mjpeg_server_thread(void *arg) {
                 }
             }
 
-            if (client->fd > 0 && client->state == CLIENT_STATE_STREAMING) {
+            if (client->state == CLIENT_STATE_STREAMING) {
+                /* Detect client disconnect (FIN/RST) immediately */
+                if (client_disconnected(client->fd)) {
+                    log_info("HTTP[%d]: Client disconnected (slot %d)\n", srv->port, i);
+                    http_close_client(srv, i);
+                    continue;
+                }
+
+                /* Close stale streaming connections (no data sent recently) */
+                if (client->last_send_time > 0) {
+                    uint64_t stale_sec = (now - client->last_send_time) / 1000000;
+                    if (stale_sec >= HTTP_STALE_STREAM_TIMEOUT_SEC) {
+                        log_info("HTTP[%d]: Closing stale stream (slot %d, %llu sec no data)\n",
+                                 srv->port, i, (unsigned long long)stale_sec);
+                        http_close_client(srv, i);
+                        continue;
+                    }
+                }
+
                 if (client->request == REQUEST_MJPEG_STREAM)
                     has_camera_clients = 1;
                 else if (client->request == REQUEST_DISPLAY_STREAM)
@@ -996,6 +1071,7 @@ static void *mjpeg_server_thread(void *arg) {
                         client->state = CLIENT_STATE_CLOSING;
                     } else {
                         client->last_frame_seq = seq;
+                        client->last_send_time = now;
                         client->frames_sent++;
                     }
 
@@ -1043,6 +1119,7 @@ static void *mjpeg_server_thread(void *arg) {
                         client->state = CLIENT_STATE_CLOSING;
                     } else {
                         client->last_frame_seq = seq;
+                        client->last_send_time = now;
                         client->frames_sent++;
                     }
 
@@ -1166,6 +1243,9 @@ static void *flv_server_thread(void *arg) {
                         srv->clients[i].request == REQUEST_FLV_STREAM &&
                         srv->clients[i].last_frame_seq == 0) {
 
+                        /* Switch to blocking mode with send timeout + TCP keepalive */
+                        make_streaming_socket(srv->clients[i].fd);
+
                         /* Reset muxer for new connection */
                         flv_muxer_reset(&muxers[i]);
 
@@ -1196,14 +1276,17 @@ static void *flv_server_thread(void *arg) {
         for (int i = 0; i < HTTP_MAX_CLIENTS; i++) {
             HttpClient *client = &srv->clients[i];
 
-            if (client->fd > 0 && client->state == CLIENT_STATE_CLOSING) {
+            /* Clean up closing clients (includes proxy-handed-off fd=-1 slots) */
+            if (client->state == CLIENT_STATE_CLOSING) {
                 http_close_client(srv, i);
                 flv_muxer_reset(&muxers[i]);
                 continue;
             }
 
+            if (client->fd <= 0) continue;
+
             /* Close idle connections that haven't sent a request */
-            if (client->fd > 0 && client->state == CLIENT_STATE_IDLE) {
+            if (client->state == CLIENT_STATE_IDLE) {
                 uint64_t idle_time = (now - client->connect_time) / 1000000;  /* seconds */
                 if (idle_time >= HTTP_IDLE_TIMEOUT_SEC) {
                     log_info("HTTP[%d]: Closing idle connection (slot %d, %llu sec)\n",
@@ -1214,8 +1297,29 @@ static void *flv_server_thread(void *arg) {
                 }
             }
 
-            if (client->fd > 0 && client->state == CLIENT_STATE_STREAMING &&
+            if (client->state == CLIENT_STATE_STREAMING &&
                 client->request == REQUEST_FLV_STREAM) {
+
+                /* Detect client disconnect (FIN/RST) immediately */
+                if (client_disconnected(client->fd)) {
+                    log_info("HTTP[%d]: FLV client disconnected (slot %d)\n", srv->port, i);
+                    http_close_client(srv, i);
+                    flv_muxer_reset(&muxers[i]);
+                    continue;
+                }
+
+                /* Close stale FLV streaming connections */
+                if (client->last_send_time > 0) {
+                    uint64_t stale_sec = (now - client->last_send_time) / 1000000;
+                    if (stale_sec >= HTTP_STALE_STREAM_TIMEOUT_SEC) {
+                        log_info("HTTP[%d]: Closing stale FLV stream (slot %d, %llu sec no data)\n",
+                                 srv->port, i, (unsigned long long)stale_sec);
+                        client->state = CLIENT_STATE_CLOSING;
+                        http_close_client(srv, i);
+                        flv_muxer_reset(&muxers[i]);
+                        continue;
+                    }
+                }
 
                 if (current_seq > client->last_frame_seq) {
                     /* Warmup pacing: add delays during initial connection
@@ -1242,6 +1346,7 @@ static void *flv_server_thread(void *arg) {
                                 client->state = CLIENT_STATE_CLOSING;
                             } else {
                                 client->last_frame_seq = seq;
+                                client->last_send_time = now;
                                 client->frames_sent++;
                             }
                             HTTP_TIMING_END(&g_flv_timing, net_send_time);
@@ -1301,7 +1406,7 @@ void flv_server_stop(void) {
 }
 
 int flv_server_client_count(void) {
-    return g_flv_server.server.client_count;
+    return g_flv_server.server.client_count + g_flv_proxy_client_count;
 }
 
 /* ============================================================================
@@ -1375,6 +1480,7 @@ static void *flv_proxy_thread(void *arg) {
     if (parse_http_url(url, host, sizeof(host), &port, path, sizeof(path)) < 0) {
         fprintf(stderr, "FLV proxy: invalid URL: %s\n", url);
         close(client_fd);
+        __sync_sub_and_fetch(&g_flv_proxy_client_count, 1);
         return NULL;
     }
 
@@ -1383,6 +1489,7 @@ static void *flv_proxy_thread(void *arg) {
     if (upstream < 0) {
         fprintf(stderr, "FLV proxy: socket() failed: %s\n", strerror(errno));
         close(client_fd);
+        __sync_sub_and_fetch(&g_flv_proxy_client_count, 1);
         return NULL;
     }
 
@@ -1401,7 +1508,22 @@ static void *flv_proxy_thread(void *arg) {
                 host, port, strerror(errno));
         close(upstream);
         close(client_fd);
+        __sync_sub_and_fetch(&g_flv_proxy_client_count, 1);
         return NULL;
+    }
+
+    /* Set send timeout and TCP keepalive on client socket */
+    struct timeval tv_send = { .tv_sec = 5, .tv_usec = 0 };
+    setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv_send, sizeof(tv_send));
+    {
+        int on = 1;
+        setsockopt(client_fd, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof(on));
+        int idle = 10;
+        setsockopt(client_fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+        int intvl = 3;
+        setsockopt(client_fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+        int cnt = 3;
+        setsockopt(client_fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
     }
 
     /* Send HTTP GET to upstream */
@@ -1431,6 +1553,7 @@ static void *flv_proxy_thread(void *arg) {
         fprintf(stderr, "FLV proxy: no response from upstream\n");
         close(upstream);
         close(client_fd);
+        __sync_sub_and_fetch(&g_flv_proxy_client_count, 1);
         return NULL;
     }
 
@@ -1444,6 +1567,7 @@ static void *flv_proxy_thread(void *arg) {
     if (send(client_fd, resp, strlen(resp), MSG_NOSIGNAL) < 0) {
         close(upstream);
         close(client_fd);
+        __sync_sub_and_fetch(&g_flv_proxy_client_count, 1);
         return NULL;
     }
 
@@ -1498,5 +1622,6 @@ proxy_done:
     g_flv_proxy_fps = 0.0f;
     close(upstream);
     close(client_fd);
+    __sync_sub_and_fetch(&g_flv_proxy_client_count, 1);
     return NULL;
 }

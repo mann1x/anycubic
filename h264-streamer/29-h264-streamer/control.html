@@ -1501,6 +1501,13 @@
 
         document.addEventListener('DOMContentLoaded', loadCamerasAndMoonraker);
 
+        // Clean up all streams on page unload (prevents stale server connections)
+        window.addEventListener('pagehide', function() {
+            stopMjpegStream();
+            stopDisplayStream();
+            stopFlvPlayer();
+        });
+
         // Poll camera status every 5s to detect async errors/crashes
         setInterval(function() {
             if (cameras.length > 1) loadCameras();
@@ -1652,25 +1659,21 @@
             document.getElementById('tab-' + tab).classList.add('active');
             event.target.classList.add('active');
 
-            // Handle stream states
+            // Stop all streams when switching away
+            if (tab !== 'mjpeg') stopMjpegStream();
+            if (tab !== 'display') stopDisplayStream();
+            if (tab !== 'flv') stopFlvPlayer();
+
+            // Start the selected stream
             if (tab === 'snapshot') {
-                // Refresh snapshot when switching to tab
                 const img = document.getElementById('preview-img');
                 img.src = snapshotUrl + '?' + Date.now();
             } else if (tab === 'mjpeg') {
                 startMjpegStream();
-            } else {
-                stopMjpegStream();
-            }
-            if (tab === 'display') {
+            } else if (tab === 'display') {
                 startDisplayStream();
-            } else {
-                stopDisplayStream();
             }
-            // Don't auto-start FLV player on tab switch - user clicks Play
-            if (tab !== 'flv') {
-                stopFlvPlayer();
-            }
+            // FLV: don't auto-start, user clicks Play
         }
 
         // MJPEG stream

@@ -27,6 +27,10 @@
 /* Idle connection timeout (seconds) - close connections that don't send a request */
 #define HTTP_IDLE_TIMEOUT_SEC 10
 
+/* Stale streaming timeout (seconds) - close streaming clients that haven't
+ * received a frame in this long (dead TCP connections, H.264 disabled, etc.) */
+#define HTTP_STALE_STREAM_TIMEOUT_SEC 30
+
 /* MJPEG boundary string */
 #define MJPEG_BOUNDARY  "mjpegstream"
 
@@ -62,6 +66,7 @@ typedef struct {
     RequestType request;
     uint64_t last_frame_seq;    /* Last frame sequence sent */
     uint64_t connect_time;      /* Connection timestamp */
+    uint64_t last_send_time;    /* Last successful send (usec, for stale detection) */
     uint8_t *send_buf;          /* Send buffer for FLV */
     size_t send_buf_size;
     size_t send_buf_pos;        /* Current position in send buffer */
