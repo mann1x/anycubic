@@ -9,6 +9,7 @@
             "onnx": "model.onnx",
             "rknn": "model.rknn",
             "training": "SupCon 2-stage KS1 dataset v4 (temp=0.05, 100+50 epochs, 540 fail + 2499 success)",
+            "dataset": "datasets/KS1/ks1printer",
             "quantization": "MMSE (handles SupCon weight outliers)",
             "source": "candidate_models/results/supcon-ks1-temp005-v4/"
         },
