@@ -482,6 +482,7 @@ export LD_LIBRARY_PATH=/oem/usr/lib:$LD_LIBRARY_PATH
 - `rpc_client.c/h` - RPC client
 - `timelapse.c/h` - Timelapse frame capture and finalization
 - `timelapse_venc.c/h` - Hardware VENC timelapse encoding
+- `fault_detect.c/h` - RKNN NPU fault detection (dlopen, 3-model ensemble + spatial heatmap)
 - `display_capture.c/h` - LCD framebuffer capture
 - `json_util.c/h` - JSON utilities
 - `cJSON.c/h` - JSON parser library
@@ -497,6 +498,102 @@ export LD_LIBRARY_PATH=/oem/usr/lib:$LD_LIBRARY_PATH
 ### Absolute Paths
 - This directory: `/shared/dev/anycubic/rkmpi-encoder/`
 - Cross-toolchain: `/shared/dev/rv1106-toolchain/`
+
+## Fault Detection (`fault_detect.c`)
+
+Real-time 3D printing fault detection using three RKNN NPU models plus spatial heatmap. Runs as a background thread inside rkmpi_enc, processing USB camera frames every 2-5 seconds.
+
+### Architecture
+
+- **dlopen for RKNN**: `librknnmrt.so` loaded at runtime — binary works on printers without NPU
+- **Load/unload per cycle**: Models loaded into CMA, run, released each cycle (~2.5 MB peak)
+- **Frame feeding**: Detection thread requests a frame from the capture loop (~once per 2-5s)
+- **Preprocessing**: TurboJPEG decode → scaled bilinear resize+center-crop → 448×224 RGB
+
+### Models
+
+| Model | Architecture | Output | Threshold | Purpose |
+|-------|-------------|--------|-----------|---------|
+| **CNN** | MobileNetV2 + fc(2) | 2-class logits (fail/success) | 0.40 | Primary binary detector |
+| **ProtoNet** | ShuffleNetV2 encoder + cosine distance | 1024-dim embedding | 0.58 (margin) | Complementary detector, gates CNN dynamic threshold |
+| **Multiclass** | ShuffleNetV2 + fc(7) | 7-class logits | 0.81 (1-p(Success)) | Fault-type label (Spaghetti, Cracking, etc.) |
+| **Spatial heatmap** | Projected spatial encoders (coarse 7×14×256 + fine 14×28×128) | Per-cell cosine margin | 1.5 (heatmap-only) | Localized defect detection |
+
+Models stored at `/useremain/home/rinkhals/fault_detect/models/{cnn,protonet,multiclass}/` on the printer.
+
+### Detection strategies
+
+Ten configurable strategies control how model votes combine. After the strategy decision, a spatial heatmap boost can override OK→FAULT for localized defects missed by global models.
+
+| Strategy | Models | Base rule | Boost Path 2 gate | Recommended for |
+|----------|--------|-----------|-------------------|-----------------|
+| **classify** | CNN+Proto+MC | OR(CNN,Proto), multi adds fault type | Any model *leaning* | **Default deployment** |
+| **or** | CNN+Proto(+MC) | FAULT if *any* model flags | Any model *leaning* | High recall, no fault-type label |
+| **verify** | CNN+Proto+MC | OR triggers, multi confirms/vetoes | Any model *above* threshold | Fewer FP, risk of multi vetoing true faults |
+| **majority** | CNN+Proto+MC | FAULT if 2-of-3 agree | Heatmap as 3rd voter | Balanced agreement |
+| **and** | CNN+Proto | Both must agree | CNN *above* + proto *leaning* | Conservative |
+| **classify_and** | CNN+Proto+MC | AND(CNN,Proto), multi adds type | CNN *above* + proto *leaning* | Conservative + fault-type |
+| **all** | CNN+Proto+MC | All must agree | Both *above* threshold | Ultra-conservative |
+| **cnn** | CNN only | CNN decides | CNN *leaning* | Single-model |
+| **protonet** | Proto only | Proto decides | Proto *leaning* | Lighting-robust single-model |
+| **multiclass** | MC only | argmax≠Success → FAULT | Multi *leaning* | Fault-type built-in |
+
+**Threshold definitions:**
+- *above*: exceeds detection threshold (CNN > 0.40, Proto lk > 0.85, Multi > 0.81)
+- *leaning*: shows some signal at >50% of threshold (CNN > 0.20, Proto lk > 0.60, Multi > 0.41)
+
+### Spatial heatmap boost
+
+Global classifiers (CNN/ProtoNet/Multi) use Global Average Pooling which dilutes fault signal for tiny/distant defects covering <5% of the frame. The spatial heatmap runs per-cell cosine similarity on a 14×28 grid and can override OK→FAULT:
+
+**Path 1 — Heatmap-only** (all strategies):
+- `heatmap_max > 1.5` + `strong_cells >= 3`
+- No model gate — overwhelming spatial evidence
+- Calibrated margin: worst OK = 1.24 (object), worst FAULT = 1.66 (tiny spaghetti)
+
+**Path 2 — Strategy-aware** (varies per strategy):
+- `heatmap_max > 0.45` + `strong_cells >= 3` + strategy-specific model corroboration
+- Permissive strategies (or/classify): any model *leaning*
+- Balanced strategies (majority/verify): any model *above* threshold
+- Conservative strategies (and/classify_and): CNN *above* + proto *leaning*
+- Strict (all): both CNN and proto *above* threshold
+- Single-model: that model *leaning*
+
+### Dynamic CNN threshold
+
+ProtoNet runs first in the pipeline. When its margin shows moderate suspicion (≥ proto_dynamic_trigger), the CNN threshold drops from `cnn_threshold` to `cnn_dynamic_threshold` (0.40 → 0.35 on KS1). This catches borderline faults where CNN is uncertain but Proto is suspicious. Only active for permissive strategies (or/classify/majority/verify) — disabled for and/classify_and/all to prevent false agreement.
+
+### CNN EMA smoothing
+
+MobileNetV2 has ~31% FP32 spread on near-identical frames (camera noise sensitivity). EMA on logits (alpha=0.3) reduces effective spread to ~2-8%. State in `g_fd.cnn_ema_logits[]`, reset on config change. Converges in ~10 cycles (50s at 5s interval).
+
+### Configuration
+
+All fault detection settings are persisted in the JSON config file and exposed via the control server REST API and web UI. Key settings:
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `fd_enabled` | true | Enable/disable fault detection |
+| `fd_strategy` | "or" | Detection strategy (see table above) |
+| `fd_interval` | 5000 | Normal check interval (ms) |
+| `fd_verify_interval` | 2000 | Verification interval after fault (ms) |
+| `fd_cnn_threshold` | 0.40 | CNN fault probability threshold |
+| `fd_proto_threshold` | 0.58 | ProtoNet cosine margin threshold |
+| `fd_multi_threshold` | 0.81 | Multiclass 1-p(Success) threshold |
+| `fd_heatmap_enabled` | true | Enable spatial heatmap + boost |
+| `fd_pace_ms` | 100 | Sleep between pipeline stages (reduces CPU spikes) |
+
+### KS1 live reference values (Feb 2026, v4 models)
+
+| Scenario | CNN | Proto margin | Multi (1-p) | Heatmap max | Boost | Result |
+|----------|-----|-------------|-------------|-------------|-------|--------|
+| Empty bed | 0.01 | -0.85 | 0.04 | 0.29 | — | OK |
+| Object on bed | 0.04 | -0.81 | 0.40 | 0.93 | — | OK |
+| 3 objects | 0.11 | -0.83 | 0.13 | 0.61 | — | OK |
+| Big spaghetti+obj | 0.81 | +0.87 | 0.976 | 2.13 | — | FAULT |
+| Small spaghetti+obj | 0.88 | +0.90 | 0.96 | 2.10 | — | FAULT |
+| Small spaghetti center | 0.76 | +0.91 | 0.93 | 2.10 | — | FAULT |
+| Tiny spaghetti TL | 0.07 | -0.25 | 0.07 | 1.79 | heatmap-only | FAULT |
 
 ## Timelapse Recording
 

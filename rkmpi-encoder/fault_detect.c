@@ -1813,24 +1813,28 @@ static int fd_run_detection(const uint8_t *preprocessed, fd_result_t *result,
          * fault signal that the global classifiers missed.  The 448x224 wide FOV
          * dilutes GAP for sparse defects (spaghetti covering <20% of frame).
          *
-         * Calibrated thresholds (KS1, Feb 2026, full 14x28 grid):
-         *   Clean bed:       heatmap_max 0.55-0.63, strong_cells=93-117/392
-         *   Spaghetti:       heatmap_max 0.55-0.61, strong_cells=TBD
-         * NOTE: heatmap max overlaps between clean bed and spaghetti on KS1
-         * camera. Spatial boost MUST be gated on CNN to avoid false positives.
-         * CNN is the most reliable discriminator (fail=0.03 clean, 0.80+ fault).
+         * Path 1 — Heatmap-only (all strategies):
+         *   heatmap_max > 1.5 + >=3 strong cells.  No model gate needed.
+         *   For tiny/distant defects where all global models miss (GAP dilution).
          *
-         * Previous calibration (broken 49-cell mask, rows 0-1 only):
-         *   Clean bed: max 0.33-0.38, cells=0
-         *   Spaghetti: max 0.50-0.59, cells=11-19 */
+         * Path 2 — Strategy-aware corroboration:
+         *   heatmap_max > 0.45 + >=3 strong cells + model corroboration.
+         *   Corroboration level matches strategy philosophy:
+         *     Permissive (or/classify):       any model "leaning" (>50% threshold)
+         *     Balanced (majority/verify):     any model above threshold
+         *     Conservative (and/classify_and): CNN above + proto leaning
+         *     Strict (all):                   both CNN and proto above threshold
+         *     Single-model:                   that model "leaning" (>50% threshold)
+         *
+         * Calibrated thresholds (KS1, Feb 2026, coarse projection encoder):
+         *   Empty bed:        heatmap 0.07-0.49,  CNN 0.01,  Proto lk 0.08
+         *   Object on bed:    heatmap 0.75-1.24,  CNN 0.04,  Proto lk 0.10
+         *   3 objects:        heatmap 0.49-0.61,  CNN 0.11,  Proto lk 0.09
+         *   Tiny spaghetti:   heatmap 1.66-1.96,  CNN 0.07,  Proto lk 0.38
+         *   Small spaghetti:  heatmap 2.09-2.11,  CNN 0.76,  Proto lk 0.95
+         *   Big spaghetti:    heatmap 2.09-2.14,  CNN 0.81,  Proto lk 0.94
+         * Path 1 gap: worst_OK=1.24 vs worst_FAULT=1.66 (margin=0.42) */
         if (result->has_heatmap && result->heatmap_max > 0.45f) {
-            /* Gate on CNN: never boost when CNN is confident OK.
-             * KS1 v3 model: empty bed=0.39, object=0.13, spaghetti=0.50+
-             * Only boost when CNN is above threshold (already suspicious). */
-            int cnn_supports = !have_cnn || cnn_fault_lk > cnn_th;
-            if (!cnn_supports)
-                goto skip_boost;
-
             int strong_cells = 0, total_active = 0;
             int mask_on = !fd_mask_is_zero(&active_mask);
             for (int h = 0; h < result->spatial_h; h++) {
@@ -1843,29 +1847,95 @@ static int fd_run_detection(const uint8_t *preprocessed, fd_result_t *result,
                         strong_cells++;
                 }
             }
-            /* Require >=3 strong cells AND a global model shows suspicion.
-             * Removed the "overwhelming evidence" path (strong_cells>=8)
-             * because the full 14x28 grid produces 93+ strong cells on
-             * clean bed — no separation from fault. */
-            int global_hint = 0;
-            if (have_cnn && cnn_fault_lk > cnn_th) global_hint = 1;
-            if (have_proto && proto_fault_lk > 0.85f) global_hint = 1;
 
-            if (strong_cells >= 3 && global_hint) {
-                /* Report boost info for UI (always when conditions met) */
+            int do_boost = 0;
+            const char *boost_path = "unknown";
+
+            /* Path 1: Heatmap-only — overwhelming spatial evidence.
+             * Coarse projection (cos_sim=-0.998): OK < 1.24, FAULT > 1.66.
+             * At 1.5, margin=0.26 from worst OK.  Applies to ALL strategies. */
+            if (result->heatmap_max > 1.5f && strong_cells >= 3) {
+                do_boost = 1;
+                boost_path = "heatmap-only";
+            }
+
+            /* Path 2: Strategy-aware corroboration with moderate heatmap.
+             * "above"   = model exceeds its detection threshold
+             * "leaning" = model shows some fault signal (>50% of threshold) */
+            if (!do_boost && strong_cells >= 3) {
+                int cnn_above   = have_cnn   && cnn_fault_lk   > cnn_th;
+                int cnn_leaning = have_cnn   && cnn_fault_lk   > cnn_th * 0.5f;
+                int proto_above = have_proto  && proto_fault_lk > 0.85f;
+                int proto_lean  = have_proto  && proto_fault_lk > 0.60f;
+                int multi_lean  = run_multi   && multi_fault_lk > multi_th * 0.5f;
+
+                switch (cfg->strategy) {
+                case FD_STRATEGY_OR:
+                case FD_STRATEGY_CLASSIFY:
+                    /* Permissive: any model leaning toward fault */
+                    if (cnn_leaning || proto_lean || multi_lean) {
+                        do_boost = 1; boost_path = "or+heatmap";
+                    }
+                    break;
+                case FD_STRATEGY_MAJORITY:
+                    /* Heatmap as 3rd voter: heatmap + one model = 2-of-3 */
+                    if (cnn_above || proto_above) {
+                        do_boost = 1; boost_path = "majority+heatmap";
+                    }
+                    break;
+                case FD_STRATEGY_VERIFY:
+                    /* Override multi veto: primary model above threshold */
+                    if (cnn_above || proto_above) {
+                        do_boost = 1; boost_path = "verify+heatmap";
+                    }
+                    break;
+                case FD_STRATEGY_AND:
+                case FD_STRATEGY_CLASSIFY_AND:
+                    /* Conservative: CNN above threshold + proto leaning */
+                    if (cnn_above && (proto_lean || !have_proto)) {
+                        do_boost = 1; boost_path = "and+heatmap";
+                    }
+                    break;
+                case FD_STRATEGY_ALL:
+                    /* Strict: both models above threshold */
+                    if (cnn_above && proto_above) {
+                        do_boost = 1; boost_path = "all+heatmap";
+                    }
+                    break;
+                case FD_STRATEGY_CNN:
+                    /* Single-model: CNN leaning + heatmap */
+                    if (cnn_leaning) {
+                        do_boost = 1; boost_path = "cnn+heatmap";
+                    }
+                    break;
+                case FD_STRATEGY_PROTONET:
+                    /* Single-model: proto leaning + heatmap */
+                    if (proto_lean) {
+                        do_boost = 1; boost_path = "proto+heatmap";
+                    }
+                    break;
+                case FD_STRATEGY_MULTICLASS:
+                    /* Single-model: multi leaning + heatmap */
+                    if (multi_lean) {
+                        do_boost = 1; boost_path = "multi+heatmap";
+                    }
+                    break;
+                }
+            }
+
+            if (do_boost) {
                 result->boost_active = 1;
                 result->boost_strong_cells = strong_cells;
                 result->boost_total_cells = total_active;
-                /* Only override OK→FAULT, not when already FAULT */
                 if (result->result == FD_CLASS_OK) {
+                    result->boost_overrode = 1;
                     result->result = FD_CLASS_FAULT;
                     result->confidence = 0.5f + 0.5f * result->heatmap_max;
                     if (result->confidence > 1.0f) result->confidence = 1.0f;
-                    fd_log("  Spatial BOOST: OK->FAULT (max=%.2f, %d/%d strong cells)\n",
-                           result->heatmap_max, strong_cells, total_active);
+                    fd_log("  Spatial BOOST: OK->FAULT (max=%.2f, %d/%d strong cells, path=%s)\n",
+                           result->heatmap_max, strong_cells, total_active, boost_path);
                 }
             }
-        skip_boost: ;
         }
     }
 

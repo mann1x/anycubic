@@ -854,6 +854,7 @@ static void serve_api_stats(ControlServer *srv, int fd) {
             if (lr->boost_active) {
                 cJSON *boost = cJSON_CreateObject();
                 cJSON_AddBoolToObject(boost, "active", 1);
+                cJSON_AddBoolToObject(boost, "overrode", lr->boost_overrode ? 1 : 0);
                 cJSON_AddNumberToObject(boost, "strong_cells", lr->boost_strong_cells);
                 cJSON_AddNumberToObject(boost, "total_cells", lr->boost_total_cells);
                 cJSON_AddNumberToObject(boost, "heatmap_max", R2(lr->heatmap_max));

@@ -2623,7 +2623,9 @@ if(flvjs.isSupported()){
                         lines.push(name + ': ' + rawPct + '% raw, ' + lkPct + '% norm (' + m.ms + 'ms) <span style="color:' + voteColor + ';font-weight:bold">(' + vote + ')</span>');
                     }
                     if (fd.boost && fd.boost.active) {
-                        lines.push('<span style="color:#fa0;font-weight:bold">BOOST</span>: heatmap ' + (fd.boost.heatmap_max * 100).toFixed(0) + '%, ' + fd.boost.strong_cells + '/' + fd.boost.total_cells + ' cells');
+                        const boostVote = fd.boost.overrode ? 'KO' : 'OK';
+                        const boostColor = fd.boost.overrode ? '#f55' : '#fa0';
+                        lines.push('Boost: heatmap ' + (fd.boost.heatmap_max * 100).toFixed(0) + '%, ' + fd.boost.strong_cells + '/' + fd.boost.total_cells + ' cells <span style="color:' + boostColor + ';font-weight:bold">(' + boostVote + ')</span>');
                     }
                     modelsRow.style.display = '';
                     modelsEl.innerHTML = lines.join('\n');
@@ -2634,7 +2636,7 @@ if(flvjs.isSupported()){
                 // Fault class
                 if (fd.detection === 'fault' && fd.fault_class && fd.fault_class !== '-') {
                     classRow.style.display = '';
-                    classEl.textContent = fd.fault_class;
+                    classEl.textContent = fd.fault_class === 'Success' ? 'Not detected' : fd.fault_class;
                 } else {
                     classRow.style.display = 'none';
                 }

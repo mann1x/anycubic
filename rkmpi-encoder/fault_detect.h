@@ -272,7 +272,8 @@ typedef struct {
     int heatmap_max_h;       /* row index of max */
     int heatmap_max_w;       /* col index of max */
     float spatial_ms;        /* spatial inference time */
-    int boost_active;        /* 1 if spatial boost overrode OK→FAULT */
+    int boost_active;        /* 1 if spatial boost conditions met */
+    int boost_overrode;      /* 1 if boost actually changed OK→FAULT */
     int boost_strong_cells;  /* number of strong cells when boost fired */
     int boost_total_cells;   /* total active cells when boost fired */
     /* Center-crop region in normalized [0,1] coords */
