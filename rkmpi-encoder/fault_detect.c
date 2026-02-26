@@ -1505,8 +1505,9 @@ static int fd_run_detection(const uint8_t *preprocessed, fd_result_t *result,
         have_cnn = 0; have_proto = 1; have_multi = 0;
     } else if (cfg->strategy == FD_STRATEGY_MULTICLASS) {
         have_cnn = 0; have_proto = 0; have_multi = 1;
-    } else if (cfg->strategy == FD_STRATEGY_AND) {
-        have_multi = 0;  /* AND: CNN+Proto only, no multiclass */
+    } else if (cfg->strategy == FD_STRATEGY_AND ||
+               cfg->strategy == FD_STRATEGY_OR) {
+        have_multi = 0;  /* AND/OR: CNN+Proto only, no multiclass */
     }
 
     /* Per-model results */
