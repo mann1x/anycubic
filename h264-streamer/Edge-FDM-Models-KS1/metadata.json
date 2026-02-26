@@ -25,16 +25,28 @@
                 "rknn": "spatial_encoder.rknn",
                 "prototypes": "spatial_prototypes.bin",
                 "grid": "14x28",
-                "channels": 232,
-                "source": "protonet/weights/spatial-ks1/fine/"
+                "channels": 128,
+                "training": "Proj+QAT+MMSE (1x1 Conv 232→128 projection + QAT, cos_sim=0.594, 106x improvement)",
+                "quantization": "MMSE",
+                "source": "protonet/weights/spatial-ks1-proj-qat-mmse/fine/"
             },
             "spatial_coarse": {
                 "onnx": "spatial_encoder_coarse.onnx",
                 "rknn": "spatial_encoder_coarse.rknn",
                 "prototypes": "spatial_prototypes_coarse.bin",
                 "grid": "7x14",
-                "channels": 1024,
-                "source": "protonet/weights/spatial-ks1/coarse/"
+                "channels": 256,
+                "training": "Proj only (1x1 Conv 1024→256 projection, cos_sim=-0.998, margin=1.998, 2.17x improvement over baseline 0.920)",
+                "quantization": "normal (MMSE/QAT add nothing — projection alone saturates coarse encoder)",
+                "source": "protonet/weights/spatial-ks1-proj-normal/coarse/",
+                "comparison": {
+                    "baseline_no_proj": {"channels": 1024, "cos_sim": 0.080, "margin": 0.920},
+                    "proj_normal": {"channels": 256, "cos_sim": -0.998, "margin": 1.998},
+                    "proj_mmse": {"channels": 256, "cos_sim": -0.998, "margin": 1.998},
+                    "proj_qat_normal": {"channels": 256, "cos_sim": -0.996, "margin": 1.996},
+                    "proj_qat_mmse": {"channels": 256, "cos_sim": -0.996, "margin": 1.996},
+                    "decision": "Proj (normal) — simplest pipeline, best result. QAT/MMSE add nothing for coarse."
+                }
             },
             "source": "protonet/weights/supcon-ks1/"
         },
@@ -54,16 +66,42 @@
             "proto_threshold": 0.58,
             "proto_dynamic_trigger": 0.70,
             "multi_threshold": 0.81,
-            "live_test_results": {
+            "live_test_results_v3": {
                 "date": "2026-02-26",
+                "note": "After coarse projection upgrade (256ch, cos_sim=-0.998) + fine Proj+QAT+MMSE (128ch, cos_sim=0.594)",
+                "empty_bed": {"cnn": "0.01-0.02", "proto": "-0.87", "heatmap": "-0.68 to 0.20", "multi": "0.50 Success"},
+                "object_on_bed": {"cnn": "0.05", "proto": "-0.78 to -0.86", "heatmap": "-0.65 to 0.26", "multi": "0.47 Success"},
+                "big_spaghetti_on_object": {"cnn": "0.72", "proto": "+0.84 to +0.86", "heatmap": "2.11-2.13", "multi": "0.93-0.94 Spaghetti"},
+                "small_spaghetti_on_object": {"cnn": "0.92", "proto": "+0.90", "heatmap": "2.08-2.09", "multi": "0.76 Spaghetti (below 0.81 th)"},
+                "gap_cnn": "worst_OK=0.05 vs best_FAULT=0.72 (gap=0.67)",
+                "gap_proto": "worst_OK=-0.78 vs best_FAULT=+0.84 (gap=1.62)",
+                "gap_heatmap": "worst_OK=0.26 vs best_FAULT=2.08 (gap=1.82)",
+                "heatmap_improvement": "Coarse projection (1024→256ch, cos_sim=-0.998) produces anti-correlated prototypes. Heatmap gap improved from 0.70 (v2) to 1.82 (v3) — 2.6x. Values now exceed 1.0 for faults (raw cosine margin, not probability). OK values go negative.",
+                "verdict": "Heatmap massively improved. CNN/Proto gaps stable. All thresholds remain well-centered."
+            },
+            "live_test_results_v2": {
+                "date": "2026-02-26",
+                "note": "After Proj+QAT+MMSE fine spatial encoder upgrade (128ch, cos_sim=0.594). Before coarse projection.",
+                "empty_bed": {"cnn": "0.01-0.02", "proto": "-0.85 to -0.87", "heatmap": "0.14-0.19", "multi": "0.41-0.44 Success"},
+                "object_on_bed": {"cnn": "0.04", "proto": "-0.82 to -0.86", "heatmap": "0.14-0.17", "multi": "0.42-0.44 Success"},
+                "big_spaghetti_on_object": {"cnn": "0.77-0.78", "proto": "+0.90", "heatmap": "0.89-0.93", "multi": "0.97 Spaghetti"},
+                "small_spaghetti_on_object": {"cnn": "0.90-0.91", "proto": "+0.88 to +0.89", "heatmap": "0.93-0.94", "multi": "0.73 Spaghetti (below 0.81 th)"},
+                "gap_cnn": "worst_OK=0.04 vs best_FAULT=0.77 (gap=0.73)",
+                "gap_proto": "worst_OK=-0.82 vs best_FAULT=+0.88 (gap=1.70)",
+                "gap_heatmap": "worst_OK=0.19 vs best_FAULT=0.89 (gap=0.70)",
+                "heatmap_improvement": "Old fine encoder (232ch, cos_sim=0.996): empty bed heatmap 0.55-0.63, triggered spatial boost false positives. New (128ch, cos_sim=0.594): empty bed 0.14-0.19, well below 0.45 boost threshold.",
+                "verdict": "All thresholds well-centered. Multiclass at 0.81 is correct — generic model has FP risk on objects if lowered."
+            },
+            "live_test_results_v1": {
+                "date": "2026-02-26",
+                "note": "Before Proj+QAT+MMSE upgrade (old 232ch fine encoder, cos_sim=0.996)",
                 "empty_bed": {"cnn": "0.04-0.05", "proto": "-0.80 to -0.84", "heatmap": "0.18-0.22"},
                 "object_on_bed": {"cnn": "0.03-0.08", "proto": "-0.78 to -0.88", "heatmap": "0.16-0.27"},
                 "big_spaghetti": {"cnn": "0.81-0.82", "proto": "+0.87 to +0.88", "heatmap": "0.90-0.91", "multi": "0.95 Spaghetti"},
                 "small_spaghetti_on_object": {"cnn": "0.92", "proto": "+0.88 to +0.89", "heatmap": "0.94-0.95", "multi": "0.81 borderline"},
                 "small_spaghetti_center": {"cnn": "0.75-0.77", "proto": "+0.82 to +0.86", "heatmap": "0.94-0.96", "multi": "0.86 Spaghetti"},
                 "gap_cnn": "worst_OK=0.08 vs best_FAULT=0.75 (gap=0.67)",
-                "gap_proto": "worst_OK=-0.78 vs best_FAULT=+0.82 (gap=1.60)",
-                "verdict": "All thresholds well-centered, no recalibration needed"
+                "gap_proto": "worst_OK=-0.78 vs best_FAULT=+0.82 (gap=1.60)"
             }
         }
     }
