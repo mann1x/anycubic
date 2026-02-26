@@ -850,6 +850,15 @@ static void serve_api_stats(ControlServer *srv, int fd) {
                 cJSON_AddItemToObject(models, "multi", m);
             }
             cJSON_AddItemToObject(fd_obj, "models", models);
+            /* Spatial boost status */
+            if (lr->boost_active) {
+                cJSON *boost = cJSON_CreateObject();
+                cJSON_AddBoolToObject(boost, "active", 1);
+                cJSON_AddNumberToObject(boost, "strong_cells", lr->boost_strong_cells);
+                cJSON_AddNumberToObject(boost, "total_cells", lr->boost_total_cells);
+                cJSON_AddNumberToObject(boost, "heatmap_max", R2(lr->heatmap_max));
+                cJSON_AddItemToObject(fd_obj, "boost", boost);
+            }
             #undef R2
         }
 

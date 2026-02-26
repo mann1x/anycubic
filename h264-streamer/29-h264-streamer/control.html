@@ -2622,6 +2622,9 @@ if(flvjs.isSupported()){
                         const voteColor = m.vote === 'fault' ? '#f55' : '#5f5';
                         lines.push(name + ': ' + rawPct + '% raw, ' + lkPct + '% norm (' + m.ms + 'ms) <span style="color:' + voteColor + ';font-weight:bold">(' + vote + ')</span>');
                     }
+                    if (fd.boost && fd.boost.active) {
+                        lines.push('<span style="color:#fa0;font-weight:bold">BOOST</span>: heatmap ' + (fd.boost.heatmap_max * 100).toFixed(0) + '%, ' + fd.boost.strong_cells + '/' + fd.boost.total_cells + ' cells');
+                    }
                     modelsRow.style.display = '';
                     modelsEl.innerHTML = lines.join('\n');
                 } else if (modelsRow) {

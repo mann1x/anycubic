@@ -1825,11 +1825,10 @@ static int fd_run_detection(const uint8_t *preprocessed, fd_result_t *result,
          *   Spaghetti: max 0.50-0.59, cells=11-19 */
         if (result->result == FD_CLASS_OK && result->has_heatmap &&
             result->heatmap_max > 0.45f) {
-            /* Gate on CNN: never boost when CNN is very confident OK.
-             * CNN fail=0.03 on clean bed vs 0.80+ on spaghetti — most
-             * reliable model. Spatial boost should only assist when CNN
-             * is borderline, not override CNN's strong OK signal. */
-            int cnn_supports = !have_cnn || cnn_fault_lk > 0.20f;
+            /* Gate on CNN: never boost when CNN is confident OK.
+             * KS1 v3 model: empty bed=0.39, object=0.13, spaghetti=0.50+
+             * Only boost when CNN is above threshold (already suspicious). */
+            int cnn_supports = !have_cnn || cnn_fault_lk > cnn_th;
             if (!cnn_supports)
                 goto skip_boost;
 
@@ -1850,13 +1849,16 @@ static int fd_run_detection(const uint8_t *preprocessed, fd_result_t *result,
              * because the full 14x28 grid produces 93+ strong cells on
              * clean bed — no separation from fault. */
             int global_hint = 0;
-            if (have_cnn && cnn_fault_lk > 0.30f) global_hint = 1;
+            if (have_cnn && cnn_fault_lk > cnn_th) global_hint = 1;
             if (have_proto && proto_fault_lk > 0.85f) global_hint = 1;
 
             if (strong_cells >= 3 && global_hint) {
                 result->result = FD_CLASS_FAULT;
                 result->confidence = 0.5f + 0.5f * result->heatmap_max;
                 if (result->confidence > 1.0f) result->confidence = 1.0f;
+                result->boost_active = 1;
+                result->boost_strong_cells = strong_cells;
+                result->boost_total_cells = total_active;
                 fd_log("  Spatial BOOST: OK->FAULT (max=%.2f, %d/%d strong cells)\n",
                        result->heatmap_max, strong_cells, total_active);
             }
@@ -1910,6 +1912,7 @@ static void *fd_thread_func(void *arg)
     int consecutive_ok = 0;
     int use_verify_interval = 0;
     uint64_t last_led_check = 0;
+    uint64_t last_led_keepalive = 0;
 
     while (!g_fd.thread_stop) {
         /* Get current config */
@@ -1940,16 +1943,27 @@ static void *fd_thread_func(void *arg)
             continue;
         }
 
-        /* LED keepalive — query every 60s, send ON, wait 3s if it was off */
+        /* LED keepalive — mandatory ON every 5 min to prevent printer standby,
+         * query+wait every 60s to detect LED-off and allow camera re-exposure */
         {
             struct timeval tv_now;
             gettimeofday(&tv_now, NULL);
             uint64_t now_ms = (uint64_t)tv_now.tv_sec * 1000 + tv_now.tv_usec / 1000;
+
+            /* Mandatory LED ON every 5 min (standby timeout is ~10 min) */
+            if (now_ms - last_led_keepalive >= 300000) {
+                last_led_keepalive = now_ms;
+                mqtt_send_led(1, 100);
+                fd_log("LED keepalive (5min)\n");
+            }
+
+            /* Check LED state every 60s — if off, turn on and wait for exposure */
             if (now_ms - last_led_check >= 60000) {
                 last_led_check = now_ms;
                 int led = mqtt_query_led(1000);
-                mqtt_send_led(1, 100);
                 if (led == 0) {
+                    mqtt_send_led(1, 100);
+                    last_led_keepalive = now_ms;
                     fd_log("LED was off, turning on and waiting 3s for exposure\n");
                     for (int i = 0; i < 30 && !g_fd.thread_stop; i++)
                         usleep(100000);  /* 3s in 100ms chunks */

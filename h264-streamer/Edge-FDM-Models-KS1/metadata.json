@@ -5,12 +5,12 @@
     "calibration": "RGB (matching on-device TJPF_RGB input)",
     "models": {
         "cnn": {
-            "display_name": "MobileNetV2 SupCon T=0.05 MMSE",
+            "display_name": "KS1 SupCon T=0.05 MMSE",
             "onnx": "model.onnx",
             "rknn": "model.rknn",
-            "training": "SupCon 2-stage (temp=0.05, 100+100 epochs)",
+            "training": "SupCon 2-stage KS1 dataset v4 (temp=0.05, 100+50 epochs, 540 fail + 2499 success)",
             "quantization": "MMSE (handles SupCon weight outliers)",
-            "source": "candidate_models/results/supcon-temp005-stage2/"
+            "source": "candidate_models/results/supcon-ks1-temp005-v4/"
         },
         "protonet": {
             "display_name": "ProtoNet Color SupCon Temp 0.05",
@@ -46,8 +46,8 @@
     "profiles": {
         "KS1": {
             "description": "Kobra S1 calibrated (Feb 2026)",
-            "cnn_threshold": 0.60,
-            "cnn_dynamic_threshold": 0.55,
+            "cnn_threshold": 0.40,
+            "cnn_dynamic_threshold": 0.35,
             "proto_threshold": 0.58,
             "proto_dynamic_trigger": 0.70,
             "multi_threshold": 0.81

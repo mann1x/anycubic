@@ -2524,6 +2524,8 @@ int main(int argc, char *argv[]) {
     /* Initialize RKMPI system (needed for H.264 encoding and YUYV JPEG encoding) */
     int need_rkmpi = h264_available || cfg.yuyv_mode || cfg.server_mode;
     if (need_rkmpi) {
+        /* Remove stale RKMPI socket from previous crash (kill -9 skips cleanup) */
+        unlink("/tmp/unix_uds1");
         ret = RK_MPI_SYS_Init();
         if (ret != RK_SUCCESS) {
             log_error("RK_MPI_SYS_Init failed: 0x%x\n", ret);
