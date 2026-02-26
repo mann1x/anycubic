@@ -14,17 +14,19 @@
             "source": "candidate_models/results/supcon-ks1-temp005-v4/"
         },
         "protonet": {
-            "display_name": "ProtoNet Color SupCon Temp 0.05",
+            "display_name": "KS1 ProtoNet Color SupCon T=0.05",
             "onnx": "encoder.onnx",
             "rknn": "encoder.rknn",
             "prototypes": "prototypes.bin",
+            "training": "SupCon KS1 dataset (temp=0.05, 100 epochs, 540 fail + 2499 success)",
+            "dataset": "datasets/KS1/ks1printer",
             "spatial_fine": {
                 "onnx": "spatial_encoder.onnx",
                 "rknn": "spatial_encoder.rknn",
                 "prototypes": "spatial_prototypes.bin",
                 "grid": "14x28",
                 "channels": 232,
-                "source": "protonet/weights/spatial-color/fine/"
+                "source": "protonet/weights/spatial-ks1/fine/"
             },
             "spatial_coarse": {
                 "onnx": "spatial_encoder_coarse.onnx",
@@ -32,9 +34,9 @@
                 "prototypes": "spatial_prototypes_coarse.bin",
                 "grid": "7x14",
                 "channels": 1024,
-                "source": "protonet/weights/spatial-color/coarse/"
+                "source": "protonet/weights/spatial-ks1/coarse/"
             },
-            "source": "protonet/weights/supcon-448x224-color/"
+            "source": "protonet/weights/supcon-ks1/"
         },
         "multiclass": {
             "display_name": "Multiclass Color SupCon 7-class",
@@ -51,7 +53,18 @@
             "cnn_dynamic_threshold": 0.35,
             "proto_threshold": 0.58,
             "proto_dynamic_trigger": 0.70,
-            "multi_threshold": 0.81
+            "multi_threshold": 0.81,
+            "live_test_results": {
+                "date": "2026-02-26",
+                "empty_bed": {"cnn": "0.04-0.05", "proto": "-0.80 to -0.84", "heatmap": "0.18-0.22"},
+                "object_on_bed": {"cnn": "0.03-0.08", "proto": "-0.78 to -0.88", "heatmap": "0.16-0.27"},
+                "big_spaghetti": {"cnn": "0.81-0.82", "proto": "+0.87 to +0.88", "heatmap": "0.90-0.91", "multi": "0.95 Spaghetti"},
+                "small_spaghetti_on_object": {"cnn": "0.92", "proto": "+0.88 to +0.89", "heatmap": "0.94-0.95", "multi": "0.81 borderline"},
+                "small_spaghetti_center": {"cnn": "0.75-0.77", "proto": "+0.82 to +0.86", "heatmap": "0.94-0.96", "multi": "0.86 Spaghetti"},
+                "gap_cnn": "worst_OK=0.08 vs best_FAULT=0.75 (gap=0.67)",
+                "gap_proto": "worst_OK=-0.78 vs best_FAULT=+0.82 (gap=1.60)",
+                "verdict": "All thresholds well-centered, no recalibration needed"
+            }
         }
     }
 }
