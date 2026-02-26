@@ -14,7 +14,7 @@
             "source": "candidate_models/results/supcon-ks1-temp005-v4/"
         },
         "protonet": {
-            "display_name": "KS1 ProtoNet Color SupCon T=0.05",
+            "display_name": "KS1 ProtoNet Color SupCon Temp 0.05",
             "onnx": "encoder.onnx",
             "rknn": "encoder.rknn",
             "prototypes": "prototypes.bin",
@@ -51,7 +51,7 @@
             "source": "protonet/weights/supcon-ks1/"
         },
         "multiclass": {
-            "display_name": "KS1 Multiclass SupCon T=0.05 MMSE 7-class",
+            "display_name": "KS1 Multiclass Color SupCon 7-class",
             "onnx": "multiclass.onnx",
             "rknn": "multiclass.rknn",
             "classes": ["Cracking", "Layer_shifting", "Spaghetti", "Stringing", "Success", "Under_Extrusion", "Warping"],
@@ -75,6 +75,7 @@
             "proto_threshold": 0.58,
             "proto_dynamic_trigger": 0.70,
             "multi_threshold": 0.81,
+            "heatmap_boost_threshold": 1.6,
             "live_test_results_v4": {
                 "date": "2026-02-26",
                 "note": "After KS1-trained multiclass upgrade (SupCon T=0.05, MMSE, 10230 images from multiclass_7c + KS1 ks1printer)",

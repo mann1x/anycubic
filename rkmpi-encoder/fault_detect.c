@@ -1854,8 +1854,9 @@ static int fd_run_detection(const uint8_t *preprocessed, fd_result_t *result,
 
             /* Path 1: Heatmap-only — overwhelming spatial evidence.
              * Coarse projection (cos_sim=-0.998): OK < 1.24, FAULT > 1.66.
-             * At 1.5, margin=0.26 from worst OK.  Applies to ALL strategies. */
-            if (result->heatmap_max > 1.5f && strong_cells >= 3) {
+             * Raised to 1.6 after live print showed spurious hit at 1.54.
+             * Margin: 0.36 from worst OK (1.24), 0.06 from weakest fault (1.66). */
+            if (result->heatmap_max > 1.6f && strong_cells >= 3) {
                 do_boost = 1;
                 boost_path = "heatmap-only";
             }
