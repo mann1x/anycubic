@@ -51,11 +51,20 @@
             "source": "protonet/weights/supcon-ks1/"
         },
         "multiclass": {
-            "display_name": "Multiclass Color SupCon 7-class",
+            "display_name": "KS1 Multiclass SupCon T=0.05 MMSE 7-class",
             "onnx": "multiclass.onnx",
             "rknn": "multiclass.rknn",
             "classes": ["Cracking", "Layer_shifting", "Spaghetti", "Stringing", "Success", "Under_Extrusion", "Warping"],
-            "source": "multiclass_cnn/scripts/results/mc-448x224-color/"
+            "training": "SupCon 2-stage KS1-augmented multiclass_7c (temp=0.05, 100+50 epochs, 10230 images)",
+            "dataset": "datasets/KS1/multiclass_7c_ks1",
+            "quantization": "MMSE",
+            "test_results": {
+                "mc_acc": 0.962,
+                "macro_f1": 0.960,
+                "bin_f1": 0.979,
+                "best_epoch": 38
+            },
+            "source": "multiclass_cnn/scripts/results/mc-ks1-temp005/"
         }
     },
     "profiles": {
@@ -66,9 +75,24 @@
             "proto_threshold": 0.58,
             "proto_dynamic_trigger": 0.70,
             "multi_threshold": 0.81,
+            "live_test_results_v4": {
+                "date": "2026-02-26",
+                "note": "After KS1-trained multiclass upgrade (SupCon T=0.05, MMSE, 10230 images from multiclass_7c + KS1 ks1printer)",
+                "empty_bed": {"cnn": "0.01", "proto": "-0.83 to -0.86", "heatmap": "0.07-0.49", "multi": "0.04 Success"},
+                "object_on_bed": {"cnn": "0.06", "proto": "-0.70 to -0.80", "heatmap": "0.75-1.24", "multi": "0.31-0.34 Success"},
+                "big_spaghetti_on_object": {"cnn": "0.81-0.82", "proto": "+0.85 to +0.88", "heatmap": "2.13-2.14", "multi": "0.976 Spaghetti"},
+                "small_spaghetti_on_object": {"cnn": "0.87-0.89", "proto": "+0.89 to +0.90", "heatmap": "2.09-2.11", "multi": "0.955-0.958 Spaghetti"},
+                "small_spaghetti_center": {"cnn": "0.75-0.76", "proto": "+0.90-0.91", "heatmap": "2.09-2.11", "multi": "0.924-0.936 Spaghetti"},
+                "gap_cnn": "worst_OK=0.06 vs best_FAULT=0.75 (gap=0.69)",
+                "gap_proto": "worst_OK=-0.70 vs best_FAULT=+0.85 (gap=1.55)",
+                "gap_heatmap": "worst_OK=1.24 vs best_FAULT=2.09 (gap=0.85)",
+                "gap_multi": "worst_OK=0.34 vs worst_FAULT=0.93 (gap=0.60, was 0.26 in v3)",
+                "multiclass_improvement": "KS1-trained multiclass doubles gap (0.60 vs 0.26). Empty bed 0.04 vs 0.50. Small spaghetti+object 0.96 vs 0.76 (was below 0.81 threshold). All fault scenarios now clear 0.81 threshold comfortably.",
+                "verdict": "Multiclass massively improved by KS1-specific training. Threshold 0.81 well-centered. All models agree on all scenarios."
+            },
             "live_test_results_v3": {
                 "date": "2026-02-26",
-                "note": "After coarse projection upgrade (256ch, cos_sim=-0.998) + fine Proj+QAT+MMSE (128ch, cos_sim=0.594)",
+                "note": "After coarse projection upgrade (256ch, cos_sim=-0.998) + fine Proj+QAT+MMSE (128ch, cos_sim=0.594). Old generic multiclass.",
                 "empty_bed": {"cnn": "0.01-0.02", "proto": "-0.87", "heatmap": "-0.68 to 0.20", "multi": "0.50 Success"},
                 "object_on_bed": {"cnn": "0.05", "proto": "-0.78 to -0.86", "heatmap": "-0.65 to 0.26", "multi": "0.47 Success"},
                 "big_spaghetti_on_object": {"cnn": "0.72", "proto": "+0.84 to +0.86", "heatmap": "2.11-2.13", "multi": "0.93-0.94 Spaghetti"},
