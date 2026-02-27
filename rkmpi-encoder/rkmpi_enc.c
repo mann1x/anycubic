@@ -359,7 +359,13 @@ static int client_activity_check(int mjpeg_clients, int flv_clients, int server_
 static volatile sig_atomic_t g_running = 1;
 static volatile sig_atomic_t g_restart_requested = 0;
 static volatile int g_snapshot_pending = 0;  /* HTTP snapshot requested */
+static volatile int g_rkmpi_reinit_needed = 0;  /* RKMPI reset after VENC recovery */
 static pthread_mutex_t g_state_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* Request RKMPI reinit (called from recovery thread to release CMA) */
+void rkmpi_request_reinit(void) {
+    g_rkmpi_reinit_needed = 1;
+}
 
 /* Request a snapshot (called from HTTP server thread) */
 void request_camera_snapshot(void) {
@@ -2760,6 +2766,58 @@ int main(int argc, char *argv[]) {
     }
 
     while (g_running) {
+        /* RKMPI reinit requested (e.g., after VENC recovery to release CMA) */
+        if (g_rkmpi_reinit_needed && rkmpi_initialized) {
+            log_info("RKMPI reinit: releasing CMA buffers from VENC recovery\n");
+            /* Destroy VENC channels */
+            if (venc_initialized) { cleanup_venc(); venc_initialized = 0; }
+            if (venc_jpeg_initialized) { cleanup_venc_jpeg(); venc_jpeg_initialized = 0; }
+            /* Free DMA buffer */
+            if (mb_blk != MB_INVALID_HANDLE) {
+                RK_MPI_MMZ_Free(mb_blk);
+                mb_blk = MB_INVALID_HANDLE;
+                mb_vaddr = NULL;
+            }
+            /* Full RKMPI reset to release lazy-deallocated rockit buffer pools */
+            RK_MPI_SYS_Exit();
+            usleep(100000);  /* 100ms settle */
+            RK_S32 rc = RK_MPI_SYS_Init();
+            if (rc != RK_SUCCESS) {
+                log_error("RKMPI reinit: SYS_Init failed: 0x%x\n", rc);
+                rkmpi_initialized = 0;
+            } else {
+                /* Re-allocate DMA buffer */
+                if (need_dma_buffer) {
+                    rc = RK_MPI_MMZ_Alloc(&mb_blk, nv12_size, RK_MMZ_ALLOC_CACHEABLE);
+                    if (rc != RK_SUCCESS || mb_blk == MB_INVALID_HANDLE) {
+                        rc = RK_MPI_MMZ_Alloc(&mb_blk, nv12_size, RK_MMZ_ALLOC_UNCACHEABLE);
+                    }
+                    if (rc == RK_SUCCESS && mb_blk != MB_INVALID_HANDLE) {
+                        mb_vaddr = RK_MPI_MMZ_Handle2VirAddr(mb_blk);
+                        mb_cacheable = RK_MPI_MMZ_IsCacheable(mb_blk);
+                        log_info("RKMPI reinit: DMA buffer re-allocated at %p\n", mb_vaddr);
+                    } else {
+                        log_error("RKMPI reinit: DMA buffer alloc failed\n");
+                    }
+                }
+                /* Re-initialize streaming VENC */
+                if (h264_available) {
+                    if (init_venc(&cfg) == 0) {
+                        venc_initialized = 1;
+                        log_info("RKMPI reinit: VENC H.264 re-initialized\n");
+                    }
+                }
+                if (cfg.yuyv_mode) {
+                    if (init_venc_jpeg(&cfg) == 0) {
+                        venc_jpeg_initialized = 1;
+                        log_info("RKMPI reinit: VENC JPEG re-initialized\n");
+                    }
+                }
+                log_info("RKMPI reinit: complete\n");
+            }
+            g_rkmpi_reinit_needed = 0;
+        }
+
         TIMING_START(total_frame);
 
         /* Periodically check control files */

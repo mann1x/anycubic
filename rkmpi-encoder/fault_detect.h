@@ -358,6 +358,11 @@ int fault_detect_npu_available(void);
 /* Check if fault detection is installed (models directory exists). */
 int fault_detect_installed(void);
 
+/* Warmup CMA by loading/unloading all configured models.
+ * Call before VENC operations to pre-heat CMA allocation paths.
+ * Returns number of models successfully loaded, or -1 on error. */
+int fault_detect_warmup(void);
+
 /* Check if the FD thread is waiting for a frame (non-blocking). */
 int fault_detect_needs_frame(void);
 

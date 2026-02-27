@@ -10,6 +10,7 @@
 
 #include "timelapse.h"
 #include "timelapse_venc.h"
+#include "fault_detect.h"
 #include "frame_buffer.h"
 #include "turbojpeg.h"
 #include <stdio.h>
@@ -1492,6 +1493,11 @@ static void *recovery_thread_func(void *arg) {
         return NULL;
     }
 
+    /* Pre-allocate CMA by loading/releasing the largest RKNN model.
+     * This "warms up" CMA so VENC allocates from a different region,
+     * preventing fragmentation that blocks RKNN model loading after recovery. */
+    fault_detect_warmup();
+
     pid_t my_pid = getpid();
     struct dirent *entry;
     int recovered = 0;
@@ -1553,6 +1559,17 @@ static void *recovery_thread_func(void *arg) {
     if (recovered > 0 || failed > 0) {
         timelapse_log("Recovery: processed %d dir(s): %d recovered, %d failed\n",
                       recovered + failed, recovered, failed);
+    }
+
+    /* Request RKMPI reinit to force release lazy-deallocated CMA buffers.
+     * VENC recovery leaves ~4MB of rockit internal buffer pools in CMA
+     * that fragment the space and prevent RKNN model loading (6MB CNN).
+     * The main capture loop handles the actual SYS_Exit/Init + resource
+     * re-allocation since it owns the DMA buffer and streaming VENC. */
+    if (recovered > 0 || failed > 0) {
+        extern void rkmpi_request_reinit(void);
+        timelapse_log("Recovery: requesting RKMPI reinit to release CMA\n");
+        rkmpi_request_reinit();
     }
 
     /* Set final status */

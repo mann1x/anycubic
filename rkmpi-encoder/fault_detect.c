@@ -14,6 +14,7 @@
 #pragma GCC diagnostic ignored "-Wformat-truncation"
 
 #include "fault_detect.h"
+#include "timelapse.h"
 #include "mqtt_client.h"
 #include "cJSON.h"
 #include "rknn/rknn_api.h"
@@ -2014,6 +2015,15 @@ static void *fd_thread_func(void *arg)
 
         if (g_fd.thread_stop) break;
 
+        /* Skip cycle while timelapse is encoding (VENC recovery uses CMA) */
+        {
+            TimelapseEncodeStatus tl_status = timelapse_get_encode_status();
+            if (tl_status == TL_ENCODE_PENDING || tl_status == TL_ENCODE_RUNNING) {
+                fd_log("Skipping cycle: timelapse encoding in progress\n");
+                continue;
+            }
+        }
+
         /* Check available memory */
         int avail_mb = fd_get_available_memory_mb();
         if (avail_mb > 0 && avail_mb < cfg.min_free_mem_mb) {
@@ -2347,6 +2357,66 @@ void fault_detect_cleanup(void)
     pthread_cond_destroy(&g_fd.frame_cond);
 
     g_fd.initialized = 0;
+}
+
+int fault_detect_warmup(void)
+{
+    if (!g_fd.initialized || !g_rknn.handle) return -1;
+
+    pthread_mutex_lock(&g_fd.config_mutex);
+    fd_config_t cfg = g_fd.config;
+    pthread_mutex_unlock(&g_fd.config_mutex);
+
+    if (!cfg.enabled) return 0;
+
+    /* Find the largest enabled model file to pre-allocate CMA */
+    fd_model_class_t classes[] = {
+        FD_MODEL_CNN, FD_MODEL_PROTONET, FD_MODEL_MULTICLASS,
+        FD_MODEL_SPATIAL, FD_MODEL_SPATIAL_COARSE
+    };
+    const char *names[] = {
+        "CNN", "ProtoNet", "Multiclass", "Spatial", "SpatialCoarse"
+    };
+    int enables[] = {
+        cfg.cnn_enabled, cfg.proto_enabled, cfg.multi_enabled,
+        cfg.heatmap_enabled, cfg.heatmap_enabled
+    };
+
+    char biggest_path[512] = {0};
+    const char *biggest_name = NULL;
+    long biggest_size = 0;
+
+    for (int i = 0; i < 5; i++) {
+        if (!enables[i]) continue;
+        char path[512];
+        if (fd_resolve_model_path(classes[i], cfg.model_set,
+                                   path, sizeof(path), &cfg) < 0)
+            continue;
+        struct stat st;
+        if (stat(path, &st) == 0 && st.st_size > biggest_size) {
+            biggest_size = st.st_size;
+            snprintf(biggest_path, sizeof(biggest_path), "%s", path);
+            biggest_name = names[i];
+        }
+    }
+
+    if (!biggest_name) {
+        fd_log("CMA warmup: no models found\n");
+        return 0;
+    }
+
+    fd_log("CMA warmup: loading %s (%ld KB) to pre-allocate CMA...\n",
+           biggest_name, biggest_size / 1024);
+
+    fd_rknn_model_t model;
+    if (fd_model_init(&model, biggest_path) == 0) {
+        fd_model_release(&model);
+        fd_log("CMA warmup: %s loaded/released OK\n", biggest_name);
+        return 1;
+    }
+
+    fd_log("CMA warmup: %s failed to load\n", biggest_name);
+    return 0;
 }
 
 int fault_detect_needs_frame(void)
