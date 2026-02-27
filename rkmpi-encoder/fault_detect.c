@@ -959,7 +959,8 @@ static int fd_resolve_model_path(fd_model_class_t cls, const char *set_name,
  * See BigEdge-FDM-Models CLAUDE.md for calibration details. */
 static void fd_get_thresholds(const fd_config_t *cfg, int strategy,
                                float *cnn_th, float *proto_th, float *multi_th,
-                               float *cnn_dyn_th, float *proto_dyn_trigger)
+                               float *cnn_dyn_th, float *proto_dyn_trigger,
+                               float *heatmap_boost_th)
 {
     const fd_active_thresholds_t *t = &cfg->thresholds;
 
@@ -977,6 +978,10 @@ static void fd_get_thresholds(const fd_config_t *cfg, int strategy,
         *multi_th = 0.10f;
     else
         *multi_th = t->multi_threshold > 0 ? t->multi_threshold : 0.81f;
+
+    /* Heatmap boost threshold: minimum heatmap_max for Path 1 (heatmap-only) override.
+     * Default 1.6 calibrated from live print (worst OK=1.24, weakest fault=1.66). */
+    *heatmap_boost_th = t->heatmap_boost_threshold > 0 ? t->heatmap_boost_threshold : 1.6f;
 }
 
 static int fd_run_cnn(const uint8_t *input, fd_result_t *r, float threshold,
@@ -1490,9 +1495,9 @@ static int fd_run_detection(const uint8_t *preprocessed, fd_result_t *result,
     snprintf(result->fault_class_name, sizeof(result->fault_class_name), "-");
 
     /* Get thresholds from config (or fallback to hardcoded defaults) */
-    float cnn_th, proto_th, multi_th, cnn_dyn_th, proto_dyn_trigger;
+    float cnn_th, proto_th, multi_th, cnn_dyn_th, proto_dyn_trigger, heatmap_boost_th;
     fd_get_thresholds(cfg, cfg->strategy, &cnn_th, &proto_th, &multi_th,
-                      &cnn_dyn_th, &proto_dyn_trigger);
+                      &cnn_dyn_th, &proto_dyn_trigger, &heatmap_boost_th);
 
     int have_cnn = cfg->cnn_enabled;
     int have_proto = cfg->proto_enabled;
@@ -1854,9 +1859,9 @@ static int fd_run_detection(const uint8_t *preprocessed, fd_result_t *result,
 
             /* Path 1: Heatmap-only — overwhelming spatial evidence.
              * Coarse projection (cos_sim=-0.998): OK < 1.24, FAULT > 1.66.
-             * Raised to 1.6 after live print showed spurious hit at 1.54.
+             * Default 1.6 calibrated from live print (spurious hit at 1.54).
              * Margin: 0.36 from worst OK (1.24), 0.06 from weakest fault (1.66). */
-            if (result->heatmap_max > 1.6f && strong_cells >= 3) {
+            if (result->heatmap_max > heatmap_boost_th && strong_cells >= 3) {
                 do_boost = 1;
                 boost_path = "heatmap-only";
             }
@@ -2539,6 +2544,7 @@ static void fd_parse_set_metadata(fd_model_set_t *s)
             p->proto_threshold = fd_json_float(prof, "proto_threshold");
             p->proto_dynamic_trigger = fd_json_float(prof, "proto_dynamic_trigger");
             p->multi_threshold = fd_json_float(prof, "multi_threshold");
+            p->heatmap_boost_threshold = fd_json_float(prof, "heatmap_boost_threshold");
             s->num_profiles++;
         }
     }

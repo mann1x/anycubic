@@ -992,6 +992,18 @@
                                     In Verify/Classify strategies, a low internal threshold (0.10) is used for type labeling only.
                                 </div>
                             </div>
+                            <div id="fd-th-heatmap-row">
+                                <div class="setting-row">
+                                    <span class="label" style="font-size:12px;">Heatmap boost:</span>
+                                    <div class="control">
+                                        <input type="number" id="fd_th_heatmap" min="0.5" max="3.0" step="0.05" style="width:60px;" disabled>
+                                    </div>
+                                </div>
+                                <div style="font-size:10px;color:#777;padding:1px 0 4px 20px;line-height:1.4;">
+                                    Minimum spatial heatmap score for heatmap-only boost override (Path 1).<br>
+                                    Higher = fewer false positives, lower = catches smaller defects. Range 0.5-3.0.
+                                </div>
+                            </div>
                         </div>
                     </div>
 
@@ -2788,7 +2800,7 @@ if(flvjs.isSupported()){
             const ids = {
                 'fd_th_cnn': 'cnn_threshold', 'fd_th_cnn_dyn': 'cnn_dynamic_threshold',
                 'fd_th_proto': 'proto_threshold', 'fd_th_proto_trig': 'proto_dynamic_trigger',
-                'fd_th_multi': 'multi_threshold'
+                'fd_th_multi': 'multi_threshold', 'fd_th_heatmap': 'heatmap_boost_threshold'
             };
             for (const [id, key] of Object.entries(ids)) {
                 const el = document.getElementById(id);
@@ -2797,7 +2809,7 @@ if(flvjs.isSupported()){
         }
 
         function toggleThresholdEditable(editable) {
-            ['fd_th_cnn','fd_th_cnn_dyn','fd_th_proto','fd_th_proto_trig','fd_th_multi'].forEach(id => {
+            ['fd_th_cnn','fd_th_cnn_dyn','fd_th_proto','fd_th_proto_trig','fd_th_multi','fd_th_heatmap'].forEach(id => {
                 const el = document.getElementById(id);
                 if (el) {
                     el.disabled = !editable;
@@ -2835,7 +2847,8 @@ if(flvjs.isSupported()){
                 cnn_dynamic_threshold: parseFloat(document.getElementById('fd_th_cnn_dyn').value) || 0,
                 proto_threshold: parseFloat(document.getElementById('fd_th_proto').value) || 0,
                 proto_dynamic_trigger: parseFloat(document.getElementById('fd_th_proto_trig').value) || 0,
-                multi_threshold: parseFloat(document.getElementById('fd_th_multi').value) || 0
+                multi_threshold: parseFloat(document.getElementById('fd_th_multi').value) || 0,
+                heatmap_boost_threshold: parseFloat(document.getElementById('fd_th_heatmap').value) || 0
             };
         }
 

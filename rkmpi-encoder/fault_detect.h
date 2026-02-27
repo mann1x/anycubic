@@ -199,6 +199,7 @@ typedef struct {
     float proto_threshold;                 /* ProtoNet margin threshold */
     float proto_dynamic_trigger;           /* ProtoNet margin that gates CNN */
     float multi_threshold;                 /* Multiclass binary threshold */
+    float heatmap_boost_threshold;         /* Spatial heatmap boost trigger */
 } fd_threshold_profile_t;
 
 /* Model set info — discovered by scanning */
@@ -237,6 +238,7 @@ typedef struct {
     float proto_threshold;
     float proto_dynamic_trigger;
     float multi_threshold;
+    float heatmap_boost_threshold;
 } fd_active_thresholds_t;
 
 /* Detection result (last inference cycle) */

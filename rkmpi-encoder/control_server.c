@@ -1003,6 +1003,7 @@ static void serve_fault_detect_sets(ControlServer *srv, int fd) {
             cJSON_AddNumberToObject(pj, "proto_threshold", round2(pr->proto_threshold));
             cJSON_AddNumberToObject(pj, "proto_dynamic_trigger", round2(pr->proto_dynamic_trigger));
             cJSON_AddNumberToObject(pj, "multi_threshold", round2(pr->multi_threshold));
+            cJSON_AddNumberToObject(pj, "heatmap_boost_threshold", round2(pr->heatmap_boost_threshold));
             cJSON_AddItemToObject(prof_obj, pr->name, pj);
         }
         cJSON_AddItemToObject(item, "profiles", prof_obj);
@@ -1031,6 +1032,12 @@ static void serve_fault_detect_sets(ControlServer *srv, int fd) {
 static float clamp_threshold(float v) {
     if (v < 0.01f) return 0.01f;
     if (v > 0.99f) return 0.99f;
+    return v;
+}
+
+static float clamp_heatmap_threshold(float v) {
+    if (v < 0.5f) return 0.5f;
+    if (v > 3.0f) return 3.0f;
     return v;
 }
 
@@ -1149,6 +1156,9 @@ static void handle_fault_detect_settings(ControlServer *srv, int fd,
             v = cJSON_GetObjectItemCaseSensitive(set_th, "multi_threshold");
             if (v && cJSON_IsNumber(v))
                 cJSON_AddNumberToObject(entry, "multi_threshold", round2(clamp_threshold((float)v->valuedouble)));
+            v = cJSON_GetObjectItemCaseSensitive(set_th, "heatmap_boost_threshold");
+            if (v && cJSON_IsNumber(v))
+                cJSON_AddNumberToObject(entry, "heatmap_boost_threshold", round2(clamp_heatmap_threshold((float)v->valuedouble)));
 
             cJSON_DeleteItemFromObjectCaseSensitive(existing, set_th->string);
             cJSON_AddItemToObject(existing, set_th->string, entry);

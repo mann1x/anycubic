@@ -1821,6 +1821,8 @@ static void apply_fd_thresholds(fd_config_t *fd_cfg, const AppConfig *cfg)
         if (v && cJSON_IsNumber(v)) fd_cfg->thresholds.proto_dynamic_trigger = (float)v->valuedouble;
         v = cJSON_GetObjectItemCaseSensitive(entry, "multi_threshold");
         if (v && cJSON_IsNumber(v)) fd_cfg->thresholds.multi_threshold = (float)v->valuedouble;
+        v = cJSON_GetObjectItemCaseSensitive(entry, "heatmap_boost_threshold");
+        if (v && cJSON_IsNumber(v)) fd_cfg->thresholds.heatmap_boost_threshold = (float)v->valuedouble;
     }
     cJSON_Delete(root);
 }
