@@ -834,9 +834,21 @@ static void yuyv_to_nv12(const uint8_t *yuyv, uint8_t *nv12_y, uint8_t *nv12_uv,
  */
 static int v4l2_init(const char *device, int width, int height, int fps,
                      int use_mjpeg, int *fd_out, V4L2Buffer **buffers_out) {
-    int fd = open(device, O_RDWR);
+    /* Wait for camera device to become available (gkcam may still hold it) */
+    int fd = -1;
+    for (int attempt = 0; attempt < 10; attempt++) {
+        fd = open(device, O_RDWR);
+        if (fd >= 0) break;
+        if (errno == EBUSY) {
+            log_info("Camera %s busy, waiting (%d/10)...\n", device, attempt + 1);
+            usleep(500000);  /* 500ms between retries */
+        } else {
+            log_error("Cannot open %s: %s\n", device, strerror(errno));
+            return -1;
+        }
+    }
     if (fd < 0) {
-        log_error("Cannot open %s: %s\n", device, strerror(errno));
+        log_error("Cannot open %s: device busy after 5s\n", device);
         return -1;
     }
 

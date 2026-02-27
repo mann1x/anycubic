@@ -59,6 +59,7 @@ start() {
 
     # Kill gkcam to free camera/ISP resources (required in all modes)
     kill_by_name gkcam
+    sleep 3
 
     PIDS=$(get_by_name h264_monitor)
     if [ "$PIDS" = "" ]; then
@@ -83,7 +84,7 @@ stop() {
     # Use SIGTERM first to allow cleanup, then SIGKILL
     kill_by_name rkmpi_enc 15
     kill_by_name h264_monitor 15
-    sleep 1
+    sleep 2
     # Force kill if still running
     kill_by_name rkmpi_enc 9
     kill_by_name h264_monitor 9
@@ -93,7 +94,7 @@ stop() {
     rm -f /tmp/h264_cmd /tmp/h264_ctrl
     rm -f /tmp/h264_cmd_[0-9] /tmp/h264_ctrl_[0-9]
 
-    sleep 2
+    sleep 3
 
     # Restart gkcam so stock camera service works again
     echo "Restarting gkcam..." >> "$APP_LOG"
@@ -109,7 +110,7 @@ restart() {
     # Use SIGTERM first to allow cleanup, then SIGKILL
     kill_by_name rkmpi_enc 15
     kill_by_name h264_monitor 15
-    sleep 1
+    sleep 2
     # Force kill if still running
     kill_by_name rkmpi_enc 9
     kill_by_name h264_monitor 9
@@ -118,6 +119,8 @@ restart() {
     rm -f /tmp/h264_stream.fifo
     rm -f /tmp/h264_cmd /tmp/h264_ctrl
     rm -f /tmp/h264_cmd_[0-9] /tmp/h264_ctrl_[0-9]
+
+    sleep 3
 
     cd "$APP_ROOT"
     echo "Restarting h264-streamer app" >> "$APP_LOG"

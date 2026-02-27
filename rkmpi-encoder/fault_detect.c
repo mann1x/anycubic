@@ -1858,13 +1858,18 @@ static int fd_run_detection(const uint8_t *preprocessed, fd_result_t *result,
             int do_boost = 0;
             const char *boost_path = "unknown";
 
-            /* Path 1: Heatmap-only — overwhelming spatial evidence.
+            /* Path 1: Heatmap with minimal model corroboration.
              * Coarse projection (cos_sim=-0.998): OK < 1.24, FAULT > 1.66.
              * Default 1.6 calibrated from live print (spurious hit at 1.54).
-             * Margin: 0.36 from worst OK (1.24), 0.06 from weakest fault (1.66). */
+             * Requires at least one model to show some fault signal to avoid
+             * false positives from spatial noise when CNN+Proto say OK. */
             if (result->heatmap_max > heatmap_boost_th && strong_cells >= 3) {
-                do_boost = 1;
-                boost_path = "heatmap-only";
+                int any_leaning = (have_cnn  && cnn_fault_lk  > cnn_th * 0.5f) ||
+                                  (have_proto && proto_fault_lk > 0.60f);
+                if (any_leaning) {
+                    do_boost = 1;
+                    boost_path = "heatmap-only";
+                }
             }
 
             /* Path 2: Strategy-aware corroboration with moderate heatmap.
@@ -1938,10 +1943,37 @@ static int fd_run_detection(const uint8_t *preprocessed, fd_result_t *result,
                 if (result->result == FD_CLASS_OK) {
                     result->boost_overrode = 1;
                     result->result = FD_CLASS_FAULT;
-                    result->confidence = 0.5f + 0.5f * result->heatmap_max;
-                    if (result->confidence > 1.0f) result->confidence = 1.0f;
                     fd_log("  Spatial BOOST: OK->FAULT (max=%.2f, %d/%d strong cells, path=%s)\n",
                            result->heatmap_max, strong_cells, total_active, boost_path);
+
+                    /* Run multiclass for fault classification if not already run */
+                    if (have_multi && !run_multi) {
+                        memset(&model_result, 0, sizeof(model_result));
+                        if (fd_run_multiclass(preprocessed, &model_result, multi_th, cfg) == 0) {
+                            result->multi_ran = 1;
+                            result->multi_ms = model_result.multi_ms;
+                            result->fault_class = model_result.fault_class;
+                            result->multi_fault_lk = model_result.confidence;
+                            snprintf(result->fault_class_name,
+                                     sizeof(result->fault_class_name), "%s",
+                                     model_result.fault_class_name);
+                            fd_log("  Multi (post-boost): class=%s conf=%.3f\n",
+                                   result->fault_class_name, model_result.confidence);
+                        }
+                    }
+
+                    /* Boost confidence: prefer multiclass score (more stable
+                     * and relevant for heatmap-only detections), fall back
+                     * to max of CNN/Proto likelihoods, floor at 0.50 */
+                    if (result->multi_ran && result->multi_fault_lk > 0.0f) {
+                        result->confidence = result->multi_fault_lk;
+                    } else {
+                        float boost_conf = 0.0f;
+                        if (have_cnn && cnn_fault_lk > boost_conf) boost_conf = cnn_fault_lk;
+                        if (have_proto && proto_fault_lk > boost_conf) boost_conf = proto_fault_lk;
+                        if (boost_conf < 0.50f) boost_conf = 0.50f;
+                        result->confidence = boost_conf;
+                    }
                 }
             }
         }
