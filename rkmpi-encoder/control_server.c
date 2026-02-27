@@ -89,7 +89,8 @@ static void send_http_response(int fd, int status_code, const char *content_type
                                 const char *body, size_t body_len,
                                 const char *extra_headers) {
     const char *status_text = "OK";
-    if (status_code == 404) status_text = "Not Found";
+    if (status_code == 204) status_text = "No Content";
+    else if (status_code == 404) status_text = "Not Found";
     else if (status_code == 400) status_text = "Bad Request";
     else if (status_code == 500) status_text = "Internal Server Error";
     else if (status_code == 302) status_text = "Found";
@@ -3883,6 +3884,24 @@ static void handle_client(ControlServer *srv, int client_fd,
     }
     else if (is_post && strcmp(path, "/api/fault_detect/settings") == 0) {
         handle_fault_detect_settings(srv, client_fd, post_body ? post_body : "");
+    }
+    else if (is_get && strcmp(path, "/api/fault_detect/frame") == 0) {
+        static uint8_t fd_frame_resp[512 * 1024];
+        uint64_t cycle = 0;
+        size_t sz = fault_detect_get_fd_frame(fd_frame_resp, sizeof(fd_frame_resp), &cycle);
+        if (sz > 0) {
+            char extra[256];
+            snprintf(extra, sizeof(extra),
+                "X-FD-Cycle: %llu\r\n"
+                "Cache-Control: no-cache\r\n"
+                "Access-Control-Allow-Origin: *\r\n",
+                (unsigned long long)cycle);
+            send_http_response(client_fd, 200, "image/jpeg",
+                               (const char *)fd_frame_resp, sz, extra);
+        } else {
+            send_http_response(client_fd, 204, "text/plain", NULL, 0,
+                               "Access-Control-Allow-Origin: *\r\n");
+        }
     }
     /* Setup wizard routes */
     else if (is_get && strcmp(path, "/setup") == 0) {

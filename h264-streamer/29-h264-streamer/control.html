@@ -816,9 +816,12 @@
             </div>
             <div class="row" id="fd-heatmap-row" style="display:none">
                 <span class="label">Heatmap:</span>
-                <div class="value" style="display:flex;flex-direction:column;gap:4px;">
+                <div class="value" style="display:flex;flex-direction:column;gap:4px;align-items:flex-end;">
                     <span id="fd-heatmap-info" style="font-size:11px;color:#ccc;"></span>
-                    <canvas id="fd-heatmap-canvas" width="140" height="140" style="border:1px solid #555;border-radius:4px;image-rendering:pixelated;"></canvas>
+                    <div id="fd-heatmap-container" style="position:relative;display:inline-block;max-width:50%;">
+                        <img id="fd-frame-img" style="display:block;max-width:100%;border-radius:4px;border:1px solid #555;" />
+                        <canvas id="fd-heatmap-canvas" style="position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;border-radius:4px;"></canvas>
+                    </div>
                 </div>
             </div>
         </div>
@@ -2525,10 +2528,13 @@ if(flvjs.isSupported()){
         // Fault Detection
         // ============================================================
 
-        function drawHeatmap(heatmap) {
+        let lastFdFrameCycle = 0;
+
+        function drawFdOverlay(heatmap) {
             const canvas = document.getElementById('fd-heatmap-canvas');
             const info = document.getElementById('fd-heatmap-info');
             const row = document.getElementById('fd-heatmap-row');
+            const img = document.getElementById('fd-frame-img');
             if (!canvas || !row) return;
 
             if (!heatmap || !heatmap.has_data || !heatmap.grid) {
@@ -2537,18 +2543,28 @@ if(flvjs.isSupported()){
             }
 
             row.style.display = '';
-            const ctx = canvas.getContext('2d');
             const grid = heatmap.grid;
             const rows = grid.length;
             const cols = rows > 0 ? grid[0].length : 0;
-            // Resize canvas to match grid (1 pixel per cell minimum 140px)
-            const canvasSize = Math.max(140, rows * 14);
-            if (canvas.width !== canvasSize || canvas.height !== canvasSize) {
-                canvas.width = canvasSize;
-                canvas.height = canvasSize;
-            }
-            const cellW = canvas.width / cols;
-            const cellH = canvas.height / rows;
+
+            // Size canvas to match displayed image
+            const imgW = img.naturalWidth || 320;
+            const imgH = img.naturalHeight || 180;
+            canvas.width = imgW;
+            canvas.height = imgH;
+
+            const ctx = canvas.getContext('2d');
+            ctx.clearRect(0, 0, imgW, imgH);
+
+            const crop = heatmap.crop || { x: 0, y: 0, w: 1, h: 1 };
+
+            // Crop region in pixel coords
+            const cx = crop.x * imgW;
+            const cy = crop.y * imgH;
+            const cw = crop.w * imgW;
+            const ch = crop.h * imgH;
+            const cellW = cw / cols;
+            const cellH = ch / rows;
 
             // Auto-normalize: find actual data range for contrast
             let vmin = Infinity, vmax = -Infinity;
@@ -2562,6 +2578,7 @@ if(flvjs.isSupported()){
             // Symmetric range around 0, minimum 0.001 to avoid division by zero
             const absMax = Math.max(Math.abs(vmin), Math.abs(vmax), 0.001);
 
+            ctx.globalAlpha = 0.45;
             for (let h = 0; h < rows; h++) {
                 for (let w = 0; w < cols; w++) {
                     const v = grid[h][w];
@@ -2582,15 +2599,20 @@ if(flvjs.isSupported()){
                         b = 0;
                     }
                     ctx.fillStyle = 'rgb(' + r + ',' + g + ',' + b + ')';
-                    ctx.fillRect(w * cellW, h * cellH, cellW, cellH);
-
-                    // Mark max location
-                    if (h === heatmap.max_row && w === heatmap.max_col) {
-                        ctx.strokeStyle = '#fff';
-                        ctx.lineWidth = 2;
-                        ctx.strokeRect(w * cellW + 1, h * cellH + 1, cellW - 2, cellH - 2);
-                    }
+                    ctx.fillRect(cx + w * cellW, cy + h * cellH, cellW, cellH);
                 }
+            }
+            ctx.globalAlpha = 1.0;
+
+            // Max cell marker
+            if (heatmap.max_row >= 0 && heatmap.max_col >= 0) {
+                ctx.strokeStyle = '#fff';
+                ctx.lineWidth = 2;
+                ctx.strokeRect(
+                    cx + heatmap.max_col * cellW + 1,
+                    cy + heatmap.max_row * cellH + 1,
+                    cellW - 2, cellH - 2
+                );
             }
 
             if (info) {
@@ -2692,9 +2714,19 @@ if(flvjs.isSupported()){
                     timingEl.textContent = fd.inference_ms + ' ms';
                 }
 
-                // Heatmap
-                if (fd.heatmap && fd.heatmap.has_data && fd.detection === 'fault') {
-                    drawHeatmap(fd.heatmap);
+                // Heatmap overlay on FD frame
+                if (fd.heatmap && fd.heatmap.has_data) {
+                    const newCycle = fd.cycle_count || 0;
+                    if (newCycle !== lastFdFrameCycle) {
+                        lastFdFrameCycle = newCycle;
+                        const fdImg = document.getElementById('fd-frame-img');
+                        if (fdImg) {
+                            fdImg.onload = function() { drawFdOverlay(fd.heatmap); };
+                            fdImg.src = '/api/fault_detect/frame?t=' + newCycle;
+                        }
+                    } else {
+                        drawFdOverlay(fd.heatmap);
+                    }
                 } else {
                     const hmRow = document.getElementById('fd-heatmap-row');
                     if (hmRow) hmRow.style.display = 'none';

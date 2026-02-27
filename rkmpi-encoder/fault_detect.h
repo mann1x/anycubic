@@ -387,4 +387,9 @@ void fault_detect_get_spatial_dims(int *h, int *w);
  * Returns {0,0,1,1} if not yet computed (no image decoded). */
 void fault_detect_get_crop(float *x, float *y, float *w, float *h);
 
+/* Get the last JPEG frame used for FD inference.
+ * Copies into caller's buffer. Returns bytes copied, 0 if none available.
+ * cycle_out receives the cycle_count of the frame (NULL to skip). */
+size_t fault_detect_get_fd_frame(uint8_t *buf, size_t max_size, uint64_t *cycle_out);
+
 #endif /* FAULT_DETECT_H */

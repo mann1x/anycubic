@@ -238,6 +238,12 @@ static struct {
     float multi_ema_logits[FD_MCLASS_COUNT];
     int multi_ema_init;
 
+    /* Last FD-processed frame (for UI overlay) */
+    uint8_t  fd_frame_buf[512 * 1024];
+    size_t   fd_frame_size;
+    uint64_t fd_frame_cycle;
+    pthread_mutex_t fd_frame_mutex;
+
     /* Initialized flag */
     int initialized;
 } g_fd;
@@ -2117,6 +2123,15 @@ static void *fd_thread_func(void *arg)
         uint8_t *jpeg_copy = (uint8_t *)malloc(jpeg_size);
         if (jpeg_copy)
             memcpy(jpeg_copy, g_fd.jpeg_buf, jpeg_size);
+
+        /* Retain copy for UI overlay (separate mutex, no contention) */
+        if (jpeg_copy && jpeg_size <= sizeof(g_fd.fd_frame_buf)) {
+            pthread_mutex_lock(&g_fd.fd_frame_mutex);
+            memcpy(g_fd.fd_frame_buf, g_fd.jpeg_buf, jpeg_size);
+            g_fd.fd_frame_size = jpeg_size;
+            g_fd.fd_frame_cycle = g_fd.state.cycle_count;
+            pthread_mutex_unlock(&g_fd.fd_frame_mutex);
+        }
         pthread_mutex_unlock(&g_fd.frame_mutex);
 
         if (!jpeg_copy) continue;
@@ -2260,6 +2275,7 @@ int fault_detect_init(const char *models_base_dir)
     pthread_mutex_init(&g_fd.config_mutex, NULL);
     pthread_mutex_init(&g_fd.state_mutex, NULL);
     pthread_mutex_init(&g_fd.frame_mutex, NULL);
+    pthread_mutex_init(&g_fd.fd_frame_mutex, NULL);
     pthread_mutex_init(&g_fd.z_mutex, NULL);
     pthread_cond_init(&g_fd.frame_cond, NULL);
 
@@ -2385,6 +2401,7 @@ void fault_detect_cleanup(void)
     pthread_mutex_destroy(&g_fd.config_mutex);
     pthread_mutex_destroy(&g_fd.state_mutex);
     pthread_mutex_destroy(&g_fd.frame_mutex);
+    pthread_mutex_destroy(&g_fd.fd_frame_mutex);
     pthread_mutex_destroy(&g_fd.z_mutex);
     pthread_cond_destroy(&g_fd.frame_cond);
 
@@ -2744,6 +2761,19 @@ void fault_detect_get_crop(float *x, float *y, float *w, float *h)
         if (w) *w = 1;
         if (h) *h = 1;
     }
+}
+
+size_t fault_detect_get_fd_frame(uint8_t *buf, size_t max_size, uint64_t *cycle_out)
+{
+    size_t copied = 0;
+    pthread_mutex_lock(&g_fd.fd_frame_mutex);
+    if (g_fd.fd_frame_size > 0 && g_fd.fd_frame_size <= max_size) {
+        memcpy(buf, g_fd.fd_frame_buf, g_fd.fd_frame_size);
+        copied = g_fd.fd_frame_size;
+        if (cycle_out) *cycle_out = g_fd.fd_frame_cycle;
+    }
+    pthread_mutex_unlock(&g_fd.fd_frame_mutex);
+    return copied;
 }
 
 /* ============================================================================
