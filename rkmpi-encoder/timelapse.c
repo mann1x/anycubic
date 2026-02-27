@@ -24,6 +24,7 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <time.h>
+#include <pthread.h>
 
 /* Global timelapse state */
 TimelapseState g_timelapse = {0};
@@ -34,6 +35,9 @@ TimelapseState g_timelapse = {0};
 #define DEFAULT_VARIABLE_FPS_MIN    5
 #define DEFAULT_VARIABLE_FPS_MAX    60
 #define DEFAULT_TARGET_LENGTH       10
+
+/* USB recovery frames directory (fallback when encoding fails) */
+#define TIMELAPSE_USB_RECOVERY_DIR  "/mnt/udisk/Time-lapse-Frames-Recovery"
 
 /* Logging helper */
 static void timelapse_log(const char *fmt, ...) {
@@ -208,11 +212,16 @@ static int run_ffmpeg(const char *ffmpeg_path, const char *ld_library_path,
         _exit(127);  /* exec failed */
     }
 
-    /* Parent: wait for child */
+    /* Parent: wait for child (retry on EINTR from signals) */
     int status;
-    if (waitpid(pid, &status, 0) < 0) {
-        timelapse_log("run_ffmpeg: waitpid failed: %s\n", strerror(errno));
-        return -1;
+    while (1) {
+        pid_t ret = waitpid(pid, &status, 0);
+        if (ret < 0) {
+            if (errno == EINTR) continue;  /* Signal interrupted, retry */
+            timelapse_log("run_ffmpeg: waitpid failed: %s\n", strerror(errno));
+            return -1;
+        }
+        break;
     }
 
     if (WIFEXITED(status)) {
@@ -814,6 +823,9 @@ int timelapse_finalize(void) {
     }
 
     timelapse_log("Finalizing %d frames...\n", g_timelapse.frame_count);
+    g_timelapse.encode_status = TL_ENCODE_RUNNING;
+    snprintf(g_timelapse.encode_detail, sizeof(g_timelapse.encode_detail),
+             "Encoding %d frames", g_timelapse.frame_count);
 
     /* Build output filenames */
     const char *output_dir = get_output_dir();
@@ -841,7 +853,7 @@ int timelapse_finalize(void) {
 
     /* VENC path: encode all saved JPEGs with hardware encoder */
     if (g_timelapse.use_venc) {
-        timelapse_log("VENC deferred encode: %d frames -> %s\n", g_timelapse.frame_count, output_mp4);
+        timelapse_log("Encoder: using VENC hardware encoder, %d frames -> %s\n", g_timelapse.frame_count, output_mp4);
 
         /* Read first frame to get dimensions */
         char first_frame_path[TIMELAPSE_PATH_MAX];
@@ -976,7 +988,7 @@ int timelapse_finalize(void) {
         g_timelapse.venc_initialized = 0;
 
         if (ret == 0) {
-            timelapse_log("VENC created: %s (%d errors during encode)\n", output_mp4, venc_errors);
+            timelapse_log("Encoder: VENC created %s (%d errors during encode)\n", output_mp4, venc_errors);
 
             /* Use last saved JPEG as thumbnail */
             char last_frame_path[TIMELAPSE_PATH_MAX];
@@ -991,6 +1003,11 @@ int timelapse_finalize(void) {
 
             /* Clean up frame JPEGs */
             cleanup_temp_frames();
+
+            /* Set success status */
+            g_timelapse.encode_status = TL_ENCODE_SUCCESS;
+            snprintf(g_timelapse.encode_detail, sizeof(g_timelapse.encode_detail),
+                     "VENC OK (%d frames)", g_timelapse.frame_count);
 
             /* Reset state */
             g_timelapse.active = 0;
@@ -1051,7 +1068,7 @@ ffmpeg_path:
     char input_pattern[TIMELAPSE_PATH_MAX];
     snprintf(input_pattern, sizeof(input_pattern), "%s/frame_%%04d.jpg", g_timelapse.temp_dir);
 
-    timelapse_log("Running ffmpeg (fps=%d, crf=%d)...\n", output_fps, crf);
+    timelapse_log("Encoder: using ffmpeg fallback (fps=%d, crf=%d)...\n", output_fps, crf);
     int ret = run_ffmpeg(TIMELAPSE_FFMPEG_PATH, NULL,
                          output_fps, input_pattern, vf_filter,
                          "libx264", crf, 0, output_mp4);
@@ -1073,7 +1090,7 @@ ffmpeg_path:
     }
 
     if (ret == 0) {
-        timelapse_log("Created %s\n", output_mp4);
+        timelapse_log("Encoder: ffmpeg created %s\n", output_mp4);
 
         /* Copy last frame as thumbnail */
         if (copy_file(last_frame, output_thumb) == 0) {
@@ -1081,8 +1098,16 @@ ffmpeg_path:
         } else {
             timelapse_log("Failed to create thumbnail %s\n", output_thumb);
         }
+
+        /* Set success status */
+        g_timelapse.encode_status = TL_ENCODE_SUCCESS;
+        snprintf(g_timelapse.encode_detail, sizeof(g_timelapse.encode_detail),
+                 "ffmpeg OK (%d frames)", g_timelapse.frame_count);
     } else {
         timelapse_log("Failed to create MP4 (ffmpeg returned %d)\n", ret);
+        g_timelapse.encode_status = TL_ENCODE_FAILED;
+        snprintf(g_timelapse.encode_detail, sizeof(g_timelapse.encode_detail),
+                 "Encoding failed (%d frames)", g_timelapse.frame_count);
     }
 
     /* Cleanup temp directory */
@@ -1141,6 +1166,14 @@ int timelapse_get_frame_count(void) {
     return g_timelapse.active ? g_timelapse.frame_count : 0;
 }
 
+TimelapseEncodeStatus timelapse_get_encode_status(void) {
+    return g_timelapse.encode_status;
+}
+
+const char *timelapse_get_encode_detail(void) {
+    return g_timelapse.encode_detail;
+}
+
 /*
  * Count sequential frame_NNNN.jpg files in a directory.
  * Returns the count (0 if none found).
@@ -1159,8 +1192,68 @@ static int count_frames_in_dir(const char *dir_path) {
 }
 
 /*
+ * Copy orphaned frames to USB stick for manual recovery.
+ * Creates a timestamped subdirectory in TIMELAPSE_USB_RECOVERY_DIR.
+ * Returns 0 on success, -1 on failure.
+ */
+static int copy_frames_to_usb(const char *orphan_dir, int frame_count) {
+    /* Check if USB is mounted */
+    struct stat st;
+    if (stat("/mnt/udisk", &st) != 0 || !S_ISDIR(st.st_mode)) {
+        timelapse_log("Recovery: USB not available, cannot preserve frames\n");
+        return -1;
+    }
+
+    /* Create recovery base dir */
+    if (ensure_directory(TIMELAPSE_USB_RECOVERY_DIR) != 0) {
+        timelapse_log("Recovery: cannot create %s\n", TIMELAPSE_USB_RECOVERY_DIR);
+        return -1;
+    }
+
+    /* Create timestamped subdirectory */
+    time_t now = time(NULL);
+    struct tm *tm = localtime(&now);
+    char timestamp[32];
+    strftime(timestamp, sizeof(timestamp), "%Y%m%d_%H%M%S", tm);
+
+    char dest_dir[TIMELAPSE_PATH_MAX];
+    snprintf(dest_dir, sizeof(dest_dir), "%s/frames_%s_%d",
+             TIMELAPSE_USB_RECOVERY_DIR, timestamp, frame_count);
+
+    if (ensure_directory(dest_dir) != 0) {
+        return -1;
+    }
+
+    /* Copy all frame files */
+    int copied = 0;
+    for (int i = 0; i < frame_count; i++) {
+        char src[TIMELAPSE_PATH_MAX], dst[TIMELAPSE_PATH_MAX];
+        snprintf(src, sizeof(src), "%s/frame_%04d.jpg", orphan_dir, i);
+        snprintf(dst, sizeof(dst), "%s/frame_%04d.jpg", dest_dir, i);
+
+        if (copy_file(src, dst) == 0) {
+            copied++;
+        }
+
+        /* Progress logging every 100 frames */
+        if ((i + 1) % 100 == 0 || i == frame_count - 1) {
+            timelapse_log("Recovery: copied %d/%d frames to USB\n", copied, frame_count);
+        }
+    }
+
+    if (copied > 0) {
+        timelapse_log("Recovery: preserved %d frames in %s\n", copied, dest_dir);
+        return 0;
+    }
+
+    /* Clean up empty dir on failure */
+    rmdir(dest_dir);
+    return -1;
+}
+
+/*
  * Attempt to recover an orphaned timelapse from saved frames.
- * Uses ffmpeg to encode (VENC requires hardware state not available at startup).
+ * Tries VENC hardware encoder first, then ffmpeg fallback.
  * Returns 0 on success, -1 on failure.
  */
 static int recover_orphaned_frames(const char *orphan_dir, int frame_count) {
@@ -1185,36 +1278,156 @@ static int recover_orphaned_frames(const char *orphan_dir, int frame_count) {
     snprintf(output_thumb, sizeof(output_thumb), "%s/recovered_%s_%d.jpg",
              output_dir, timestamp, frame_count);
 
-    /* Build input pattern */
-    char input_pattern[TIMELAPSE_PATH_MAX];
-    snprintf(input_pattern, sizeof(input_pattern), "%s/frame_%%04d.jpg", orphan_dir);
-
     /* Use default encoding settings */
     int fps = DEFAULT_OUTPUT_FPS;
     int crf = DEFAULT_CRF;
+    int ret = -1;
 
     timelapse_log("Recovery: encoding %d frames -> %s (fps=%d, crf=%d)\n",
                   frame_count, output_mp4, fps, crf);
 
-    /* Try bundled ffmpeg first */
-    int ret = run_ffmpeg(TIMELAPSE_FFMPEG_PATH, NULL,
+    /* === Try VENC hardware encoder first === */
+    timelapse_log("Recovery: trying VENC hardware encoder...\n");
+    snprintf(g_timelapse.encode_detail, sizeof(g_timelapse.encode_detail),
+             "VENC recovery %d frames", frame_count);
+    do {
+        /* Read first frame to get dimensions */
+        char first_frame_path[TIMELAPSE_PATH_MAX];
+        snprintf(first_frame_path, sizeof(first_frame_path), "%s/frame_%04d.jpg",
+                 orphan_dir, 0);
+
+        FILE *ff = fopen(first_frame_path, "rb");
+        if (!ff) {
+            timelapse_log("Recovery: VENC: cannot read first frame, skipping VENC\n");
+            break;
+        }
+
+        fseek(ff, 0, SEEK_END);
+        size_t first_size = ftell(ff);
+        fseek(ff, 0, SEEK_SET);
+
+        uint8_t *first_jpeg = malloc(first_size);
+        if (!first_jpeg) {
+            fclose(ff);
+            break;
+        }
+
+        fread(first_jpeg, 1, first_size, ff);
+        fclose(ff);
+
+        /* Parse header for dimensions */
+        tjhandle tj = tjInitDecompress();
+        if (!tj) {
+            free(first_jpeg);
+            break;
+        }
+
+        int width, height, subsamp, colorspace;
+        if (tjDecompressHeader3(tj, first_jpeg, first_size, &width, &height,
+                                &subsamp, &colorspace) != 0) {
+            timelapse_log("Recovery: VENC: failed to parse JPEG header: %s\n", tjGetErrorStr());
+            tjDestroy(tj);
+            free(first_jpeg);
+            break;
+        }
+        tjDestroy(tj);
+        free(first_jpeg);
+
+        /* Initialize VENC */
+        if (timelapse_venc_init(width, height, fps) != 0) {
+            timelapse_log("Recovery: VENC init failed (%dx%d), falling back to ffmpeg\n",
+                          width, height);
+            break;
+        }
+
+        timelapse_log("Recovery: VENC encoding %d frames at %dx%d @ %dfps...\n",
+                      frame_count, width, height, fps);
+
+        /* Encode all frames */
+        int venc_errors = 0;
+        uint8_t *jpeg_buf = malloc(FRAME_BUFFER_MAX_JPEG);
+        if (!jpeg_buf) {
+            timelapse_venc_finish(NULL);
+            break;
+        }
+
+        for (int i = 0; i < frame_count; i++) {
+            char frame_path[TIMELAPSE_PATH_MAX];
+            snprintf(frame_path, sizeof(frame_path), "%s/frame_%04d.jpg",
+                     orphan_dir, i);
+
+            FILE *f = fopen(frame_path, "rb");
+            if (!f) { venc_errors++; continue; }
+
+            fseek(f, 0, SEEK_END);
+            size_t jpeg_size = ftell(f);
+            fseek(f, 0, SEEK_SET);
+
+            if (jpeg_size > FRAME_BUFFER_MAX_JPEG) {
+                fclose(f);
+                venc_errors++;
+                continue;
+            }
+
+            size_t bytes_read = fread(jpeg_buf, 1, jpeg_size, f);
+            fclose(f);
+
+            if (bytes_read != jpeg_size) { venc_errors++; continue; }
+
+            if (!validate_jpeg_full(jpeg_buf, jpeg_size)) {
+                venc_errors++;
+                continue;
+            }
+
+            if (timelapse_venc_add_frame(jpeg_buf, jpeg_size) != 0) {
+                venc_errors++;
+            }
+
+            if ((i + 1) % 50 == 0 || i == frame_count - 1) {
+                timelapse_log("Recovery: VENC encoded %d/%d frames (%d errors)\n",
+                              i + 1, frame_count, venc_errors);
+            }
+        }
+
+        free(jpeg_buf);
+
+        ret = timelapse_venc_finish(output_mp4);
+        if (ret == 0) {
+            timelapse_log("Recovery: VENC created %s (%d errors)\n", output_mp4, venc_errors);
+        } else {
+            timelapse_log("Recovery: VENC finalize failed, falling back to ffmpeg\n");
+        }
+    } while (0);
+
+    /* === FFmpeg fallback === */
+    if (ret != 0) {
+        char input_pattern[TIMELAPSE_PATH_MAX];
+        snprintf(input_pattern, sizeof(input_pattern), "%s/frame_%%04d.jpg", orphan_dir);
+
+        snprintf(g_timelapse.encode_detail, sizeof(g_timelapse.encode_detail),
+                 "ffmpeg recovery %d frames", frame_count);
+
+        /* Try bundled ffmpeg first */
+        timelapse_log("Recovery: trying bundled ffmpeg (libx264)...\n");
+        ret = run_ffmpeg(TIMELAPSE_FFMPEG_PATH, NULL,
                          fps, input_pattern, "",
                          "libx264", crf, 0, output_mp4);
 
-    /* Fallback to stock ffmpeg */
-    if (ret != 0) {
-        timelapse_log("Recovery: static ffmpeg failed, trying stock...\n");
-        ret = run_ffmpeg(TIMELAPSE_FFMPEG_STOCK, TIMELAPSE_FFMPEG_LIBS,
-                         fps, input_pattern, "",
-                         "libx264", crf, 0, output_mp4);
-    }
+        /* Fallback to stock ffmpeg */
+        if (ret != 0) {
+            timelapse_log("Recovery: trying stock ffmpeg (libx264)...\n");
+            ret = run_ffmpeg(TIMELAPSE_FFMPEG_STOCK, TIMELAPSE_FFMPEG_LIBS,
+                             fps, input_pattern, "",
+                             "libx264", crf, 0, output_mp4);
+        }
 
-    /* Fallback to mpeg4 codec */
-    if (ret != 0) {
-        timelapse_log("Recovery: libx264 failed, trying mpeg4...\n");
-        ret = run_ffmpeg(TIMELAPSE_FFMPEG_STOCK, TIMELAPSE_FFMPEG_LIBS,
-                         fps, input_pattern, "",
-                         "mpeg4", 0, 5, output_mp4);
+        /* Fallback to mpeg4 codec */
+        if (ret != 0) {
+            timelapse_log("Recovery: trying stock ffmpeg (mpeg4)...\n");
+            ret = run_ffmpeg(TIMELAPSE_FFMPEG_STOCK, TIMELAPSE_FFMPEG_LIBS,
+                             fps, input_pattern, "",
+                             "mpeg4", 0, 5, output_mp4);
+        }
     }
 
     if (ret == 0) {
@@ -1228,13 +1441,30 @@ static int recover_orphaned_frames(const char *orphan_dir, int frame_count) {
             timelapse_log("Recovery: created thumbnail %s\n", output_thumb);
         }
     } else {
-        timelapse_log("Recovery: encoding failed (code %d), cleaning up frames\n", ret);
+        timelapse_log("Recovery: all encoding methods failed for %d frames\n", frame_count);
+
+        /* Preserve frames on USB instead of deleting */
+        timelapse_log("Recovery: copying frames to USB for manual recovery...\n");
+        if (copy_frames_to_usb(orphan_dir, frame_count) == 0) {
+            timelapse_log("Recovery: frames preserved on USB\n");
+        } else {
+            timelapse_log("Recovery: WARNING - could not preserve frames, they will be lost!\n");
+        }
     }
 
     return ret == 0 ? 0 : -1;
 }
 
-void timelapse_recover_orphaned(void) {
+/*
+ * Background thread for orphaned timelapse recovery.
+ * Runs at low priority to avoid impacting normal operation.
+ */
+static void *recovery_thread_func(void *arg) {
+    (void)arg;
+
+    /* Lower thread priority to avoid impacting main loop */
+    nice(19);
+
     const char *base = get_temp_dir_base();
 
     /* Split base into parent dir and prefix
@@ -1246,10 +1476,10 @@ void timelapse_recover_orphaned(void) {
     char prefix[256];
 
     const char *last_slash = strrchr(base, '/');
-    if (!last_slash || last_slash == base) return;
+    if (!last_slash || last_slash == base) return NULL;
 
     size_t parent_len = last_slash - base;
-    if (parent_len >= sizeof(parent_dir)) return;
+    if (parent_len >= sizeof(parent_dir)) return NULL;
     memcpy(parent_dir, base, parent_len);
     parent_dir[parent_len] = '\0';
 
@@ -1257,11 +1487,15 @@ void timelapse_recover_orphaned(void) {
     size_t prefix_len = strlen(prefix);
 
     DIR *dir = opendir(parent_dir);
-    if (!dir) return;
+    if (!dir) {
+        g_timelapse.encode_status = TL_ENCODE_IDLE;
+        return NULL;
+    }
 
     pid_t my_pid = getpid();
     struct dirent *entry;
     int recovered = 0;
+    int failed = 0;
 
     while ((entry = readdir(dir)) != NULL) {
         if (strncmp(entry->d_name, prefix, prefix_len) != 0)
@@ -1298,17 +1532,99 @@ void timelapse_recover_orphaned(void) {
         timelapse_log("Recovery: found %d orphaned frames in %s\n",
                       frame_count, orphan_dir);
 
-        /* Try to encode the recovered frames */
-        recover_orphaned_frames(orphan_dir, frame_count);
+        /* Update status to running */
+        g_timelapse.encode_status = TL_ENCODE_RUNNING;
 
-        /* Always clean up regardless of encoding success */
+        /* Try to encode the recovered frames */
+        int ret = recover_orphaned_frames(orphan_dir, frame_count);
+
+        /* Clean up original frames (copies are on USB if encoding failed) */
         cleanup_temp_dir(orphan_dir);
-        recovered++;
+
+        if (ret == 0) {
+            recovered++;
+        } else {
+            failed++;
+        }
     }
 
     closedir(dir);
 
-    if (recovered > 0) {
-        timelapse_log("Recovery: processed %d orphaned timelapse dir(s)\n", recovered);
+    if (recovered > 0 || failed > 0) {
+        timelapse_log("Recovery: processed %d dir(s): %d recovered, %d failed\n",
+                      recovered + failed, recovered, failed);
     }
+
+    /* Set final status */
+    if (failed > 0) {
+        g_timelapse.encode_status = TL_ENCODE_FAILED;
+        snprintf(g_timelapse.encode_detail, sizeof(g_timelapse.encode_detail),
+                 "Recovery failed (%d/%d)", failed, recovered + failed);
+    } else if (recovered > 0) {
+        g_timelapse.encode_status = TL_ENCODE_SUCCESS;
+        snprintf(g_timelapse.encode_detail, sizeof(g_timelapse.encode_detail),
+                 "Recovery OK (%d)", recovered);
+    } else {
+        g_timelapse.encode_status = TL_ENCODE_IDLE;
+        g_timelapse.encode_detail[0] = '\0';
+    }
+
+    return NULL;
+}
+
+void timelapse_recover_orphaned(void) {
+    /* Quick check: any orphan dirs to process? */
+    const char *base = get_temp_dir_base();
+    const char *last_slash = strrchr(base, '/');
+    if (!last_slash || last_slash == base) return;
+
+    char parent_dir[TIMELAPSE_PATH_MAX];
+    size_t parent_len = last_slash - base;
+    if (parent_len >= sizeof(parent_dir)) return;
+    memcpy(parent_dir, base, parent_len);
+    parent_dir[parent_len] = '\0';
+
+    char prefix[256];
+    snprintf(prefix, sizeof(prefix), "%s_", last_slash + 1);
+    size_t prefix_len = strlen(prefix);
+
+    DIR *dir = opendir(parent_dir);
+    if (!dir) return;
+
+    pid_t my_pid = getpid();
+    int found = 0;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (strncmp(entry->d_name, prefix, prefix_len) != 0) continue;
+        int pid = atoi(entry->d_name + prefix_len);
+        if (pid <= 0 || pid == (int)my_pid) continue;
+        if (kill(pid, 0) == 0) continue;  /* Still alive */
+        found = 1;
+        break;
+    }
+    closedir(dir);
+
+    if (!found) return;
+
+    /* Set pending status and launch background thread */
+    g_timelapse.encode_status = TL_ENCODE_PENDING;
+    snprintf(g_timelapse.encode_detail, sizeof(g_timelapse.encode_detail),
+             "Recovery pending");
+    timelapse_log("Recovery: launching background thread for orphaned frames\n");
+
+    pthread_t thread;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+
+    if (pthread_create(&thread, &attr, recovery_thread_func, NULL) != 0) {
+        timelapse_log("Recovery: failed to create thread: %s, running synchronously\n",
+                      strerror(errno));
+        pthread_attr_destroy(&attr);
+        /* Fallback: run synchronously */
+        recovery_thread_func(NULL);
+        return;
+    }
+
+    pthread_attr_destroy(&attr);
 }

@@ -6,6 +6,7 @@
     <script src="https://cdn.jsdelivr.net/npm/flv.js@1.6.2/dist/flv.min.js"></script>
     <style>
         body { font-family: sans-serif; margin: 20px; background: #1a1a1a; color: #fff; }
+        @keyframes tl-blink { 0%,100%{opacity:1} 50%{opacity:0.2} }
         .container { max-width: 900px; margin: 0 auto; }
         h1 { color: #4CAF50; }
         .section { background: #2d2d2d; padding: 15px; margin: 10px 0; border-radius: 8px; }
@@ -231,7 +232,7 @@
                     <button onclick="window.open(snapshotUrl, '_blank')" class="secondary" style="padding:5px 12px;font-size:12px;">Open Snapshot</button>
                     <button onclick="openFlvFullscreen()" class="secondary" style="padding:5px 12px;font-size:12px;">Open FLV</button>
                     <button onclick="window.open(streamBase + '/display', '_blank')" class="secondary" style="padding:5px 12px;font-size:12px;">Open Display</button>
-                    <button onclick="window.open('/timelapse', 'timelapse_' + location.hostname.replace(/\./g, '_'), 'width=900,height=700')" class="secondary" style="padding:5px 12px;font-size:12px;">Time Lapse</button>
+                    <button onclick="window.open('/timelapse', 'timelapse_' + location.hostname.replace(/\./g, '_'), 'width=900,height=700')" class="secondary" style="padding:5px 12px;font-size:12px;"><span id="tl-encode-dot" style="display:none;margin-right:4px;font-size:10px;" title="">&#9679;</span>Time Lapse</button>
                 </div>
                 <div style="display:flex;gap:5px;align-items:center;">
                     <span style="color:#888;font-size:12px;margin-right:5px;">LED:</span>
@@ -1499,6 +1500,7 @@
             loadMoonrakerCameraSettings();
             loadNetworkInterfaces();
             checkMoonrakerStatus();
+            setInterval(checkMoonrakerStatus, 10000);  /* Poll every 10s for encode status */
         }
 
         function refreshPreview() {
@@ -2127,12 +2129,43 @@ if(flvjs.isSupported()){
                         statusEl.innerHTML = 'o Disconnected';
                         statusEl.style.color = '#888';
                     }
+                    updateTlEncodeDot(data.timelapse_encode_status, data.timelapse_encode_detail);
                 })
                 .catch(() => {
                     const statusEl = document.getElementById('moonraker_status');
                     statusEl.innerHTML = '? Unknown';
                     statusEl.style.color = '#f90';
                 });
+        }
+
+        function updateTlEncodeDot(status, detail) {
+            const dot = document.getElementById('tl-encode-dot');
+            if (!dot) return;
+            if (!status || status === 'idle') {
+                dot.style.display = 'none';
+                dot.style.animation = '';
+                return;
+            }
+            dot.style.display = 'inline';
+            dot.title = detail || status;
+            switch (status) {
+                case 'pending':
+                    dot.style.color = '#f90';
+                    dot.style.animation = '';
+                    break;
+                case 'running':
+                    dot.style.color = '#4CAF50';
+                    dot.style.animation = 'tl-blink 1s infinite';
+                    break;
+                case 'success':
+                    dot.style.color = '#4CAF50';
+                    dot.style.animation = '';
+                    break;
+                case 'failed':
+                    dot.style.color = '#f44336';
+                    dot.style.animation = '';
+                    break;
+            }
         }
 
         function updateStorageSettings() {

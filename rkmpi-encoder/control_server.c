@@ -16,6 +16,7 @@
 #include "touch_inject.h"
 #include "fault_detect.h"
 #include "frame_buffer.h"
+#include "timelapse.h"
 #include "cJSON.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -2836,6 +2837,17 @@ static void serve_timelapse_moonraker_status(ControlServer *srv, int fd) {
                                g_moonraker_client->timelapse_active);
         cJSON_AddNumberToObject(root, "timelapse_frames",
                                  g_moonraker_client->timelapse_frames);
+
+        /* Encoding status: idle, pending, running, success, failed */
+        {
+            const char *status_str[] = {"idle", "pending", "running", "success", "failed"};
+            TimelapseEncodeStatus es = timelapse_get_encode_status();
+            cJSON_AddStringToObject(root, "timelapse_encode_status",
+                                     status_str[es < 5 ? es : 0]);
+            const char *detail = timelapse_get_encode_detail();
+            if (detail && detail[0])
+                cJSON_AddStringToObject(root, "timelapse_encode_detail", detail);
+        }
     } else {
         /* No moonraker client — try a quick TCP probe */
         int sock = socket(AF_INET, SOCK_STREAM, 0);
@@ -2876,6 +2888,17 @@ static void serve_timelapse_moonraker_status(ControlServer *srv, int fd) {
         cJSON_AddStringToObject(root, "filename", "");
         cJSON_AddBoolToObject(root, "timelapse_active", 0);
         cJSON_AddNumberToObject(root, "timelapse_frames", 0);
+
+        /* Encoding status even without moonraker */
+        {
+            const char *status_str[] = {"idle", "pending", "running", "success", "failed"};
+            TimelapseEncodeStatus es = timelapse_get_encode_status();
+            cJSON_AddStringToObject(root, "timelapse_encode_status",
+                                     status_str[es < 5 ? es : 0]);
+            const char *detail = timelapse_get_encode_detail();
+            if (detail && detail[0])
+                cJSON_AddStringToObject(root, "timelapse_encode_detail", detail);
+        }
     }
 
     cJSON_AddStringToObject(root, "host", srv->config->moonraker_host);

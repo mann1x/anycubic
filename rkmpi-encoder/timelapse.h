@@ -44,6 +44,15 @@ typedef struct {
     char temp_dir_base[TIMELAPSE_PATH_MAX]; /* Base directory for temp frames */
 } TimelapseConfig;
 
+/* Timelapse encoding status (for API/UI) */
+typedef enum {
+    TL_ENCODE_IDLE = 0,     /* No encoding in progress */
+    TL_ENCODE_PENDING,      /* Recovery queued (waiting to start) */
+    TL_ENCODE_RUNNING,      /* Encoding in progress (finalize or recovery) */
+    TL_ENCODE_SUCCESS,      /* Last encoding succeeded */
+    TL_ENCODE_FAILED        /* Last encoding failed */
+} TimelapseEncodeStatus;
+
 /* Timelapse state */
 typedef struct {
     int active;                             /* Timelapse recording in progress */
@@ -59,6 +68,10 @@ typedef struct {
     int venc_initialized;                   /* 1 if VENC encoder is ready */
     int frame_width;                        /* Frame width (from first frame) */
     int frame_height;                       /* Frame height (from first frame) */
+
+    /* Encoding status (for API/UI reporting) */
+    TimelapseEncodeStatus encode_status;    /* Current encoding status */
+    char encode_detail[256];                /* Status detail (e.g. "VENC 381 frames") */
 } TimelapseState;
 
 /* Global timelapse state */
@@ -166,11 +179,21 @@ void timelapse_set_custom_mode(int enabled);
 int timelapse_get_frame_count(void);
 
 /*
+ * Get current encoding status (for API/UI).
+ */
+TimelapseEncodeStatus timelapse_get_encode_status(void);
+
+/*
+ * Get encoding status detail string (for API/UI).
+ */
+const char *timelapse_get_encode_detail(void);
+
+/*
  * Recover orphaned timelapse frames from previous crashed instances.
- * Scans for temp directories from dead processes, encodes whatever frames
- * are available into MP4, then cleans up.
+ * Scans for temp directories from dead processes, tries VENC first then
+ * ffmpeg fallback.  On failure, copies frames to USB for manual recovery.
  *
- * Should be called once at startup before the main loop.
+ * Runs in a background thread (non-blocking).  Call once at startup.
  */
 void timelapse_recover_orphaned(void);
 
