@@ -16,6 +16,7 @@
 #include <stddef.h>
 #include <string.h>
 #include <stdio.h>
+#include <time.h>
 
 /* Model input dimensions (448x224 = 2:1 aspect for 16:9 cameras) */
 #define FD_MODEL_INPUT_WIDTH  448
@@ -200,6 +201,18 @@ typedef struct {
     float proto_dynamic_trigger;           /* ProtoNet margin that gates CNN */
     float multi_threshold;                 /* Multiclass binary threshold */
     float heatmap_boost_threshold;         /* Spatial heatmap boost trigger */
+    /* Advanced boost tuning */
+    int   boost_min_cells;                 /* Min strong cells for boost (default 3) */
+    float boost_cell_threshold;            /* Per-cell margin for "strong" (default 0.30) */
+    float boost_lean_factor;               /* CNN/Multi leaning = th * this (default 0.50) */
+    float boost_proto_lean;                /* Proto leaning gate (default 0.60) */
+    float boost_multi_lean;                /* Multi leaning gate + floor (default 0.25) */
+    float boost_proto_veto;                /* Proto strong-OK veto (default 0.35) */
+    float boost_proto_strong;              /* Proto strong confirmation (default 0.85) */
+    float boost_amplifier_cap;             /* Max heatmap amplifier (default 2.0) */
+    float boost_confidence_cap;            /* Max confidence from boost (default 0.95) */
+    float ema_alpha;                       /* EMA smoothing factor (default 0.30) */
+    float heatmap_coarse_weight;           /* Coarse blend weight (default 0.70) */
 } fd_threshold_profile_t;
 
 /* Model set info — discovered by scanning */
@@ -239,6 +252,18 @@ typedef struct {
     float proto_dynamic_trigger;
     float multi_threshold;
     float heatmap_boost_threshold;
+    /* Advanced boost tuning */
+    int   boost_min_cells;
+    float boost_cell_threshold;
+    float boost_lean_factor;
+    float boost_proto_lean;
+    float boost_multi_lean;
+    float boost_proto_veto;
+    float boost_proto_strong;
+    float boost_amplifier_cap;
+    float boost_confidence_cap;
+    float ema_alpha;
+    float heatmap_coarse_weight;
 } fd_active_thresholds_t;
 
 /* Detection result (last inference cycle) */
@@ -310,6 +335,7 @@ typedef struct {
     fd_mask196_t heatmap_mask;  /* grid mask: 1=active cell, 0=excluded from confidence */
     fd_z_mask_entry_t z_masks[FD_Z_MASK_MAX_ENTRIES];
     int z_mask_count;           /* 0 = disabled, use static heatmap_mask */
+    int debug_logging;          /* 1 = extra diagnostic logging (heatmap split, EMA state) */
     /* File overrides from metadata.json (populated by scan) */
     char cnn_file[64];
     char proto_file[64];
@@ -391,5 +417,136 @@ void fault_detect_get_crop(float *x, float *y, float *w, float *h);
  * Copies into caller's buffer. Returns bytes copied, 0 if none available.
  * cycle_out receives the cycle_count of the frame (NULL to skip). */
 size_t fault_detect_get_fd_frame(uint8_t *buf, size_t max_size, uint64_t *cycle_out);
+
+/* ============================================================================
+ * Prototype Management
+ * ============================================================================ */
+
+/* Directories on USB stick */
+#define FD_DATASETS_DIR       "/mnt/udisk/fault_detect/datasets"
+#define FD_PROTO_SETS_DIR     "/mnt/udisk/fault_detect/prototype_sets"
+#define FD_MAX_PROTO_SETS     16
+#define FD_MAX_DATASETS       16
+
+/* Prototype computation states */
+typedef enum {
+    PROTO_COMPUTE_IDLE = 0,
+    PROTO_COMPUTE_PENDING,
+    PROTO_COMPUTE_RUNNING,
+    PROTO_COMPUTE_SAVING,
+    PROTO_COMPUTE_DONE,
+    PROTO_COMPUTE_ERROR,
+    PROTO_COMPUTE_CANCELLED
+} fd_proto_compute_state_t;
+
+/* Download states */
+typedef enum {
+    FD_DOWNLOAD_IDLE = 0,
+    FD_DOWNLOAD_RUNNING,
+    FD_DOWNLOAD_EXTRACTING,
+    FD_DOWNLOAD_DONE,
+    FD_DOWNLOAD_ERROR
+} fd_download_state_t;
+
+/* Prototype computation progress (read by control server) */
+typedef struct {
+    fd_proto_compute_state_t state;
+    char dataset_name[64];
+    char set_name[64];
+    int current_model;          /* 0=classification, 1=spatial_fine, 2=spatial_coarse */
+    const char *model_name;     /* human-readable current model name */
+    int current_class;          /* 0=failure, 1=success */
+    int images_processed;       /* within current model+class */
+    int images_total;           /* within current model+class */
+    int total_images_processed; /* across all models */
+    int total_images_all;       /* total across all models */
+    int elapsed_s;
+    int estimated_total_s;
+    float cos_sim[3];           /* per-model separation metrics */
+    float margin[3];
+    char error_msg[256];
+    int incremental;            /* 1 = incremental update mode */
+} fd_proto_compute_progress_t;
+
+/* Dataset info (returned by listing) */
+typedef struct {
+    char name[64];
+    int n_failure, n_success;
+    time_t created;
+    char source[128];
+    size_t size_bytes;
+} fd_dataset_info_t;
+
+/* Prototype set info */
+typedef struct {
+    char name[64];
+    char source_dataset[64];
+    int n_failure, n_success;
+    time_t created;
+    float margin[3];            /* classification, spatial_fine, spatial_coarse */
+    int is_active;
+    char encoder_hashes[3][33]; /* MD5 hex of each RKNN model used */
+} fd_proto_set_info_t;
+
+/* Download progress */
+typedef struct {
+    fd_download_state_t state;
+    size_t downloaded_bytes;
+    size_t total_bytes;
+    int progress_pct;
+    char error_msg[256];
+} fd_download_progress_t;
+
+/* --- Prototype management API --- */
+
+/* Trigger full prototype computation from dataset.
+ * Runs in FD thread (pauses inference). Returns 0 if request accepted. */
+int fault_detect_compute_prototypes(const char *dataset_name, const char *set_name);
+
+/* Trigger incremental prototype update (merge new images into existing set).
+ * Returns 0 if request accepted. */
+int fault_detect_compute_prototypes_incremental(const char *dataset_name,
+                                                 const char *set_name);
+
+/* Cancel in-progress computation. */
+void fault_detect_cancel_proto_compute(void);
+
+/* Get computation progress (thread-safe copy). */
+fd_proto_compute_progress_t fault_detect_get_proto_progress(void);
+
+/* List datasets on USB. Returns count (up to max). */
+int fault_detect_list_datasets(fd_dataset_info_t *out, int max);
+
+/* Create empty dataset directory. Returns 0 on success. */
+int fault_detect_create_dataset(const char *name);
+
+/* Delete dataset and all images. Returns 0 on success. */
+int fault_detect_delete_dataset(const char *name);
+
+/* Save a JPEG frame to a dataset class directory.
+ * class_idx: 0=failure, 1=success. Returns 0 on success. */
+int fault_detect_save_frame_to_dataset(const char *dataset_name, int class_idx,
+                                        const uint8_t *jpeg_buf, size_t jpeg_len);
+
+/* List prototype sets on USB. Returns count (up to max). */
+int fault_detect_list_proto_sets(fd_proto_set_info_t *out, int max,
+                                  const char *active_set);
+
+/* Activate a prototype set: copy .bin files to model dir and reload.
+ * Returns 0 on success. */
+int fault_detect_activate_proto_set(const char *set_name);
+
+/* Delete a prototype set. Returns 0 on success. */
+int fault_detect_delete_proto_set(const char *set_name);
+
+/* Start background download of dataset from URL.
+ * Returns 0 if download started. */
+int fault_detect_download_dataset(const char *url, const char *name);
+
+/* Get download progress (thread-safe copy). */
+fd_download_progress_t fault_detect_get_download_progress(void);
+
+/* Cancel in-progress download. */
+void fault_detect_cancel_download(void);
 
 #endif /* FAULT_DETECT_H */

@@ -1008,6 +1008,80 @@
                                     Higher = fewer false positives, lower = catches smaller defects. Range 0.5-3.0.
                                 </div>
                             </div>
+                            <details id="fd-advanced-boost" style="margin-top:8px;">
+                                <summary style="cursor:pointer;font-size:12px;color:#aaa;">Advanced Boost Settings</summary>
+                                <div style="margin-top:6px;">
+                                    <div style="font-size:10px;color:#888;padding:0 0 6px 8px;">Boost activation</div>
+                                    <div class="setting-row">
+                                        <span class="label" style="font-size:11px;">Min strong cells:</span>
+                                        <div class="control">
+                                            <input type="number" id="fd_th_boost_min_cells" min="1" max="50" step="1" style="width:60px;" disabled>
+                                        </div>
+                                    </div>
+                                    <div class="setting-row">
+                                        <span class="label" style="font-size:11px;">Cell threshold:</span>
+                                        <div class="control">
+                                            <input type="number" id="fd_th_boost_cell_th" min="0.05" max="2.0" step="0.05" style="width:60px;" disabled>
+                                        </div>
+                                    </div>
+                                    <div style="font-size:10px;color:#888;padding:4px 0 6px 8px;">Corroboration gates</div>
+                                    <div class="setting-row">
+                                        <span class="label" style="font-size:11px;">Lean factor:</span>
+                                        <div class="control">
+                                            <input type="number" id="fd_th_boost_lean" min="0.1" max="1.0" step="0.05" style="width:60px;" disabled>
+                                        </div>
+                                    </div>
+                                    <div class="setting-row">
+                                        <span class="label" style="font-size:11px;">Proto lean:</span>
+                                        <div class="control">
+                                            <input type="number" id="fd_th_boost_proto_lean" min="0.1" max="0.99" step="0.01" style="width:60px;" disabled>
+                                        </div>
+                                    </div>
+                                    <div class="setting-row">
+                                        <span class="label" style="font-size:11px;">Multi lean:</span>
+                                        <div class="control">
+                                            <input type="number" id="fd_th_boost_multi_lean" min="0.05" max="0.99" step="0.01" style="width:60px;" disabled>
+                                        </div>
+                                    </div>
+                                    <div class="setting-row">
+                                        <span class="label" style="font-size:11px;">Proto veto:</span>
+                                        <div class="control">
+                                            <input type="number" id="fd_th_boost_proto_veto" min="0.1" max="0.99" step="0.01" style="width:60px;" disabled>
+                                        </div>
+                                    </div>
+                                    <div class="setting-row">
+                                        <span class="label" style="font-size:11px;">Proto strong:</span>
+                                        <div class="control">
+                                            <input type="number" id="fd_th_boost_proto_strong" min="0.5" max="0.99" step="0.01" style="width:60px;" disabled>
+                                        </div>
+                                    </div>
+                                    <div style="font-size:10px;color:#888;padding:4px 0 6px 8px;">Confidence &amp; smoothing</div>
+                                    <div class="setting-row">
+                                        <span class="label" style="font-size:11px;">Amplifier cap:</span>
+                                        <div class="control">
+                                            <input type="number" id="fd_th_boost_amp_cap" min="1.0" max="5.0" step="0.1" style="width:60px;" disabled>
+                                        </div>
+                                    </div>
+                                    <div class="setting-row">
+                                        <span class="label" style="font-size:11px;">Confidence cap:</span>
+                                        <div class="control">
+                                            <input type="number" id="fd_th_boost_conf_cap" min="0.5" max="1.0" step="0.01" style="width:60px;" disabled>
+                                        </div>
+                                    </div>
+                                    <div class="setting-row">
+                                        <span class="label" style="font-size:11px;">EMA alpha:</span>
+                                        <div class="control">
+                                            <input type="number" id="fd_th_ema_alpha" min="0.05" max="1.0" step="0.05" style="width:60px;" disabled>
+                                        </div>
+                                    </div>
+                                    <div class="setting-row">
+                                        <span class="label" style="font-size:11px;">Coarse weight:</span>
+                                        <div class="control">
+                                            <input type="number" id="fd_th_coarse_wt" min="0.0" max="1.0" step="0.05" style="width:60px;" disabled>
+                                        </div>
+                                    </div>
+                                </div>
+                            </details>
                         </div>
                     </div>
 
@@ -1015,6 +1089,65 @@
                         <button type="button" onclick="applyFdSettings()">Apply</button>
                         <span id="fd-status-msg" style="margin-left:10px;font-size:12px;"></span>
                     </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="section" id="proto-section">
+            <h2>Prototype Management</h2>
+            <div style="display:flex;gap:20px;flex-wrap:wrap;">
+                <!-- Datasets panel -->
+                <div style="flex:1;min-width:280px;">
+                    <h3 style="margin:0 0 8px 0;font-size:14px;">Datasets</h3>
+                    <div id="proto-datasets-list" style="margin-bottom:8px;font-size:13px;"></div>
+                    <div style="display:flex;gap:5px;flex-wrap:wrap;">
+                        <button type="button" onclick="protoDownloadDataset()" id="proto-dl-btn" style="font-size:12px;">Download Default</button>
+                        <button type="button" onclick="protoCreateDataset()" style="font-size:12px;">New Dataset</button>
+                    </div>
+                    <div id="proto-dl-status" style="display:none;margin-top:6px;font-size:12px;">
+                        <div style="background:#333;border-radius:3px;height:16px;overflow:hidden;margin-bottom:3px;">
+                            <div id="proto-dl-bar" style="background:#4a9eff;height:100%;width:0%;transition:width 0.3s;"></div>
+                        </div>
+                        <span id="proto-dl-text"></span>
+                    </div>
+                </div>
+
+                <!-- Prototype Sets panel -->
+                <div style="flex:1;min-width:280px;">
+                    <h3 style="margin:0 0 8px 0;font-size:14px;">Prototype Sets</h3>
+                    <div id="proto-sets-list" style="margin-bottom:8px;font-size:13px;"></div>
+                </div>
+            </div>
+
+            <!-- Compute Controls -->
+            <div style="margin-top:12px;padding-top:10px;border-top:1px solid #444;">
+                <h3 style="margin:0 0 8px 0;font-size:14px;">Compute Prototypes</h3>
+                <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+                    <label style="font-size:12px;">Dataset:</label>
+                    <select id="proto-compute-dataset" style="font-size:12px;"></select>
+                    <label style="font-size:12px;">Set name:</label>
+                    <input type="text" id="proto-compute-setname" style="font-size:12px;width:100px;" placeholder="e.g. default">
+                    <button type="button" onclick="protoStartCompute(false)" style="font-size:12px;">Compute</button>
+                    <button type="button" onclick="protoStartCompute(true)" style="font-size:12px;">Incremental</button>
+                    <button type="button" onclick="protoCancelCompute()" id="proto-cancel-btn" style="font-size:12px;display:none;">Cancel</button>
+                </div>
+                <div id="proto-compute-status" style="display:none;margin-top:8px;">
+                    <div style="background:#333;border-radius:3px;height:18px;overflow:hidden;margin-bottom:4px;">
+                        <div id="proto-compute-bar" style="background:#4a9eff;height:100%;width:0%;transition:width 0.3s;"></div>
+                    </div>
+                    <span id="proto-compute-text" style="font-size:12px;"></span>
+                </div>
+                <div id="proto-compute-results" style="display:none;margin-top:8px;font-size:13px;"></div>
+            </div>
+
+            <!-- Capture to Dataset -->
+            <div style="margin-top:12px;padding-top:10px;border-top:1px solid #444;">
+                <h3 style="margin:0 0 8px 0;font-size:14px;">Capture to Dataset</h3>
+                <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+                    <select id="proto-capture-dataset" style="font-size:12px;"></select>
+                    <button type="button" onclick="protoSaveFrame('failure')" style="font-size:12px;background:#a33;">Save as Failure</button>
+                    <button type="button" onclick="protoSaveFrame('success')" style="font-size:12px;">Save as Success</button>
+                    <span id="proto-capture-msg" style="font-size:12px;"></span>
                 </div>
             </div>
         </div>
@@ -2566,7 +2699,9 @@ if(flvjs.isSupported()){
             const cellW = cw / cols;
             const cellH = ch / rows;
 
-            // Auto-normalize: find actual data range for contrast
+            // Fixed scale centered at 0: negative=OK(green), positive=FAULT(red)
+            // Cosine margin space: -1.0 = deeply OK, +1.0 = deeply FAULT
+            const HEATMAP_SCALE = 1.0;
             let vmin = Infinity, vmax = -Infinity;
             for (let h = 0; h < rows; h++) {
                 for (let w = 0; w < cols; w++) {
@@ -2575,15 +2710,13 @@ if(flvjs.isSupported()){
                     if (v > vmax) vmax = v;
                 }
             }
-            // Symmetric range around 0, minimum 0.001 to avoid division by zero
-            const absMax = Math.max(Math.abs(vmin), Math.abs(vmax), 0.001);
 
             ctx.globalAlpha = 0.45;
             for (let h = 0; h < rows; h++) {
                 for (let w = 0; w < cols; w++) {
                     const v = grid[h][w];
-                    // Normalize to [-1,1] using actual range, then to [0,1]
-                    const t = Math.max(0, Math.min(1, (v / absMax + 1) / 2));
+                    // Fixed scale: v=-1→t=0(green), v=0→t=0.5(yellow), v=+1→t=1(red)
+                    const t = Math.max(0, Math.min(1, (v / HEATMAP_SCALE + 1) / 2));
                     let r, g, b;
                     if (t < 0.5) {
                         // green to yellow
@@ -2685,14 +2818,19 @@ if(flvjs.isSupported()){
                         const name = names[key] || key;
                         const rawPct = (m.raw * 100).toFixed(1);
                         const lkPct = (m.fault_lk * 100).toFixed(1);
-                        const vote = m.vote === 'fault' ? 'KO' : 'OK';
-                        const voteColor = m.vote === 'fault' ? '#f55' : '#5f5';
-                        lines.push(name + ': ' + rawPct + '% raw, ' + lkPct + '% norm (' + m.ms + 'ms) <span style="color:' + voteColor + ';font-weight:bold">(' + vote + ')</span>');
+                        let line = name + ': ' + rawPct + '% raw, ' + lkPct + '% norm (' + m.ms + 'ms)';
+                        if (key !== 'multi') {
+                            const vote = m.vote === 'fault' ? 'KO' : 'OK';
+                            const voteColor = m.vote === 'fault' ? '#f55' : '#5f5';
+                            line += ' <span style="color:' + voteColor + ';font-weight:bold">(' + vote + ')</span>';
+                        }
+                        lines.push(line);
                     }
                     if (fd.boost && fd.boost.active) {
-                        const boostVote = fd.boost.overrode ? 'KO' : 'OK';
-                        const boostColor = fd.boost.overrode ? '#f55' : '#fa0';
-                        lines.push('Boost: heatmap ' + (fd.boost.heatmap_max * 100).toFixed(0) + '%, ' + fd.boost.strong_cells + '/' + fd.boost.total_cells + ' cells <span style="color:' + boostColor + ';font-weight:bold">(' + boostVote + ')</span>');
+                        const isFault = fd.detection === 'fault';
+                        const boostLabel = isFault ? 'KO' : 'OK';
+                        const boostColor = fd.boost.overrode ? '#f55' : (isFault ? '#fa0' : '#5f5');
+                        lines.push('Boost: heatmap ' + (fd.boost.heatmap_max * 100).toFixed(0) + '%, ' + fd.boost.strong_cells + '/' + fd.boost.total_cells + ' cells <span style="color:' + boostColor + ';font-weight:bold">(' + boostLabel + ')</span>');
                     }
                     modelsRow.style.display = '';
                     modelsEl.innerHTML = lines.join('\n');
@@ -2865,7 +3003,18 @@ if(flvjs.isSupported()){
             const ids = {
                 'fd_th_cnn': 'cnn_threshold', 'fd_th_cnn_dyn': 'cnn_dynamic_threshold',
                 'fd_th_proto': 'proto_threshold', 'fd_th_proto_trig': 'proto_dynamic_trigger',
-                'fd_th_multi': 'multi_threshold', 'fd_th_heatmap': 'heatmap_boost_threshold'
+                'fd_th_multi': 'multi_threshold', 'fd_th_heatmap': 'heatmap_boost_threshold',
+                'fd_th_boost_min_cells': 'boost_min_cells',
+                'fd_th_boost_cell_th': 'boost_cell_threshold',
+                'fd_th_boost_lean': 'boost_lean_factor',
+                'fd_th_boost_proto_lean': 'boost_proto_lean',
+                'fd_th_boost_multi_lean': 'boost_multi_lean',
+                'fd_th_boost_proto_veto': 'boost_proto_veto',
+                'fd_th_boost_proto_strong': 'boost_proto_strong',
+                'fd_th_boost_amp_cap': 'boost_amplifier_cap',
+                'fd_th_boost_conf_cap': 'boost_confidence_cap',
+                'fd_th_ema_alpha': 'ema_alpha',
+                'fd_th_coarse_wt': 'heatmap_coarse_weight'
             };
             for (const [id, key] of Object.entries(ids)) {
                 const el = document.getElementById(id);
@@ -2874,7 +3023,11 @@ if(flvjs.isSupported()){
         }
 
         function toggleThresholdEditable(editable) {
-            ['fd_th_cnn','fd_th_cnn_dyn','fd_th_proto','fd_th_proto_trig','fd_th_multi','fd_th_heatmap'].forEach(id => {
+            ['fd_th_cnn','fd_th_cnn_dyn','fd_th_proto','fd_th_proto_trig','fd_th_multi','fd_th_heatmap',
+             'fd_th_boost_min_cells','fd_th_boost_cell_th','fd_th_boost_lean',
+             'fd_th_boost_proto_lean','fd_th_boost_multi_lean','fd_th_boost_proto_veto',
+             'fd_th_boost_proto_strong','fd_th_boost_amp_cap','fd_th_boost_conf_cap',
+             'fd_th_ema_alpha','fd_th_coarse_wt'].forEach(id => {
                 const el = document.getElementById(id);
                 if (el) {
                     el.disabled = !editable;
@@ -2913,7 +3066,18 @@ if(flvjs.isSupported()){
                 proto_threshold: parseFloat(document.getElementById('fd_th_proto').value) || 0,
                 proto_dynamic_trigger: parseFloat(document.getElementById('fd_th_proto_trig').value) || 0,
                 multi_threshold: parseFloat(document.getElementById('fd_th_multi').value) || 0,
-                heatmap_boost_threshold: parseFloat(document.getElementById('fd_th_heatmap').value) || 0
+                heatmap_boost_threshold: parseFloat(document.getElementById('fd_th_heatmap').value) || 0,
+                boost_min_cells: parseInt(document.getElementById('fd_th_boost_min_cells').value) || 0,
+                boost_cell_threshold: parseFloat(document.getElementById('fd_th_boost_cell_th').value) || 0,
+                boost_lean_factor: parseFloat(document.getElementById('fd_th_boost_lean').value) || 0,
+                boost_proto_lean: parseFloat(document.getElementById('fd_th_boost_proto_lean').value) || 0,
+                boost_multi_lean: parseFloat(document.getElementById('fd_th_boost_multi_lean').value) || 0,
+                boost_proto_veto: parseFloat(document.getElementById('fd_th_boost_proto_veto').value) || 0,
+                boost_proto_strong: parseFloat(document.getElementById('fd_th_boost_proto_strong').value) || 0,
+                boost_amplifier_cap: parseFloat(document.getElementById('fd_th_boost_amp_cap').value) || 0,
+                boost_confidence_cap: parseFloat(document.getElementById('fd_th_boost_conf_cap').value) || 0,
+                ema_alpha: parseFloat(document.getElementById('fd_th_ema_alpha').value) || 0,
+                heatmap_coarse_weight: parseFloat(document.getElementById('fd_th_coarse_wt').value) || 0
             };
         }
 
@@ -2982,10 +3146,13 @@ if(flvjs.isSupported()){
             if (!fdInstalled) {
                 const s1 = document.getElementById('fd-status-section');
                 const s2 = document.getElementById('fd-config-section');
+                const s3 = document.getElementById('proto-section');
                 if (s1) s1.style.display = 'none';
                 if (s2) s2.style.display = 'none';
+                if (s3) s3.style.display = 'none';
                 return;
             }
+            protoRefresh();
             updateFdVisibility();
             // Set strategy from template
             const strat = '$fd_strategy';
@@ -3029,6 +3196,275 @@ if(flvjs.isSupported()){
                 }
             })();
         })();
+        // ============================================================
+        // Prototype Management
+        // ============================================================
+        let protoComputeTimer = null;
+        let protoDlTimer = null;
+
+        function protoRefresh() {
+            protoLoadDatasets();
+            protoLoadSets();
+            /* Resume progress display if computation was already running */
+            fetch('/api/proto/compute/status').then(r => r.json()).then(data => {
+                if (data.state === 'running' || data.state === 'saving') {
+                    document.getElementById('proto-compute-status').style.display = 'block';
+                    document.getElementById('proto-cancel-btn').style.display = 'inline-block';
+                    protoComputeTimer = setInterval(protoCheckComputeStatus, 2000);
+                    protoCheckComputeStatus();
+                } else if (data.state === 'done' && data.elapsed_s > 0) {
+                    /* Show last completed results */
+                    document.getElementById('proto-compute-status').style.display = 'block';
+                    protoCheckComputeStatus();
+                }
+            }).catch(() => {});
+        }
+
+        function protoLoadDatasets() {
+            fetch('/api/proto/datasets').then(r => r.json()).then(data => {
+                const el = document.getElementById('proto-datasets-list');
+                const dsel = document.getElementById('proto-compute-dataset');
+                const csel = document.getElementById('proto-capture-dataset');
+                if (!data.datasets || data.datasets.length === 0) {
+                    el.innerHTML = '<div style="color:#888;">No datasets. Download or create one.</div>';
+                    dsel.innerHTML = '';
+                    csel.innerHTML = '';
+                    return;
+                }
+                let html = '';
+                dsel.innerHTML = '';
+                csel.innerHTML = '';
+                data.datasets.forEach(ds => {
+                    const sizeMB = ds.size_mb ? ds.size_mb.toFixed(1) : '?';
+                    html += `<div style="display:flex;align-items:center;gap:8px;margin-bottom:5px;padding:6px 10px;background:#2a2a2a;border:1px solid #444;border-radius:4px;">
+                        <span style="flex:1;"><b>${ds.name}</b> &mdash; ${ds.n_failure}f / ${ds.n_success}s (${sizeMB} MB)</span>
+                        <button onclick="protoDeleteDataset('${ds.name}')" style="font-size:11px;padding:2px 8px;background:#633;">Del</button>
+                    </div>`;
+                    const opt1 = document.createElement('option');
+                    opt1.value = ds.name; opt1.textContent = `${ds.name} (${ds.n_failure}f/${ds.n_success}s)`;
+                    dsel.appendChild(opt1);
+                    const opt2 = opt1.cloneNode(true);
+                    csel.appendChild(opt2);
+                });
+                el.innerHTML = html;
+            }).catch(() => {});
+        }
+
+        function protoLoadSets() {
+            fetch('/api/proto/sets').then(r => r.json()).then(data => {
+                const el = document.getElementById('proto-sets-list');
+                if (!data.sets || data.sets.length === 0) {
+                    el.innerHTML = '<div style="color:#888;">No prototype sets computed yet.</div>';
+                    return;
+                }
+                let html = '';
+                const labels = ['Class', 'Fine', 'Coarse'];
+                const sorted = data.sets.slice().sort((a, b) => (b.is_active ? 1 : 0) - (a.is_active ? 1 : 0));
+                sorted.forEach(s => {
+                    const active = s.is_active;
+                    const border = active ? '1px solid #4CAF50' : '1px solid #444';
+                    const badge = active ? '<span style="color:#4CAF50;font-size:11px;font-weight:bold;margin-left:6px;">ACTIVE</span>' : '';
+                    let marginsHtml = s.margins.map((m, i) => {
+                        const color = m > 0.5 ? '#4CAF50' : m > 0.1 ? '#f0ad4e' : '#d9534f';
+                        return `<span style="color:${color}">${labels[i]}: ${m.toFixed(3)}</span>`;
+                    }).join(' &nbsp; ');
+                    html += `<div style="padding:6px 10px;margin-bottom:5px;background:#2a2a2a;border:${border};border-radius:4px;">
+                        <div style="display:flex;align-items:center;gap:8px;">
+                            <span style="flex:1;"><b>${s.name}</b>${badge}</span>
+                            ${!active ? `<button onclick="protoActivateSet('${s.name}')" style="font-size:11px;padding:2px 8px;">Activate</button>` : ''}
+                            <button onclick="protoDeleteSet('${s.name}')" style="font-size:11px;padding:2px 8px;background:#633;">Del</button>
+                        </div>
+                        <div style="font-size:11px;color:#aaa;margin-top:3px;">
+                            ${s.source_dataset ? 'From: ' + s.source_dataset + ' &mdash; ' : ''}${s.n_failure}f/${s.n_success}s
+                        </div>
+                        <div style="font-size:11px;margin-top:3px;">${marginsHtml}</div>
+                    </div>`;
+                });
+                el.innerHTML = html;
+            }).catch(() => {});
+        }
+
+        function protoDownloadDataset() {
+            const btn = document.getElementById('proto-dl-btn');
+            btn.disabled = true;
+            fetch('/api/proto/datasets/download', {
+                method: 'POST', headers: {'Content-Type':'application/json'},
+                body: JSON.stringify({})
+            }).then(r => r.json()).then(data => {
+                if (data.ok) {
+                    document.getElementById('proto-dl-status').style.display = 'block';
+                    protoDlTimer = setInterval(protoCheckDlStatus, 2000);
+                } else {
+                    btn.disabled = false;
+                    alert(data.message || 'Download failed');
+                }
+            }).catch(e => { btn.disabled = false; alert('Error: ' + e); });
+        }
+
+        function protoCheckDlStatus() {
+            fetch('/api/proto/datasets/download/status').then(r => r.json()).then(data => {
+                const bar = document.getElementById('proto-dl-bar');
+                const text = document.getElementById('proto-dl-text');
+                if (data.state === 'running') {
+                    const mb = (data.downloaded_bytes / 1048576).toFixed(1);
+                    bar.style.width = '50%';
+                    text.textContent = `Downloading... ${mb} MB`;
+                } else if (data.state === 'extracting') {
+                    bar.style.width = '80%';
+                    text.textContent = 'Extracting...';
+                } else if (data.state === 'done') {
+                    bar.style.width = '100%';
+                    text.textContent = 'Download complete!';
+                    text.style.color = '#4CAF50';
+                    clearInterval(protoDlTimer);
+                    document.getElementById('proto-dl-btn').disabled = false;
+                    setTimeout(() => {
+                        document.getElementById('proto-dl-status').style.display = 'none';
+                        protoLoadDatasets();
+                    }, 2000);
+                } else if (data.state === 'error') {
+                    bar.style.width = '100%';
+                    bar.style.background = '#d9534f';
+                    text.textContent = 'Error: ' + (data.error || 'unknown');
+                    text.style.color = '#d9534f';
+                    clearInterval(protoDlTimer);
+                    document.getElementById('proto-dl-btn').disabled = false;
+                }
+            });
+        }
+
+        function protoCreateDataset() {
+            const name = prompt('Dataset name (no spaces/special chars):');
+            if (!name) return;
+            fetch('/api/proto/datasets/create', {
+                method: 'POST', headers: {'Content-Type':'application/json'},
+                body: JSON.stringify({name: name})
+            }).then(r => r.json()).then(() => protoLoadDatasets());
+        }
+
+        function protoDeleteDataset(name) {
+            if (!confirm(`Delete dataset "${name}" and all images?`)) return;
+            fetch(`/api/proto/datasets/delete/${name}`, {method:'POST'})
+                .then(r => r.json()).then(() => protoLoadDatasets());
+        }
+
+        function protoStartCompute(incremental) {
+            const dataset = document.getElementById('proto-compute-dataset').value;
+            const setName = document.getElementById('proto-compute-setname').value.trim();
+            if (!dataset) { alert('Select a dataset'); return; }
+            if (!setName) { alert('Enter a set name'); return; }
+            const url = incremental ? '/api/proto/compute/incremental' : '/api/proto/compute';
+            fetch(url, {
+                method: 'POST', headers: {'Content-Type':'application/json'},
+                body: JSON.stringify({dataset: dataset, set_name: setName})
+            }).then(r => r.json()).then(data => {
+                if (data.ok) {
+                    document.getElementById('proto-compute-status').style.display = 'block';
+                    document.getElementById('proto-compute-results').style.display = 'none';
+                    document.getElementById('proto-cancel-btn').style.display = 'inline-block';
+                    protoComputeTimer = setInterval(protoCheckComputeStatus, 2000);
+                } else {
+                    alert(data.message || 'Failed to start computation');
+                }
+            }).catch(e => alert('Error: ' + e));
+        }
+
+        function protoCancelCompute() {
+            fetch('/api/proto/compute/cancel', {method:'POST'});
+        }
+
+        function protoFormatTime(totalSec) {
+            if (totalSec < 0) totalSec = 0;
+            const h = Math.floor(totalSec / 3600);
+            const m = Math.floor((totalSec % 3600) / 60);
+            const s = Math.floor(totalSec % 60);
+            if (h > 0) return `${h}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+            return `${m}:${String(s).padStart(2,'0')}`;
+        }
+
+        function protoCheckComputeStatus() {
+            fetch('/api/proto/compute/status').then(r => r.json()).then(data => {
+                const bar = document.getElementById('proto-compute-bar');
+                const text = document.getElementById('proto-compute-text');
+                const results = document.getElementById('proto-compute-results');
+                const cancelBtn = document.getElementById('proto-cancel-btn');
+
+                if (data.state === 'running' || data.state === 'saving') {
+                    const pct = data.total_all > 0 ? Math.round(100 * data.total_processed / data.total_all) : 0;
+                    bar.style.width = pct + '%';
+                    bar.style.background = '#4a9eff';
+                    const cls = data.current_class === 0 ? 'failure' : 'success';
+                    const remaining = data.estimated_total_s > 0 ? data.estimated_total_s - data.elapsed_s : 0;
+                    const eta = data.estimated_total_s > 0 ? ` (ETA: ${protoFormatTime(remaining)})` : '';
+                    text.textContent = `${data.model_name || '?'} [${cls}] ${data.images_processed}/${data.images_total} — ${pct}% ${protoFormatTime(data.elapsed_s)}${eta}`;
+                } else if (data.state === 'done') {
+                    bar.style.width = '100%';
+                    bar.style.background = '#4CAF50';
+                    text.textContent = `Done in ${protoFormatTime(data.elapsed_s)}`;
+                    clearInterval(protoComputeTimer);
+                    cancelBtn.style.display = 'none';
+
+                    const labels = ['Classification', 'Spatial Fine', 'Spatial Coarse'];
+                    let rHtml = '<b>Results:</b> ';
+                    if (data.margins) {
+                        data.margins.forEach((m, i) => {
+                            const color = m > 0.5 ? '#4CAF50' : m > 0.1 ? '#f0ad4e' : '#d9534f';
+                            rHtml += `<span style="color:${color}">${labels[i]}: ${m.toFixed(3)}</span> &nbsp; `;
+                        });
+                    }
+                    results.innerHTML = rHtml;
+                    results.style.display = 'block';
+                    protoLoadSets();
+                } else if (data.state === 'error' || data.state === 'cancelled') {
+                    bar.style.width = '100%';
+                    bar.style.background = '#d9534f';
+                    text.textContent = data.state === 'cancelled' ? 'Cancelled' : 'Error: ' + (data.error || 'unknown');
+                    clearInterval(protoComputeTimer);
+                    cancelBtn.style.display = 'none';
+                } else if (data.state === 'idle') {
+                    clearInterval(protoComputeTimer);
+                    cancelBtn.style.display = 'none';
+                }
+            });
+        }
+
+        function protoActivateSet(name) {
+            fetch('/api/proto/sets/activate', {
+                method: 'POST', headers: {'Content-Type':'application/json'},
+                body: JSON.stringify({name: name})
+            }).then(r => r.json()).then(data => {
+                if (data.ok) protoLoadSets();
+                else alert(data.message || 'Activation failed');
+            });
+        }
+
+        function protoDeleteSet(name) {
+            if (!confirm(`Delete prototype set "${name}"?`)) return;
+            fetch(`/api/proto/sets/delete/${name}`, {method:'POST'})
+                .then(r => r.json()).then(() => protoLoadSets());
+        }
+
+        function protoSaveFrame(cls) {
+            const dataset = document.getElementById('proto-capture-dataset').value;
+            if (!dataset) { alert('Select a dataset first'); return; }
+            fetch('/api/proto/datasets/save_frame', {
+                method: 'POST', headers: {'Content-Type':'application/json'},
+                body: JSON.stringify({dataset: dataset, class: cls})
+            }).then(r => r.json()).then(data => {
+                const msg = document.getElementById('proto-capture-msg');
+                if (data.ok) {
+                    const kb = (data.size / 1024).toFixed(1);
+                    msg.textContent = `Saved ${cls} frame (${kb} KB)`;
+                    msg.style.color = '#4CAF50';
+                    protoLoadDatasets();
+                } else {
+                    msg.textContent = data.message || 'Save failed';
+                    msg.style.color = '#d9534f';
+                }
+                setTimeout(() => { msg.textContent = ''; }, 3000);
+            });
+        }
+
     </script>
 </body>
 </html>

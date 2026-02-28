@@ -163,6 +163,11 @@ void config_set_defaults(AppConfig *cfg) {
     cfg->fd_beep_pattern = 0;
     cfg->fd_thresholds_json[0] = '\0';
 
+    /* Prototype Management */
+    cfg->proto_active_set[0] = '\0';
+    snprintf(cfg->proto_dataset_url, sizeof(cfg->proto_dataset_url),
+             "https://github.com/mann1x/anycubic/releases/download/datasets/ks1-v7/ks1_default_dataset.tar.gz");
+
     /* Fault Detection Setup */
     cfg->fd_setup_status = FD_SETUP_NONE;
     cfg->fd_setup_timestamp = 0;
@@ -331,6 +336,7 @@ int config_load(AppConfig *cfg, const char *path) {
     cfg->fault_detect_pace_ms = clamp_int(
         json_get_int(root, "fault_detect_pace_ms", cfg->fault_detect_pace_ms), 0, 500);
     cfg->heatmap_enabled = json_get_bool(root, "heatmap_enabled", cfg->heatmap_enabled);
+    cfg->fd_debug_logging = json_get_bool(root, "fd_debug_logging", cfg->fd_debug_logging);
     cfg->fd_beep_pattern = clamp_int(
         json_get_int(root, "fd_beep_pattern", cfg->fd_beep_pattern), 0, 5);
 
@@ -342,6 +348,14 @@ int config_load(AppConfig *cfg, const char *path) {
             strncpy(cfg->fd_thresholds_json, th_str, sizeof(cfg->fd_thresholds_json) - 1);
             free(th_str);
         }
+    }
+
+    /* Prototype Management */
+    {
+        const char *pa = json_get_str(root, "proto_active_set", cfg->proto_active_set);
+        strncpy(cfg->proto_active_set, pa, sizeof(cfg->proto_active_set) - 1);
+        const char *pu = json_get_str(root, "proto_dataset_url", cfg->proto_dataset_url);
+        strncpy(cfg->proto_dataset_url, pu, sizeof(cfg->proto_dataset_url) - 1);
     }
 
     /* Fault Detection Setup */
@@ -556,6 +570,7 @@ int config_save(const AppConfig *cfg, const char *path) {
     json_set_int(root, "fault_detect_min_free_mem", cfg->fault_detect_min_free_mem);
     json_set_int(root, "fault_detect_pace_ms", cfg->fault_detect_pace_ms);
     json_set_bool(root, "heatmap_enabled", cfg->heatmap_enabled);
+    json_set_bool(root, "fd_debug_logging", cfg->fd_debug_logging);
     json_set_int(root, "fd_beep_pattern", cfg->fd_beep_pattern);
 
     /* Per-set threshold settings */
@@ -566,6 +581,11 @@ int config_save(const AppConfig *cfg, const char *path) {
             cJSON_AddItemToObject(root, "fd_thresholds", fd_th);
         }
     }
+
+    /* Prototype Management */
+    json_set_str(root, "proto_active_set", cfg->proto_active_set);
+    if (cfg->proto_dataset_url[0])
+        json_set_str(root, "proto_dataset_url", cfg->proto_dataset_url);
 
     /* Fault Detection Setup */
     json_set_int(root, "fd_setup_status", cfg->fd_setup_status);

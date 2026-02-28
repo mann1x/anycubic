@@ -1006,6 +1006,18 @@ static void serve_fault_detect_sets(ControlServer *srv, int fd) {
             cJSON_AddNumberToObject(pj, "proto_dynamic_trigger", round2(pr->proto_dynamic_trigger));
             cJSON_AddNumberToObject(pj, "multi_threshold", round2(pr->multi_threshold));
             cJSON_AddNumberToObject(pj, "heatmap_boost_threshold", round2(pr->heatmap_boost_threshold));
+            /* Advanced boost tuning */
+            cJSON_AddNumberToObject(pj, "boost_min_cells", pr->boost_min_cells);
+            cJSON_AddNumberToObject(pj, "boost_cell_threshold", round2(pr->boost_cell_threshold));
+            cJSON_AddNumberToObject(pj, "boost_lean_factor", round2(pr->boost_lean_factor));
+            cJSON_AddNumberToObject(pj, "boost_proto_lean", round2(pr->boost_proto_lean));
+            cJSON_AddNumberToObject(pj, "boost_multi_lean", round2(pr->boost_multi_lean));
+            cJSON_AddNumberToObject(pj, "boost_proto_veto", round2(pr->boost_proto_veto));
+            cJSON_AddNumberToObject(pj, "boost_proto_strong", round2(pr->boost_proto_strong));
+            cJSON_AddNumberToObject(pj, "boost_amplifier_cap", round2(pr->boost_amplifier_cap));
+            cJSON_AddNumberToObject(pj, "boost_confidence_cap", round2(pr->boost_confidence_cap));
+            cJSON_AddNumberToObject(pj, "ema_alpha", round2(pr->ema_alpha));
+            cJSON_AddNumberToObject(pj, "heatmap_coarse_weight", round2(pr->heatmap_coarse_weight));
             cJSON_AddItemToObject(prof_obj, pr->name, pj);
         }
         cJSON_AddItemToObject(item, "profiles", prof_obj);
@@ -1034,6 +1046,12 @@ static void serve_fault_detect_sets(ControlServer *srv, int fd) {
 static float clamp_threshold(float v) {
     if (v < 0.01f) return 0.01f;
     if (v > 0.99f) return 0.99f;
+    return v;
+}
+
+static float clamp_float(float v, float lo, float hi) {
+    if (v < lo) return lo;
+    if (v > hi) return hi;
     return v;
 }
 
@@ -1072,6 +1090,9 @@ static void handle_fault_detect_settings(ControlServer *srv, int fd,
 
     item = cJSON_GetObjectItemCaseSensitive(root, "heatmap_enabled");
     if (item) cfg->heatmap_enabled = cJSON_IsTrue(item) ? 1 : 0;
+
+    item = cJSON_GetObjectItemCaseSensitive(root, "fd_debug_logging");
+    if (item) cfg->fd_debug_logging = cJSON_IsTrue(item) ? 1 : 0;
 
     item = cJSON_GetObjectItemCaseSensitive(root, "beep_pattern");
     if (item && cJSON_IsNumber(item)) {
@@ -1161,6 +1182,40 @@ static void handle_fault_detect_settings(ControlServer *srv, int fd,
             v = cJSON_GetObjectItemCaseSensitive(set_th, "heatmap_boost_threshold");
             if (v && cJSON_IsNumber(v))
                 cJSON_AddNumberToObject(entry, "heatmap_boost_threshold", round2(clamp_heatmap_threshold((float)v->valuedouble)));
+            /* Advanced boost tuning */
+            v = cJSON_GetObjectItemCaseSensitive(set_th, "boost_min_cells");
+            if (v && cJSON_IsNumber(v))
+                cJSON_AddNumberToObject(entry, "boost_min_cells", (int)clamp_float((float)v->valuedouble, 1, 50));
+            v = cJSON_GetObjectItemCaseSensitive(set_th, "boost_cell_threshold");
+            if (v && cJSON_IsNumber(v))
+                cJSON_AddNumberToObject(entry, "boost_cell_threshold", round2(clamp_float((float)v->valuedouble, 0.05f, 2.0f)));
+            v = cJSON_GetObjectItemCaseSensitive(set_th, "boost_lean_factor");
+            if (v && cJSON_IsNumber(v))
+                cJSON_AddNumberToObject(entry, "boost_lean_factor", round2(clamp_float((float)v->valuedouble, 0.1f, 1.0f)));
+            v = cJSON_GetObjectItemCaseSensitive(set_th, "boost_proto_lean");
+            if (v && cJSON_IsNumber(v))
+                cJSON_AddNumberToObject(entry, "boost_proto_lean", round2(clamp_float((float)v->valuedouble, 0.1f, 0.99f)));
+            v = cJSON_GetObjectItemCaseSensitive(set_th, "boost_multi_lean");
+            if (v && cJSON_IsNumber(v))
+                cJSON_AddNumberToObject(entry, "boost_multi_lean", round2(clamp_float((float)v->valuedouble, 0.05f, 0.99f)));
+            v = cJSON_GetObjectItemCaseSensitive(set_th, "boost_proto_veto");
+            if (v && cJSON_IsNumber(v))
+                cJSON_AddNumberToObject(entry, "boost_proto_veto", round2(clamp_float((float)v->valuedouble, 0.1f, 0.99f)));
+            v = cJSON_GetObjectItemCaseSensitive(set_th, "boost_proto_strong");
+            if (v && cJSON_IsNumber(v))
+                cJSON_AddNumberToObject(entry, "boost_proto_strong", round2(clamp_float((float)v->valuedouble, 0.5f, 0.99f)));
+            v = cJSON_GetObjectItemCaseSensitive(set_th, "boost_amplifier_cap");
+            if (v && cJSON_IsNumber(v))
+                cJSON_AddNumberToObject(entry, "boost_amplifier_cap", round2(clamp_float((float)v->valuedouble, 1.0f, 5.0f)));
+            v = cJSON_GetObjectItemCaseSensitive(set_th, "boost_confidence_cap");
+            if (v && cJSON_IsNumber(v))
+                cJSON_AddNumberToObject(entry, "boost_confidence_cap", round2(clamp_float((float)v->valuedouble, 0.5f, 1.0f)));
+            v = cJSON_GetObjectItemCaseSensitive(set_th, "ema_alpha");
+            if (v && cJSON_IsNumber(v))
+                cJSON_AddNumberToObject(entry, "ema_alpha", round2(clamp_float((float)v->valuedouble, 0.05f, 1.0f)));
+            v = cJSON_GetObjectItemCaseSensitive(set_th, "heatmap_coarse_weight");
+            if (v && cJSON_IsNumber(v))
+                cJSON_AddNumberToObject(entry, "heatmap_coarse_weight", round2(clamp_float((float)v->valuedouble, 0.0f, 1.0f)));
 
             cJSON_DeleteItemFromObjectCaseSensitive(existing, set_th->string);
             cJSON_AddItemToObject(existing, set_th->string, entry);
@@ -1242,6 +1297,315 @@ static fd_mask196_t compute_mask_from_corners(const float *corners, int npts,
         }
     }
     return mask;
+}
+
+/* ============================================================================
+ * Prototype Management API Handlers
+ * ============================================================================ */
+
+/* GET /api/proto/datasets */
+static void serve_proto_datasets(ControlServer *srv, int fd) {
+    (void)srv;
+    fd_dataset_info_t datasets[FD_MAX_DATASETS];
+    int count = fault_detect_list_datasets(datasets, FD_MAX_DATASETS);
+
+    /* Check USB mount */
+    struct stat st;
+    int usb_mounted = (stat("/mnt/udisk", &st) == 0 && S_ISDIR(st.st_mode));
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddBoolToObject(root, "usb_mounted", usb_mounted);
+
+    cJSON *arr = cJSON_CreateArray();
+    for (int i = 0; i < count; i++) {
+        cJSON *item = cJSON_CreateObject();
+        cJSON_AddStringToObject(item, "name", datasets[i].name);
+        cJSON_AddNumberToObject(item, "n_failure", datasets[i].n_failure);
+        cJSON_AddNumberToObject(item, "n_success", datasets[i].n_success);
+        cJSON_AddNumberToObject(item, "size_mb",
+            (double)datasets[i].size_bytes / (1024.0 * 1024.0));
+        if (datasets[i].source[0])
+            cJSON_AddStringToObject(item, "source", datasets[i].source);
+        cJSON_AddItemToArray(arr, item);
+    }
+    cJSON_AddItemToObject(root, "datasets", arr);
+    send_json_response(fd, 200, root);
+}
+
+/* POST /api/proto/datasets/create */
+static void handle_proto_dataset_create(int fd, const char *body) {
+    cJSON *json = cJSON_Parse(body);
+    if (!json) { send_json_error(fd, 400, "invalid JSON"); return; }
+
+    const cJSON *name = cJSON_GetObjectItemCaseSensitive(json, "name");
+    if (!name || !cJSON_IsString(name) || !name->valuestring[0]) {
+        send_json_error(fd, 400, "name required");
+        cJSON_Delete(json);
+        return;
+    }
+
+    int ret = fault_detect_create_dataset(name->valuestring);
+    cJSON_Delete(json);
+
+    if (ret == 0) {
+        cJSON *resp = cJSON_CreateObject();
+        cJSON_AddBoolToObject(resp, "ok", 1);
+        send_json_response(fd, 200, resp);
+    } else {
+        send_json_error(fd, 500, "failed to create dataset");
+    }
+}
+
+/* DELETE /api/proto/datasets/delete/<name> */
+static void handle_proto_dataset_delete(int fd, const char *name) {
+    if (!name || !name[0]) { send_json_error(fd, 400, "name required"); return; }
+    int ret = fault_detect_delete_dataset(name);
+    if (ret == 0) {
+        cJSON *resp = cJSON_CreateObject();
+        cJSON_AddBoolToObject(resp, "ok", 1);
+        send_json_response(fd, 200, resp);
+    } else {
+        send_json_error(fd, 500, "failed to delete dataset");
+    }
+}
+
+/* POST /api/proto/datasets/download */
+static void handle_proto_dataset_download(ControlServer *srv, int fd, const char *body) {
+    cJSON *json = cJSON_Parse(body);
+
+    /* Get URL from body or config */
+    const char *url = NULL;
+    const char *name = "default";
+    if (json) {
+        const cJSON *u = cJSON_GetObjectItemCaseSensitive(json, "url");
+        if (u && cJSON_IsString(u)) url = u->valuestring;
+        const cJSON *n = cJSON_GetObjectItemCaseSensitive(json, "name");
+        if (n && cJSON_IsString(n) && n->valuestring[0]) name = n->valuestring;
+    }
+    if (!url || !url[0]) {
+        url = srv->config->proto_dataset_url;
+    }
+    if (!url || !url[0]) {
+        if (json) cJSON_Delete(json);
+        send_json_error(fd, 400, "no download URL configured");
+        return;
+    }
+
+    int ret = fault_detect_download_dataset(url, name);
+    if (json) cJSON_Delete(json);
+
+    if (ret == 0) {
+        cJSON *resp = cJSON_CreateObject();
+        cJSON_AddBoolToObject(resp, "ok", 1);
+        send_json_response(fd, 200, resp);
+    } else {
+        send_json_error(fd, 409, "download already in progress");
+    }
+}
+
+/* GET /api/proto/datasets/download/status */
+static void serve_proto_download_status(int fd) {
+    fd_download_progress_t p = fault_detect_get_download_progress();
+    cJSON *root = cJSON_CreateObject();
+    const char *states[] = {"idle", "running", "extracting", "done", "error"};
+    cJSON_AddStringToObject(root, "state", states[p.state]);
+    cJSON_AddNumberToObject(root, "downloaded_bytes", (double)p.downloaded_bytes);
+    cJSON_AddNumberToObject(root, "progress_pct", p.progress_pct);
+    if (p.error_msg[0])
+        cJSON_AddStringToObject(root, "error", p.error_msg);
+    send_json_response(fd, 200, root);
+}
+
+/* GET /api/proto/sets */
+static void serve_proto_sets(ControlServer *srv, int fd) {
+    fd_proto_set_info_t sets[FD_MAX_PROTO_SETS];
+    int count = fault_detect_list_proto_sets(sets, FD_MAX_PROTO_SETS,
+                                              srv->config->proto_active_set);
+
+    cJSON *arr = cJSON_CreateArray();
+    for (int i = 0; i < count; i++) {
+        cJSON *item = cJSON_CreateObject();
+        cJSON_AddStringToObject(item, "name", sets[i].name);
+        cJSON_AddStringToObject(item, "source_dataset", sets[i].source_dataset);
+        cJSON_AddNumberToObject(item, "n_failure", sets[i].n_failure);
+        cJSON_AddNumberToObject(item, "n_success", sets[i].n_success);
+        cJSON_AddBoolToObject(item, "is_active", sets[i].is_active);
+
+        cJSON *margins = cJSON_CreateArray();
+        for (int j = 0; j < 3; j++)
+            cJSON_AddItemToArray(margins, cJSON_CreateNumber(
+                (double)((int)(sets[i].margin[j] * 1000 + 0.5f)) / 1000.0));
+        cJSON_AddItemToObject(item, "margins", margins);
+
+        cJSON *enc = cJSON_CreateArray();
+        for (int j = 0; j < 3; j++)
+            cJSON_AddItemToArray(enc, cJSON_CreateString(sets[i].encoder_hashes[j]));
+        cJSON_AddItemToObject(item, "encoder_hashes", enc);
+
+        cJSON_AddItemToArray(arr, item);
+    }
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddItemToObject(root, "sets", arr);
+    cJSON_AddStringToObject(root, "active_set", srv->config->proto_active_set);
+    send_json_response(fd, 200, root);
+}
+
+/* POST /api/proto/compute */
+static void handle_proto_compute(int fd, const char *body, int incremental) {
+    cJSON *json = cJSON_Parse(body);
+    if (!json) { send_json_error(fd, 400, "invalid JSON"); return; }
+
+    const cJSON *ds = cJSON_GetObjectItemCaseSensitive(json, "dataset");
+    const cJSON *sn = cJSON_GetObjectItemCaseSensitive(json, "set_name");
+    if (!ds || !cJSON_IsString(ds) || !ds->valuestring[0] ||
+        !sn || !cJSON_IsString(sn) || !sn->valuestring[0]) {
+        send_json_error(fd, 400, "dataset and set_name required");
+        cJSON_Delete(json);
+        return;
+    }
+
+    int ret;
+    if (incremental)
+        ret = fault_detect_compute_prototypes_incremental(ds->valuestring, sn->valuestring);
+    else
+        ret = fault_detect_compute_prototypes(ds->valuestring, sn->valuestring);
+
+    cJSON_Delete(json);
+
+    if (ret == 0) {
+        cJSON *resp = cJSON_CreateObject();
+        cJSON_AddBoolToObject(resp, "ok", 1);
+        send_json_response(fd, 200, resp);
+    } else {
+        send_json_error(fd, 409, "computation already in progress");
+    }
+}
+
+/* GET /api/proto/compute/status */
+static void serve_proto_compute_status(int fd) {
+    fd_proto_compute_progress_t p = fault_detect_get_proto_progress();
+    cJSON *root = cJSON_CreateObject();
+
+    const char *states[] = {"idle", "pending", "running", "saving", "done", "error", "cancelled"};
+    cJSON_AddStringToObject(root, "state", states[p.state]);
+    cJSON_AddStringToObject(root, "dataset", p.dataset_name);
+    cJSON_AddStringToObject(root, "set_name", p.set_name);
+    cJSON_AddNumberToObject(root, "current_model", p.current_model);
+    if (p.model_name)
+        cJSON_AddStringToObject(root, "model_name", p.model_name);
+    cJSON_AddNumberToObject(root, "current_class", p.current_class);
+    cJSON_AddNumberToObject(root, "images_processed", p.images_processed);
+    cJSON_AddNumberToObject(root, "images_total", p.images_total);
+    cJSON_AddNumberToObject(root, "total_processed", p.total_images_processed);
+    cJSON_AddNumberToObject(root, "total_all", p.total_images_all);
+    cJSON_AddNumberToObject(root, "elapsed_s", p.elapsed_s);
+    cJSON_AddNumberToObject(root, "estimated_total_s", p.estimated_total_s);
+    cJSON_AddBoolToObject(root, "incremental", p.incremental);
+
+    if (p.state == PROTO_COMPUTE_DONE || p.state == PROTO_COMPUTE_ERROR) {
+        cJSON *margins = cJSON_CreateArray();
+        cJSON *cos_sims = cJSON_CreateArray();
+        for (int i = 0; i < 3; i++) {
+            cJSON_AddItemToArray(margins, cJSON_CreateNumber(
+                (double)((int)(p.margin[i] * 1000 + 0.5f)) / 1000.0));
+            cJSON_AddItemToArray(cos_sims, cJSON_CreateNumber(
+                (double)((int)(p.cos_sim[i] * 1000 + 0.5f)) / 1000.0));
+        }
+        cJSON_AddItemToObject(root, "margins", margins);
+        cJSON_AddItemToObject(root, "cos_sims", cos_sims);
+    }
+
+    if (p.error_msg[0])
+        cJSON_AddStringToObject(root, "error", p.error_msg);
+
+    send_json_response(fd, 200, root);
+}
+
+/* POST /api/proto/sets/activate */
+static void handle_proto_activate(ControlServer *srv, int fd, const char *body) {
+    cJSON *json = cJSON_Parse(body);
+    if (!json) { send_json_error(fd, 400, "invalid JSON"); return; }
+
+    const cJSON *name = cJSON_GetObjectItemCaseSensitive(json, "name");
+    if (!name || !cJSON_IsString(name) || !name->valuestring[0]) {
+        send_json_error(fd, 400, "name required");
+        cJSON_Delete(json);
+        return;
+    }
+
+    int ret = fault_detect_activate_proto_set(name->valuestring);
+    if (ret == 0) {
+        /* Save active set to config */
+        strncpy(srv->config->proto_active_set, name->valuestring,
+                sizeof(srv->config->proto_active_set) - 1);
+        config_save(srv->config, srv->config->config_file);
+
+        cJSON *resp = cJSON_CreateObject();
+        cJSON_AddBoolToObject(resp, "ok", 1);
+        send_json_response(fd, 200, resp);
+    } else {
+        send_json_error(fd, 500, "failed to activate prototype set");
+    }
+    cJSON_Delete(json);
+}
+
+/* DELETE /api/proto/sets/delete/<name> */
+static void handle_proto_set_delete(int fd, const char *name) {
+    if (!name || !name[0]) { send_json_error(fd, 400, "name required"); return; }
+    int ret = fault_detect_delete_proto_set(name);
+    if (ret == 0) {
+        cJSON *resp = cJSON_CreateObject();
+        cJSON_AddBoolToObject(resp, "ok", 1);
+        send_json_response(fd, 200, resp);
+    } else {
+        send_json_error(fd, 500, "failed to delete prototype set");
+    }
+}
+
+/* POST /api/proto/datasets/save_frame */
+static void handle_proto_save_frame(int fd, const char *body) {
+    cJSON *json = cJSON_Parse(body);
+    if (!json) { send_json_error(fd, 400, "invalid JSON"); return; }
+
+    const cJSON *ds = cJSON_GetObjectItemCaseSensitive(json, "dataset");
+    const cJSON *cls = cJSON_GetObjectItemCaseSensitive(json, "class");
+    if (!ds || !cJSON_IsString(ds) || !ds->valuestring[0]) {
+        send_json_error(fd, 400, "dataset required");
+        cJSON_Delete(json);
+        return;
+    }
+
+    int class_idx = 1; /* default: success */
+    if (cls && cJSON_IsString(cls)) {
+        if (strcmp(cls->valuestring, "failure") == 0) class_idx = 0;
+    } else if (cls && cJSON_IsNumber(cls)) {
+        class_idx = cls->valueint;
+    }
+
+    /* Get current FD frame (last captured camera JPEG) */
+    static uint8_t frame_buf[512 * 1024];
+    uint64_t cycle = 0;
+    size_t sz = fault_detect_get_fd_frame(frame_buf, sizeof(frame_buf), &cycle);
+
+    if (sz == 0) {
+        send_json_error(fd, 404, "no camera frame available");
+        cJSON_Delete(json);
+        return;
+    }
+
+    int ret = fault_detect_save_frame_to_dataset(ds->valuestring, class_idx,
+                                                   frame_buf, sz);
+    cJSON_Delete(json);
+
+    if (ret == 0) {
+        cJSON *resp = cJSON_CreateObject();
+        cJSON_AddBoolToObject(resp, "ok", 1);
+        cJSON_AddNumberToObject(resp, "size", (double)sz);
+        send_json_response(fd, 200, resp);
+    } else {
+        send_json_error(fd, 500, "failed to save frame");
+    }
 }
 
 /* GET /setup - Serve wizard page */
@@ -1380,6 +1744,7 @@ static void serve_setup_status(ControlServer *srv, int fd) {
     /* FD state */
     cJSON_AddBoolToObject(root, "fd_enabled", cfg->fault_detect_enabled);
     cJSON_AddBoolToObject(root, "heatmap_enabled", cfg->heatmap_enabled);
+    cJSON_AddBoolToObject(root, "fd_debug_logging", cfg->fd_debug_logging);
 
     fd_state_t fd_state = fault_detect_get_state();
     const char *fd_status_str;
@@ -3902,6 +4267,55 @@ static void handle_client(ControlServer *srv, int client_fd,
             send_http_response(client_fd, 204, "text/plain", NULL, 0,
                                "Access-Control-Allow-Origin: *\r\n");
         }
+    }
+    /* Prototype management routes */
+    else if (is_get && strcmp(path, "/api/proto/datasets") == 0) {
+        serve_proto_datasets(srv, client_fd);
+    }
+    else if (is_post && strcmp(path, "/api/proto/datasets/create") == 0) {
+        handle_proto_dataset_create(client_fd, post_body ? post_body : "");
+    }
+    else if ((is_get || is_post) && strncmp(path, "/api/proto/datasets/delete/", 26) == 0) {
+        handle_proto_dataset_delete(client_fd, path + 26);
+    }
+    else if (is_post && strcmp(path, "/api/proto/datasets/download") == 0) {
+        handle_proto_dataset_download(srv, client_fd, post_body ? post_body : "");
+    }
+    else if (is_get && strcmp(path, "/api/proto/datasets/download/status") == 0) {
+        serve_proto_download_status(client_fd);
+    }
+    else if (is_post && strcmp(path, "/api/proto/datasets/download/cancel") == 0) {
+        fault_detect_cancel_download();
+        cJSON *resp = cJSON_CreateObject();
+        cJSON_AddBoolToObject(resp, "ok", 1);
+        send_json_response(client_fd, 200, resp);
+    }
+    else if (is_post && strcmp(path, "/api/proto/datasets/save_frame") == 0) {
+        handle_proto_save_frame(client_fd, post_body ? post_body : "");
+    }
+    else if (is_get && strcmp(path, "/api/proto/sets") == 0) {
+        serve_proto_sets(srv, client_fd);
+    }
+    else if (is_post && strcmp(path, "/api/proto/compute") == 0) {
+        handle_proto_compute(client_fd, post_body ? post_body : "", 0);
+    }
+    else if (is_post && strcmp(path, "/api/proto/compute/incremental") == 0) {
+        handle_proto_compute(client_fd, post_body ? post_body : "", 1);
+    }
+    else if (is_get && strcmp(path, "/api/proto/compute/status") == 0) {
+        serve_proto_compute_status(client_fd);
+    }
+    else if (is_post && strcmp(path, "/api/proto/compute/cancel") == 0) {
+        fault_detect_cancel_proto_compute();
+        cJSON *resp = cJSON_CreateObject();
+        cJSON_AddBoolToObject(resp, "ok", 1);
+        send_json_response(client_fd, 200, resp);
+    }
+    else if (is_post && strcmp(path, "/api/proto/sets/activate") == 0) {
+        handle_proto_activate(srv, client_fd, post_body ? post_body : "");
+    }
+    else if ((is_get || is_post) && strncmp(path, "/api/proto/sets/delete/", 22) == 0) {
+        handle_proto_set_delete(client_fd, path + 22);
     }
     /* Setup wizard routes */
     else if (is_get && strcmp(path, "/setup") == 0) {

@@ -120,8 +120,13 @@ typedef struct {
     int fault_detect_min_free_mem;
     int fault_detect_pace_ms;
     int heatmap_enabled;                /* Spatial heatmap on fault detection */
+    int fd_debug_logging;               /* Extra FD diagnostic logging (heatmap split, EMA) */
     int fd_beep_pattern;                /* Buzzer alert on fault: 0=none, 1-5=patterns */
     char fd_thresholds_json[2048];      /* Per-set threshold config JSON */
+
+    /* Prototype Management */
+    char proto_active_set[64];          /* Name of active prototype set */
+    char proto_dataset_url[256];        /* URL for default dataset download */
 
     /* Fault Detection Setup Wizard */
     int fd_setup_status;                /* 0=NONE, 1=INPROGRESS, 2=OK */

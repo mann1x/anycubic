@@ -454,6 +454,21 @@ make install-h264
 
 - **Rinkhals** - Custom firmware for Anycubic printers: `/shared/dev/Rinkhals`
 - **ACProxyCam** - Windows camera proxy application
+- **BigEdge-FDM-Models** - ML fault detection models: `/srv/dev-disk-by-label-opt/dev/rknn/BigEdge-FDM-Models/`
+  - See `BigEdge-FDM-Models/CLAUDE.md` for training provenance rules and model details
+  - Deployed models: `h264-streamer/Edge-FDM-Models-KS1/`
+
+### Model Training Provenance (MANDATORY)
+
+When training or deploying fault detection models, ALWAYS record the complete provenance:
+- Exact script path + all CLI arguments used
+- Dataset name, version, and image counts
+- RKNN quantization algorithm (normal/mmse)
+- Prototype computation method (simulator/on-device)
+- Save as `train_command.sh` in the output directory
+- Update MEMORY.md with provenance entry on deployment
+
+See `BigEdge-FDM-Models/CLAUDE.md` "Training Provenance Rules" section for full details.
 
 ---
 

@@ -1841,6 +1841,29 @@ static void apply_fd_thresholds(fd_config_t *fd_cfg, const AppConfig *cfg)
         if (v && cJSON_IsNumber(v)) fd_cfg->thresholds.multi_threshold = (float)v->valuedouble;
         v = cJSON_GetObjectItemCaseSensitive(entry, "heatmap_boost_threshold");
         if (v && cJSON_IsNumber(v)) fd_cfg->thresholds.heatmap_boost_threshold = (float)v->valuedouble;
+        /* Advanced boost tuning */
+        v = cJSON_GetObjectItemCaseSensitive(entry, "boost_min_cells");
+        if (v && cJSON_IsNumber(v)) fd_cfg->thresholds.boost_min_cells = (int)v->valuedouble;
+        v = cJSON_GetObjectItemCaseSensitive(entry, "boost_cell_threshold");
+        if (v && cJSON_IsNumber(v)) fd_cfg->thresholds.boost_cell_threshold = (float)v->valuedouble;
+        v = cJSON_GetObjectItemCaseSensitive(entry, "boost_lean_factor");
+        if (v && cJSON_IsNumber(v)) fd_cfg->thresholds.boost_lean_factor = (float)v->valuedouble;
+        v = cJSON_GetObjectItemCaseSensitive(entry, "boost_proto_lean");
+        if (v && cJSON_IsNumber(v)) fd_cfg->thresholds.boost_proto_lean = (float)v->valuedouble;
+        v = cJSON_GetObjectItemCaseSensitive(entry, "boost_multi_lean");
+        if (v && cJSON_IsNumber(v)) fd_cfg->thresholds.boost_multi_lean = (float)v->valuedouble;
+        v = cJSON_GetObjectItemCaseSensitive(entry, "boost_proto_veto");
+        if (v && cJSON_IsNumber(v)) fd_cfg->thresholds.boost_proto_veto = (float)v->valuedouble;
+        v = cJSON_GetObjectItemCaseSensitive(entry, "boost_proto_strong");
+        if (v && cJSON_IsNumber(v)) fd_cfg->thresholds.boost_proto_strong = (float)v->valuedouble;
+        v = cJSON_GetObjectItemCaseSensitive(entry, "boost_amplifier_cap");
+        if (v && cJSON_IsNumber(v)) fd_cfg->thresholds.boost_amplifier_cap = (float)v->valuedouble;
+        v = cJSON_GetObjectItemCaseSensitive(entry, "boost_confidence_cap");
+        if (v && cJSON_IsNumber(v)) fd_cfg->thresholds.boost_confidence_cap = (float)v->valuedouble;
+        v = cJSON_GetObjectItemCaseSensitive(entry, "ema_alpha");
+        if (v && cJSON_IsNumber(v)) fd_cfg->thresholds.ema_alpha = (float)v->valuedouble;
+        v = cJSON_GetObjectItemCaseSensitive(entry, "heatmap_coarse_weight");
+        if (v && cJSON_IsNumber(v)) fd_cfg->thresholds.heatmap_coarse_weight = (float)v->valuedouble;
     }
     cJSON_Delete(root);
 }
@@ -1969,6 +1992,7 @@ static void on_config_changed(AppConfig *cfg) {
         fd_cfg.min_free_mem_mb = cfg->fault_detect_min_free_mem;
         fd_cfg.pace_ms = cfg->fault_detect_pace_ms;
         fd_cfg.heatmap_enabled = cfg->heatmap_enabled;
+        fd_cfg.debug_logging = cfg->fd_debug_logging;
         fd_cfg.beep_pattern = cfg->fd_beep_pattern;
         fd_cfg.setup_mode = 0;  /* only set via API, not from config */
         /* Only apply saved mask when setup is complete; otherwise full grid */
@@ -2355,6 +2379,7 @@ int main(int argc, char *argv[]) {
             fd_cfg.min_free_mem_mb = app_config.fault_detect_min_free_mem;
             fd_cfg.pace_ms = app_config.fault_detect_pace_ms;
             fd_cfg.heatmap_enabled = app_config.heatmap_enabled;
+            fd_cfg.debug_logging = app_config.fd_debug_logging;
             fd_cfg.beep_pattern = app_config.fd_beep_pattern;
             fd_cfg.setup_mode = 0;  /* only set via API, not from config */
             /* Only apply saved mask when setup is complete; otherwise full grid */
