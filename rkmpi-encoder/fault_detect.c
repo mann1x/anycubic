@@ -4067,6 +4067,70 @@ int fault_detect_delete_proto_set(const char *set_name)
  * Prototype Management — Dataset Download
  * ============================================================================ */
 
+/* Resolve dataset URL: if URL points to a .json metadata file, fetch it and
+ * extract the actual download URL and dataset name from it.
+ * Returns 0 on success (url/name updated), -1 on error, 1 if not a metadata URL. */
+static int fd_resolve_dataset_metadata(char *url, size_t url_sz, char *name, size_t name_sz)
+{
+    /* Only resolve if URL ends with .json */
+    size_t len = strlen(url);
+    if (len < 6 || strcmp(url + len - 5, ".json") != 0)
+        return 1;  /* not metadata, use URL directly */
+
+    fd_log("Download: fetching metadata from %s\n", url);
+
+    char tmp_meta[] = "/tmp/fd_dataset_meta.json";
+    char cmd[600];
+    snprintf(cmd, sizeof(cmd), "wget -q -O '%s' '%s' 2>&1", tmp_meta, url);
+    int ret = system(cmd);
+    if (ret != 0) {
+        fd_log("Download: metadata fetch failed (exit %d)\n", WEXITSTATUS(ret));
+        unlink(tmp_meta);
+        return -1;
+    }
+
+    /* Read and parse JSON */
+    FILE *f = fopen(tmp_meta, "r");
+    if (!f) { unlink(tmp_meta); return -1; }
+
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (fsize <= 0 || fsize > 8192) { fclose(f); unlink(tmp_meta); return -1; }
+
+    char *buf = malloc(fsize + 1);
+    if (!buf) { fclose(f); unlink(tmp_meta); return -1; }
+    fread(buf, 1, fsize, f);
+    buf[fsize] = '\0';
+    fclose(f);
+    unlink(tmp_meta);
+
+    cJSON *root = cJSON_Parse(buf);
+    free(buf);
+    if (!root) {
+        fd_log("Download: metadata JSON parse failed\n");
+        return -1;
+    }
+
+    cJSON *ds = cJSON_GetObjectItemCaseSensitive(root, "prototype_dataset");
+    if (!ds) { cJSON_Delete(root); return -1; }
+
+    cJSON *ds_url = cJSON_GetObjectItemCaseSensitive(ds, "url");
+    cJSON *ds_name = cJSON_GetObjectItemCaseSensitive(ds, "name");
+    if (!ds_url || !cJSON_IsString(ds_url) || !ds_url->valuestring[0]) {
+        cJSON_Delete(root);
+        return -1;
+    }
+
+    snprintf(url, url_sz, "%s", ds_url->valuestring);
+    if (ds_name && cJSON_IsString(ds_name) && ds_name->valuestring[0])
+        snprintf(name, name_sz, "%s", ds_name->valuestring);
+
+    fd_log("Download: resolved to url=%s name=%s\n", url, name);
+    cJSON_Delete(root);
+    return 0;
+}
+
 static void *fd_download_thread_func(void *arg)
 {
     (void)arg;
@@ -4078,13 +4142,34 @@ static void *fd_download_thread_func(void *arg)
     g_proto.dl_progress.error_msg[0] = '\0';
     pthread_mutex_unlock(&g_proto.dl_mutex);
 
+    /* Resolve metadata URL if needed */
+    char resolved_url[512];
+    char resolved_name[64];
+    snprintf(resolved_url, sizeof(resolved_url), "%s", g_proto.dl_url);
+    snprintf(resolved_name, sizeof(resolved_name), "%s", g_proto.dl_name);
+
+    int meta_ret = fd_resolve_dataset_metadata(resolved_url, sizeof(resolved_url),
+                                                resolved_name, sizeof(resolved_name));
+    if (meta_ret < 0) {
+        pthread_mutex_lock(&g_proto.dl_mutex);
+        g_proto.dl_progress.state = FD_DOWNLOAD_ERROR;
+        snprintf(g_proto.dl_progress.error_msg, sizeof(g_proto.dl_progress.error_msg),
+                 "failed to fetch dataset metadata");
+        pthread_mutex_unlock(&g_proto.dl_mutex);
+        g_proto.dl_thread_running = 0;
+        return NULL;
+    }
+
+    /* Update name if metadata resolved it */
+    snprintf(g_proto.dl_name, sizeof(g_proto.dl_name), "%s", resolved_name);
+
     char tmp_path[] = "/tmp/fd_dataset.tar.gz";
 
     /* Download with wget (busybox) */
     char cmd[600];
-    snprintf(cmd, sizeof(cmd), "wget -q -O '%s' '%s' 2>&1", tmp_path, g_proto.dl_url);
+    snprintf(cmd, sizeof(cmd), "wget -q -O '%s' '%s' 2>&1", tmp_path, resolved_url);
 
-    fd_log("Download: starting %s\n", g_proto.dl_url);
+    fd_log("Download: starting %s\n", resolved_url);
     int ret = system(cmd);
 
     if (g_proto.dl_cancel) {

@@ -1,0 +1,9 @@
+{
+  "prototype_dataset": {
+    "name": "ks1printer_full",
+    "url": "https://github.com/mann1x/anycubic/releases/download/datasets/ks1-full/ks1_default_dataset.tar.gz",
+    "n_failure": 539,
+    "n_success": 2499,
+    "description": "Full KS1 training dataset for on-device prototype computation"
+  }
+}

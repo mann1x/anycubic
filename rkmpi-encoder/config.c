@@ -166,7 +166,7 @@ void config_set_defaults(AppConfig *cfg) {
     /* Prototype Management */
     cfg->proto_active_set[0] = '\0';
     snprintf(cfg->proto_dataset_url, sizeof(cfg->proto_dataset_url),
-             "https://github.com/mann1x/anycubic/releases/download/datasets/ks1-v7/ks1_default_dataset.tar.gz");
+             "https://raw.githubusercontent.com/mann1x/anycubic/main/h264-streamer/29-h264-streamer/datasets.json");
 
     /* Fault Detection Setup */
     cfg->fd_setup_status = FD_SETUP_NONE;
